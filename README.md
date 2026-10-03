@@ -105,16 +105,22 @@ CTF skills cover recon, web, pwn, crypto, reverse engineering, forensics, stego,
 | `Shift+Enter` | Insert a newline |
 | `Enter` | Submit the prompt or selected command; during a turn it queues the message for after the reply |
 | `Ctrl+K` | Clear input |
-| `Ctrl+U` | Clear input when there is text, otherwise page up |
-| `Ctrl+D` | Delete the character under the caret when there is text, otherwise page down |
+| `Ctrl+U` | Clear input when there is text, otherwise scroll half a page up |
+| `Ctrl+D` | Delete the character under the caret when there is text, otherwise scroll half a page down |
 | `Ctrl+W` | Delete the word before the caret |
-| `Ctrl+L` | Repaint the screen and return to the bottom (it never clears the transcript; `/clear` does that) |
+| `Ctrl+A` / `Ctrl+E` | Jump to the start / end of the line |
+| `Alt+←` / `Alt+→` (also `Alt+B` / `Alt+F`) | Jump a word left / right |
+| `Ctrl+L` | Clear the visible transcript and redraw (history and conversation context are kept; `/clear --context` drops the context too) |
 | `Ctrl+T` | Cycle the color theme (same list as `/theme`) |
 | `Ctrl+Shift+C` | Copy latest output |
 | `[` / `]` | Lower or raise thinking level (0–20) |
+| `@` at the start of a prompt | Open the file-mention picker (`Mention files`); `Esc` closes it |
+| Bracketed paste | A paste of 4+ lines collapses into `[Pasted N lines]`: `Enter` inserts it, `Esc` discards it |
 | `Tab` | Complete the current word (paths, slash commands, tool names) when the input is not empty; otherwise switch build and plan modes |
 | `Ctrl+C` | Clear what you are typing, then exit on a second press. During a turn it cancels the turn instead of closing the shell |
 | Mouse wheel | Scroll the transcript (smooth scrolling follows `smooth_scroll_lines`) |
+
+While scrolled up, the transcript header shows `· ↓ N new lines  (End to jump)`; each new line arriving is counted there until `End` returns to the bottom. Multi-line drafts grow the input box to four rows and then scroll with the caret. Prompt history (last 500 entries, consecutive duplicates collapsed) persists to `~/.wrosecode/history` and is recalled with `↑`/`↓`.
 
 Shell calls have a 30 second timeout and are terminated if stuck. Panics and turn errors are written to `.ctf/errors.log`; the TUI keeps provider errors visible with a recovery suggestion. One-shot runs print a computed usage report, and `--summary json` emits a machine-readable `TaskComplete` object.
 

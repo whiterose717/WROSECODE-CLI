@@ -20,6 +20,7 @@ use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlt
 use crossterm::{execute, queue};
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -315,6 +316,12 @@ struct Ui {
     max_scroll: usize,
     /// Messages typed while the agent was thinking, sent after the turn ends.
     pending: Vec<String>,
+    /// Lines that arrived while the viewport was detached from the bottom,
+    /// shown as `↓ N new lines  (End to jump)` until End re-engages follow.
+    new_since_detach: usize,
+    /// A large bracketed paste waiting to be inserted: the text and its
+    /// line count, so one big paste never hammers the key handlers.
+    paste_chip: Option<(String, usize)>,
 }
 
 /// State for cycling through Tab completions with the same token.
@@ -453,6 +460,8 @@ impl Ui {
             page_size: 10,
             max_scroll: 0,
             pending: Vec::new(),
+            new_since_detach: 0,
+            paste_chip: None,
         }
     }
 
@@ -523,12 +532,24 @@ impl Ui {
         }
     }
 
+    /// Ctrl+U / Ctrl+D scroll half a screen (spec 1.1), half of what PageUp
+    /// and PageDown move.
+    fn scroll_half_page(&mut self, down: bool) {
+        let half = self.page_size.max(2).div_ceil(2);
+        if down {
+            self.scroll_down(half);
+        } else {
+            self.scroll_up(half);
+        }
+    }
+
     fn scroll_home(&mut self) {
         self.scroll = self.max_scroll;
     }
 
     fn scroll_end(&mut self) {
         self.scroll = 0;
+        self.new_since_detach = 0;
     }
 
     fn is_following(&self) -> bool {
@@ -566,13 +587,105 @@ impl Ui {
         }
     }
 
-    /// ` · ↑N lines` when the viewport is detached from the bottom, so the
-    /// user can tell follow mode is off.
+    /// Alt+← / Alt+B: jump to the start of the previous word.
+    fn move_word_left(&mut self) {
+        let head = &self.input[..self.cursor];
+        let chars: Vec<(usize, char)> = head.char_indices().collect();
+        let mut index = chars.len();
+        while index > 0 && chars[index - 1].1.is_whitespace() {
+            index -= 1;
+        }
+        while index > 0 && !chars[index - 1].1.is_whitespace() {
+            index -= 1;
+        }
+        self.cursor = chars.get(index).map(|(offset, _)| *offset).unwrap_or(0);
+    }
+
+    /// Alt+→ / Alt+F: jump to the start of the next word (or the end of the
+    /// line when only whitespace remains).
+    fn move_word_right(&mut self) {
+        let base = self.cursor;
+        let chars: Vec<(usize, char)> = self.input[base..].char_indices().collect();
+        let mut index = 0;
+        while index < chars.len() && !chars[index].1.is_whitespace() {
+            index += 1;
+        }
+        while index < chars.len() && chars[index].1.is_whitespace() {
+            index += 1;
+        }
+        self.cursor = match chars.get(index) {
+            Some((offset, _)) => base + offset,
+            None => self.input.len(),
+        };
+    }
+
+    /// Insert whole text (a mention, an expanded paste) at the cursor.
+    fn insert_str(&mut self, text: &str) {
+        self.input.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    /// Append to prompt history: consecutive duplicates are dropped and the
+    /// list is capped so a long session cannot grow it forever (spec 1.2).
+    fn push_history(&mut self, line: String) {
+        if self.history.last().map(String::as_str) == Some(line.as_str()) {
+            self.history_index = None;
+            return;
+        }
+        self.history.push(line);
+        if self.history.len() > 500 {
+            self.history.remove(0);
+        }
+        self.history_index = None;
+    }
+
+    /// Clear the visible transcript without touching the session or the
+    /// conversation context (spec 1.3).
+    fn clear_transcript(&mut self) {
+        self.entries.clear();
+        self.tool_rows.clear();
+        self.tool_timeline.clear();
+        self.last_flag.clear();
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_position = 0;
+        self.transcript_key = None;
+        self.renderer.previous.clear();
+        self.renderer.full_redraw = true;
+        self.scroll_end();
+    }
+
+    /// Rows the prompt box occupies: one for a single line, growing with the
+    /// draft up to four, then scrolling like the transcript (spec 1.2).
+    fn input_rows(&self) -> usize {
+        self.input.split('\n').count().clamp(1, 4)
+    }
+
+    /// Bracketed paste (spec 1.2): a short paste types through, a long one
+    /// becomes an expandable chip so large pastes never replay per key.
+    fn accept_paste(&mut self, text: &str) {
+        let normalized: String = text.chars().filter(|ch| *ch != '\r').collect();
+        let lines = normalized.lines().count().max(1);
+        if lines >= 4 || normalized.len() >= 200 {
+            self.paste_chip = Some((normalized, lines));
+            self.status = format!("[Pasted {lines} lines]  ⏎ insert  ·  Esc discard");
+        } else {
+            for ch in normalized.chars() {
+                self.insert(ch);
+            }
+            self.palette = self.input.starts_with('/') && !self.input.contains(' ');
+            self.selected = 0;
+        }
+    }
+
+    /// ` · ↓ N new lines  (End to jump)` when the viewport is detached from
+    /// the bottom, so the user can tell follow mode is off and press End to
+    /// re-engage it (spec 1.1).
     fn follow_marker(&self) -> String {
         if self.is_following() || self.max_scroll == 0 {
             String::new()
         } else {
-            format!(" · ↑{} lines", self.scroll)
+            format!(" · ↓ {} new lines  (End to jump)", self.new_since_detach)
         }
     }
 
@@ -580,6 +693,7 @@ impl Ui {
     fn push_scrolled(&mut self, entry: Entry, added_lines: usize) {
         if self.scroll > 0 {
             self.scroll = self.scroll.saturating_add(added_lines);
+            self.new_since_detach += added_lines;
         }
         self.entries.push(entry);
     }
@@ -587,7 +701,9 @@ impl Ui {
     fn push(&mut self, speaker: Speaker, text: impl Into<String>) {
         let text = text.into();
         if self.scroll > 0 {
-            self.scroll = self.scroll.saturating_add(text.lines().count() + 1);
+            let added = text.lines().count() + 1;
+            self.scroll = self.scroll.saturating_add(added);
+            self.new_since_detach += added;
         }
         self.entries.push(Entry { speaker, text });
     }
@@ -758,7 +874,12 @@ impl Ui {
             );
             body_start += 1;
         }
-        let body_end = height_usize.saturating_sub(3);
+        // The prompt box grows with the draft (up to four rows) and a large
+        // paste parks a chip above it; the body shrinks by exactly that much
+        // so the status line, separator and prompt stay glued to the bottom.
+        let input_rows = self.input_rows();
+        let chip_rows = usize::from(self.paste_chip.is_some());
+        let body_end = height_usize.saturating_sub(2 + input_rows + chip_rows);
         let body_height = body_end.saturating_sub(body_start);
         // The clamp keeps a usable left pane but must never exceed the
         // terminal itself: on a 23-column screen the old bounds produced a
@@ -1031,7 +1152,7 @@ impl Ui {
                 };
             }
         }
-        let status_row = height_usize.saturating_sub(3);
+        let status_row = body_end;
         let spinner = SPINNER;
         let queue_note = if self.pending.is_empty() {
             String::new()
@@ -1073,39 +1194,86 @@ impl Ui {
         if status_row < height_usize {
             frame[status_row] = Row::new(clip(&status_text, width_usize), theme(self.theme).status);
         }
-        if height_usize > 1 {
-            frame[height_usize - 2] = Row::new("─".repeat(width_usize), theme(self.theme).muted);
+        let separator_row = status_row.saturating_add(1);
+        if separator_row < height_usize {
+            frame[separator_row] = Row::new("─".repeat(width_usize), theme(self.theme).muted);
         }
+        if let Some((_, pasted_lines)) = &self.paste_chip {
+            let chip_row = separator_row.saturating_add(1);
+            if chip_row < height_usize {
+                frame[chip_row] = Row::new(
+                    clip(
+                        &format!(" [Pasted {pasted_lines} lines]  ⏎ insert  ·  Esc discard"),
+                        width_usize,
+                    ),
+                    theme(self.theme).accent,
+                );
+            }
+        }
+        // The prompt grows with the draft: up to `input_rows` rows are shown,
+        // the window follows the caret so a long draft scrolls inside its box,
+        // and only the first line of the draft keeps the "> " marker.
+        let input_top = height_usize.saturating_sub(input_rows);
         let input_width = width_usize.saturating_sub(3);
-        let chars: Vec<char> = self.input.chars().collect();
-        let cursor_chars = self.input[..self.cursor].chars().count();
-        let start = cursor_chars.saturating_sub(input_width.saturating_sub(1));
-        let visible: String = if self.mask_input {
-            chars
-                .iter()
-                .skip(start)
-                .take(input_width)
-                .map(|_| '•')
-                .collect()
-        } else {
-            chars
-                .iter()
-                .skip(start)
-                .take(input_width)
-                .map(|ch| if *ch == '\n' { '↵' } else { *ch })
-                .collect()
-        };
-        frame[height_usize - 1] = Row::new(
-            format!("> {visible}"),
-            input_syntax_color(&self.input, theme(self.theme)),
-        );
+        let input_color = input_syntax_color(&self.input, theme(self.theme));
+        let draft_lines: Vec<&str> = self.input.split('\n').collect();
+        let caret_line = self.input[..self.cursor].matches('\n').count();
+        let skip = caret_line.saturating_sub(input_rows.saturating_sub(1));
+        let cursor_in_line = self.input[..self.cursor]
+            .rsplit('\n')
+            .next()
+            .map(str::chars)
+            .map(Iterator::count)
+            .unwrap_or(0);
+        let mut caret_x = 2usize;
+        for (offset, line) in draft_lines.iter().enumerate().skip(skip).take(input_rows) {
+            let row_index = input_top + (offset - skip);
+            if row_index >= height_usize {
+                break;
+            }
+            let prefix = if offset == skip {
+                if skip == 0 {
+                    "> "
+                } else {
+                    "↳ "
+                }
+            } else {
+                "  "
+            };
+            let line_chars: Vec<char> = line.chars().collect();
+            let visible: String = if offset == caret_line {
+                let start = cursor_in_line.saturating_sub(input_width.saturating_sub(1));
+                caret_x = 2 + cursor_in_line.saturating_sub(start);
+                if self.mask_input {
+                    line_chars
+                        .iter()
+                        .skip(start)
+                        .take(input_width)
+                        .map(|_| '•')
+                        .collect()
+                } else {
+                    line_chars.iter().skip(start).take(input_width).collect()
+                }
+            } else if self.mask_input {
+                line_chars.iter().take(input_width).map(|_| '•').collect()
+            } else {
+                line_chars.iter().take(input_width).collect()
+            };
+            frame[row_index] = Row::new(
+                clip(&format!("{prefix}{visible}"), width_usize),
+                input_color,
+            );
+        }
         for row in &mut frame {
             if row.bg == Color::Reset {
                 row.bg = theme(self.theme).background;
             }
         }
-        let x = (2 + cursor_chars.saturating_sub(start)).min(width_usize.saturating_sub(1)) as u16;
-        (frame, (x, height.saturating_sub(1)))
+        let x = caret_x.min(width_usize.saturating_sub(1)) as u16;
+        let y = input_top
+            .saturating_add(caret_line.saturating_sub(skip))
+            .min(height_usize.saturating_sub(1)) as u16;
+        (frame, (x, y))
     }
 
     fn insert(&mut self, ch: char) {
@@ -1609,7 +1777,19 @@ pub async fn run(
     let session_dir = Session::dir()?;
     let mut session = initial_session.unwrap_or_else(Session::fresh);
     let mut ui = Ui::new(&agent, session.name.clone());
+    ui.history = load_history();
     ui.renderer.full_redraw = profile.full_redraw;
+    // Test hook: the PTY suite floods the transcript with
+    // `WROSECODE_E2E_LINES` entries at startup so it can prove bottom-pinned
+    // auto-follow and the detached-scroll indicator without a model. Unknown
+    // or unparsable values are ignored.
+    if let Ok(raw) = std::env::var("WROSECODE_E2E_LINES") {
+        if let Ok(count) = raw.trim().parse::<usize>() {
+            for index in 0..count {
+                ui.push(Speaker::System, format!("flood line {index}"));
+            }
+        }
+    }
     if !session.transcript.is_empty() {
         ui.entries.clear();
         for (speaker, text) in &session.transcript {
@@ -1642,13 +1822,7 @@ pub async fn run(
         }
         let next = event::read()?;
         if let Event::Paste(text) = &next {
-            for ch in text.chars() {
-                if ch != '\r' {
-                    ui.insert(ch);
-                }
-            }
-            ui.palette = ui.input.starts_with('/') && !ui.input.contains(' ');
-            ui.selected = 0;
+            ui.accept_paste(text);
             continue;
         }
         if let Event::Mouse(mouse) = &next {
@@ -1693,6 +1867,10 @@ pub async fn run(
             continue;
         }
         match key.code {
+            KeyCode::Esc if ui.paste_chip.is_some() => {
+                ui.paste_chip = None;
+                ui.status = "Paste discarded".into();
+            }
             KeyCode::Esc if ui.picker.is_some() => {
                 close_picker(&mut ui);
             }
@@ -1713,10 +1891,10 @@ pub async fn run(
                 ui.selected = 0;
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Readline kill-line when there is text; page up when not, so
-                // the scroll keys never depend on a full input box.
+                // Readline kill-line when there is text; half page up when
+                // not, so the scroll keys never depend on a full input box.
                 if ui.input.is_empty() {
-                    ui.scroll_page(false);
+                    ui.scroll_half_page(false);
                 } else {
                     ui.clear_input();
                 }
@@ -1725,11 +1903,17 @@ pub async fn run(
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if ui.input.is_empty() {
-                    ui.scroll_page(true);
+                    ui.scroll_half_page(true);
                 } else {
                     ui.delete_forward();
                 }
                 ui.completion = None;
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ui.cursor = 0;
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ui.cursor = ui.input.len();
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ui.delete_word_before_cursor();
@@ -1741,14 +1925,17 @@ pub async fn run(
                 ui.selected = 0;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Repaint, do not destroy: a stray Ctrl+L used to wipe the
-                // transcript. Clearing lives in /clear now.
-                ui.renderer.previous.clear();
-                ui.renderer.full_redraw = true;
-                ui.scroll_end();
+                // Ctrl+L clears the visible transcript and forces a full
+                // redraw; the session and the conversation context survive
+                // (spec 1.3), and /clear --context is what drops those.
+                ui.clear_transcript();
+                ui.push(
+                    Speaker::System,
+                    "Transcript cleared. Session context and history are kept.",
+                );
                 ui.palette = false;
                 ui.selected = 0;
-                ui.status = "Screen repainted".into();
+                ui.status = "Transcript cleared".into();
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ui.set_input("/".into());
@@ -1855,8 +2042,25 @@ pub async fn run(
                 ui.picker_query.pop();
                 ui.selected = 0;
             }
-            KeyCode::Char(ch) => {
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 ui.navigation_mode = false;
+                let token_start = ui.input.is_empty()
+                    || ui.input[..ui.cursor]
+                        .chars()
+                        .last()
+                        .is_some_and(char::is_whitespace);
+                if ch == '@' && token_start && !ui.palette && ui.picker_all.is_none() {
+                    let files = list_files_for_mention(&ui.root);
+                    ui.picker = Some(("Mention files".into(), files.clone()));
+                    ui.picker_all = Some(files);
+                    ui.picker_query.clear();
+                    ui.selected = 0;
+                    ui.status = "@ mention · type to filter · Enter insert · Esc cancel".into();
+                    continue;
+                }
                 let opening = ch == '/' && ui.input.is_empty();
                 ui.insert(ch);
                 if opening {
@@ -1880,6 +2084,10 @@ pub async fn run(
             KeyCode::Delete if ui.cursor < ui.input.len() => {
                 ui.input.remove(ui.cursor);
             }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => ui.move_word_left(),
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => ui.move_word_right(),
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => ui.move_word_left(),
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => ui.move_word_right(),
             KeyCode::Left => ui.move_left(),
             KeyCode::Right => ui.move_right(),
             KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_home(),
@@ -1954,6 +2162,11 @@ pub async fn run(
                 ui.palette = false;
             }
             KeyCode::Enter => {
+                if let Some((pasted, _)) = ui.paste_chip.take() {
+                    ui.insert_str(&pasted);
+                    ui.status = "Pasted into the input".into();
+                    continue;
+                }
                 if ui.picker.is_some() {
                     let title = ui
                         .picker
@@ -1966,6 +2179,8 @@ pub async fn run(
                     if let Some(choice) = choices.get(selected) {
                         if title == "Prompt history" {
                             ui.set_input(choice.clone());
+                        } else if title == "Mention files" {
+                            ui.insert_str(&format!("@{choice} "));
                         } else {
                             let _ = crate::ctf::copy_to_clipboard(choice);
                             ui.status = "Flag history entry copied".into();
@@ -1985,8 +2200,8 @@ pub async fn run(
                 if line.is_empty() {
                     continue;
                 }
-                ui.history.push(line.clone());
-                ui.scroll_end();
+                ui.push_history(line.clone());
+                save_history(&ui.history);
                 ui.push(Speaker::User, line.clone());
                 if line == "/quit" || line == "/exit" {
                     break;
@@ -2135,11 +2350,7 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
     while event::poll(Duration::ZERO)? {
         match event::read()? {
             Event::Paste(text) => {
-                for ch in text.chars() {
-                    if ch != '\r' {
-                        ui.insert(ch);
-                    }
-                }
+                ui.accept_paste(&text);
                 ui.completion = None;
             }
             Event::Mouse(mouse) => match mouse.kind {
@@ -2149,22 +2360,32 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
             },
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
                 if control && key.code == KeyCode::Char('c') {
                     return Ok(true);
                 }
                 match key.code {
-                    KeyCode::Char(ch) if !control => {
+                    KeyCode::Esc if ui.paste_chip.is_some() => {
+                        ui.paste_chip = None;
+                    }
+                    KeyCode::Char(ch) if !control && !alt => {
                         ui.navigation_mode = false;
                         ui.insert(ch);
                     }
                     KeyCode::Backspace if !control => ui.backspace(),
                     KeyCode::Delete => ui.delete_forward(),
+                    KeyCode::Left if alt => ui.move_word_left(),
+                    KeyCode::Right if alt => ui.move_word_right(),
                     KeyCode::Left if !control => ui.move_left(),
                     KeyCode::Right if !control => ui.move_right(),
                     KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         ui.insert('\n');
                     }
                     KeyCode::Enter if ui.input.is_empty() => {}
+                    KeyCode::Enter if ui.paste_chip.is_some() => {
+                        let (pasted, _) = ui.paste_chip.take().expect("chip is present");
+                        ui.insert_str(&pasted);
+                    }
                     KeyCode::Enter => {
                         let queued = ui.take_input();
                         ui.completion = None;
@@ -2173,6 +2394,7 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
                             format!("Queued while thinking: {}", clip(&queued, 72)),
                         );
                         ui.status = format!("Thinking · {} queued", ui.pending.len() + 1);
+                        ui.push_history(queued.clone());
                         ui.pending.push(queued);
                     }
                     KeyCode::Home if ui.input.is_empty() => ui.scroll_home(),
@@ -2185,14 +2407,14 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
                     KeyCode::PageDown => ui.scroll_page(true),
                     KeyCode::Char('u') if control => {
                         if ui.input.is_empty() {
-                            ui.scroll_page(false);
+                            ui.scroll_half_page(false);
                         } else {
                             ui.clear_input();
                         }
                     }
                     KeyCode::Char('d') if control => {
                         if ui.input.is_empty() {
-                            ui.scroll_page(true);
+                            ui.scroll_half_page(true);
                         } else {
                             ui.delete_forward();
                         }
@@ -2226,7 +2448,6 @@ async fn run_turn_queue(
             return Ok(true);
         };
         ui.pending.remove(0);
-        ui.scroll_end();
         ui.push(Speaker::User, next.clone());
         line = next;
         ui.status = format!("Queued · {} left", ui.pending.len());
@@ -2355,6 +2576,72 @@ fn filter_picker_items(items: &[String], query: &str) -> Vec<String> {
         .filter(|item| commands::fuzzy_score(item, &needle).is_some())
         .cloned()
         .collect()
+}
+
+/// `~/.wrosecode/history` — prompt history survives restarts (spec 1.2).
+fn history_file() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".wrosecode").join("history"))
+}
+
+/// Load persisted prompt history, dropping consecutive duplicates and
+/// anything past the 500-entry cap `push_history` enforces.
+fn load_history() -> Vec<String> {
+    let Some(path) = history_file() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.dedup();
+    while lines.len() > 500 {
+        lines.remove(0);
+    }
+    lines
+}
+
+/// Best-effort save: a read-only home directory must not fail the shell.
+fn save_history(history: &[String]) {
+    let Some(path) = history_file() else {
+        return;
+    };
+    let mut text = history.join("\n");
+    text.push('\n');
+    let _ = std::fs::write(path, text);
+}
+
+/// Files offered by the `@` mention picker: a fuzzy-filterable slice of the
+/// project tree, skipping VCS/build noise and capped so a huge repository
+/// cannot stall a keystroke (spec 1.2).
+fn list_files_for_mention(root: &str) -> Vec<String> {
+    let skip_dirs = [".git", "target", "node_modules", ".wrosecode"];
+    let mut files = Vec::new();
+    let walker = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !(entry.file_type().is_dir() && skip_dirs.contains(&name.as_ref()))
+        });
+    for entry in walker.flatten() {
+        if files.len() >= 400 {
+            break;
+        }
+        if entry.file_type().is_file() {
+            if let Ok(relative) = entry.path().strip_prefix(root) {
+                files.push(relative.to_string_lossy().into_owned());
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 /// What an open picker should display: the query-filtered list when the picker
@@ -2601,18 +2888,20 @@ async fn run_command(
     match name {
         "/help" => ui.push(Speaker::System, commands::help()),
         "/clear" => {
-            ui.entries.clear();
-            ui.tool_rows.clear();
-            ui.tool_timeline.clear();
-            ui.last_flag.clear();
-            ui.search_query.clear();
-            ui.search_matches.clear();
-            ui.search_position = 0;
-            ui.scroll_end();
-            ui.push(
-                Speaker::System,
-                "Transcript cleared. Session context and history are kept (Ctrl+L repaints without clearing).",
-            );
+            let drop_context = args.split_whitespace().any(|flag| flag == "--context");
+            ui.clear_transcript();
+            if drop_context {
+                agent.messages.clear();
+                ui.push(
+                    Speaker::System,
+                    "Transcript and context cleared. The next turn starts fresh.",
+                );
+            } else {
+                ui.push(
+                    Speaker::System,
+                    "Transcript cleared. Session context and history are kept (Ctrl+L does the same · /clear --context drops context).",
+                );
+            }
         }
         "/build" | "/plan" => {
             let mode = name.trim_start_matches('/');
@@ -3571,7 +3860,20 @@ mod tests {
         ui.scroll_up(5);
         assert_eq!(ui.scroll, 5);
         assert!(!ui.is_following());
-        assert_eq!(ui.follow_marker(), " · ↑5 lines");
+        assert_eq!(
+            ui.follow_marker(),
+            " · ↓ 0 new lines  (End to jump)",
+            "detached state advertises the jump hint (spec 1.1)"
+        );
+
+        // Output that lands while detached is counted for the indicator.
+        ui.push(Speaker::System, "late arrival");
+        assert_eq!(ui.new_since_detach, 2, "entry plus its separator line");
+        assert_eq!(
+            ui.follow_marker(),
+            " · ↓ 2 new lines  (End to jump)",
+            "the counter feeds the indicator"
+        );
 
         ui.scroll_up(10_000);
         assert_eq!(ui.scroll, ui.max_scroll, "scroll_up clamps at the top");
@@ -3590,6 +3892,24 @@ mod tests {
         ui.scroll_end();
         assert_eq!(ui.scroll, 0);
         assert_eq!(ui.follow_marker(), String::new());
+        assert_eq!(
+            ui.new_since_detach, 0,
+            "End clears the new-lines counter along with the offset"
+        );
+    }
+
+    #[test]
+    fn ctrl_u_ctrl_d_scroll_half_a_page() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 60);
+        ui.compose(100, 30);
+        let page = ui.page_size;
+        assert!(page > 4, "a full page must be bigger than a half page");
+
+        ui.scroll_half_page(false);
+        assert_eq!(ui.scroll, page.div_ceil(2).min(ui.max_scroll));
+        ui.scroll_half_page(true);
+        assert!(ui.is_following(), "half a page down returns to the bottom");
     }
 
     #[test]
@@ -3717,8 +4037,8 @@ mod tests {
             "a scrolled-up view stays put while the draft grows"
         );
         assert!(
-            frame[2].text.contains("↑4 lines"),
-            "the header advertises how far back you are: {:?}",
+            frame[2].text.contains("↓ 0 new lines  (End to jump)"),
+            "the header advertises the jump hint while detached: {:?}",
             frame[2].text
         );
 
@@ -3780,6 +4100,186 @@ mod tests {
         ui.clear_input();
         assert_eq!(ui.input, "");
         assert_eq!(ui.cursor, 0);
+    }
+
+    #[test]
+    fn word_jumps_follow_readline_semantics() {
+        let mut ui = shell();
+        ui.set_input("hello world".into());
+        ui.cursor = ui.input.len();
+        ui.move_word_left();
+        assert_eq!(ui.cursor, 6, "Alt+Left lands on the current word start");
+        ui.move_word_left();
+        assert_eq!(ui.cursor, 0, "Alt+Left again crosses to the line start");
+        ui.move_word_right();
+        assert_eq!(ui.cursor, 6, "Alt+Right skips the word and the separator");
+        ui.move_word_right();
+        assert_eq!(
+            ui.cursor, 11,
+            "Alt+Right past the last word ends at the line end"
+        );
+
+        ui.set_input("  spaced  out  ".into());
+        ui.cursor = 3;
+        ui.move_word_left();
+        assert_eq!(ui.cursor, 2, "Alt+Left inside a word jumps to its start");
+        ui.move_word_right();
+        assert_eq!(ui.cursor, 10, "Alt+Right jumps over word and separator");
+
+        ui.cursor = 0;
+        ui.move_word_left();
+        assert_eq!(ui.cursor, 0, "Alt+Left at the start does nothing");
+        ui.cursor = ui.input.len();
+        ui.move_word_right();
+        assert_eq!(
+            ui.cursor,
+            ui.input.len(),
+            "Alt+Right at the end does nothing"
+        );
+    }
+
+    #[test]
+    fn prompt_history_drops_consecutive_duplicates_and_caps() {
+        let mut ui = shell();
+        ui.push_history("first".into());
+        ui.push_history("first".into());
+        ui.push_history("second".into());
+        ui.push_history("first".into());
+        assert_eq!(
+            ui.history,
+            vec!["first", "second", "first"],
+            "only consecutive duplicates collapse"
+        );
+        ui.history.clear();
+        for index in 0..520 {
+            ui.push_history(format!("line {index}"));
+        }
+        assert_eq!(ui.history.len(), 500, "the list is capped at 500");
+        assert_eq!(ui.history.first().map(String::as_str), Some("line 20"));
+    }
+
+    #[test]
+    fn long_pastes_become_an_expandable_chip() {
+        let mut ui = shell();
+        ui.accept_paste("one line");
+        assert!(
+            ui.paste_chip.is_none(),
+            "a short paste types straight through"
+        );
+        assert_eq!(ui.input, "one line");
+
+        let big: String = (0..300).map(|index| format!("line {index}\n")).collect();
+        ui.accept_paste(&big);
+        let (text, lines) = ui
+            .paste_chip
+            .clone()
+            .expect("a 300-line paste becomes a chip, not keystrokes");
+        assert_eq!(lines, 300);
+        assert_eq!(text, big);
+        assert_eq!(
+            ui.input, "one line",
+            "the chip does not touch the draft until Enter"
+        );
+
+        // The chip owns a row between the separator and the prompt.
+        let (frame, _) = ui.compose(100, 30);
+        assert!(
+            frame[28].text.contains("[Pasted 300 lines]"),
+            "chip row: {:?}",
+            frame[28].text
+        );
+        assert!(
+            frame[26].text.contains("Ready") || frame[26].text.starts_with(' '),
+            "the status line shifts up to make room: {:?}",
+            frame[26].text
+        );
+    }
+
+    #[test]
+    fn multiline_input_grows_then_scrolls() {
+        let mut ui = shell();
+        ui.set_input("one".into());
+        assert_eq!(ui.input_rows(), 1);
+
+        ui.set_input("one\ntwo".into());
+        assert_eq!(ui.input_rows(), 2, "the draft grows a row per line");
+        let (frame, (_, y)) = ui.compose(100, 30);
+        assert_eq!(y, 29, "the caret sits on the draft's last row");
+        assert!(frame[28].text.starts_with("> one"), "{:?}", frame[28].text);
+        assert!(frame[29].text.contains("two"), "{:?}", frame[29].text);
+
+        // Ten lines are capped at a four-row box that follows the caret.
+        let long = (0..10)
+            .map(|index| format!("line{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.set_input(long);
+        ui.cursor = ui.input.len();
+        assert_eq!(ui.input_rows(), 4, "the box stops growing after four rows");
+        let (frame, (_, y)) = ui.compose(100, 30);
+        assert_eq!(y, 29, "the caret stays on the bottom row of the box");
+        assert!(
+            frame[29].text.contains("line9"),
+            "the window follows the caret: {:?}",
+            frame[29].text
+        );
+        assert!(
+            frame[26].text.contains("line6"),
+            "the box starts four rows above the caret: {:?}",
+            frame[26].text
+        );
+        assert!(
+            frame[26].text.starts_with("↳ "),
+            "a scrolled window marks its first row: {:?}",
+            frame[26].text
+        );
+
+        // The caret walks up: the window follows it back toward the top.
+        ui.cursor = 0;
+        let (frame, (_, y)) = ui.compose(100, 30);
+        assert_eq!(y, 26, "caret on the first line of the visible window");
+        assert!(
+            frame[26].text.starts_with("> line0"),
+            "{:?}",
+            frame[26].text
+        );
+    }
+
+    #[test]
+    fn clearing_keeps_history_and_context_fields() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 10);
+        ui.push_history("remembered".into());
+        ui.tool_rows.insert("tool-1".into(), 3);
+        ui.clear_transcript();
+        assert!(ui.entries.is_empty(), "the visible transcript is cleared");
+        assert!(ui.tool_rows.is_empty());
+        assert_eq!(
+            ui.history,
+            vec!["remembered"],
+            "history survives a clear (spec 1.3)"
+        );
+        assert_eq!(ui.transcript_key, None, "the wrap cache is invalidated");
+    }
+
+    #[test]
+    fn mention_picker_skips_build_and_vcs_noise() {
+        let root = std::env::temp_dir().join(format!("wrose-mention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("temp src dir");
+        std::fs::create_dir_all(root.join("target/debug")).expect("temp target dir");
+        std::fs::create_dir_all(root.join(".git")).expect("temp git dir");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").expect("temp source");
+        std::fs::write(root.join("target/debug/wrosecode"), "binary").expect("temp binary");
+        std::fs::write(root.join(".git/config"), "[core]").expect("temp git config");
+
+        let files = list_files_for_mention(root.to_str().expect("utf-8 path"));
+        assert_eq!(
+            files,
+            vec!["src/main.rs".to_string()],
+            "only project files are offered to @"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

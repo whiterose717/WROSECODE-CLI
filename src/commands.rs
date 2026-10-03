@@ -59,7 +59,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/clear",
         category: "Session",
-        description: "Clear the transcript (conversation context is kept)",
+        description: "Clear the transcript (add --context to also drop conversation context)",
     },
     CommandSpec {
         name: "/theme",

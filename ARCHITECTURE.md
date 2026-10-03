@@ -32,9 +32,11 @@ virtualized — the transcript is wrapped once into `transcript_lines`, keyed by
 content and pane width, and scrolling reslices that cache instead of
 re-wrapping, so a long history costs nothing per frame. `PageUp`/`PageDown`
 page by the real viewport height, `Home`/`End` jump the transcript when the
-input is empty, the header reports `· ↑N lines` whenever the view is not
-following the bottom, and `/clear` drops the transcript while keeping the
-conversation context. `Ctrl+L` repaints rather than destroys.
+input is empty, the header reports `· ↓ N new lines  (End to jump)` whenever
+the view is not following the bottom (each line pushed while detached feeds
+the count until `End`), and `/clear` drops the transcript while keeping the
+conversation context. `Ctrl+L` clears the visible transcript and redraws;
+only `/clear --context` also drops conversation context.
 
 Input is never dropped while a model turn is running: keys land in the input
 box, `Enter` queues the message for after the reply (the status line shows
