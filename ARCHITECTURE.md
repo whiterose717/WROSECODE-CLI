@@ -23,7 +23,24 @@ plus `--summary json` prints a `TaskComplete` object, `--until`/`--until-cmd`/
 platform verdict onto shell-friendly exit codes (0/2/1). Integration tests in
 `tests/` exercise those paths against local mock HTTP servers.
 
-The TUI builds a complete frame but the renderer compares it with the prior frame and writes changed rows only. Mouse resizing changes the horizontal split without clearing the terminal.
+The TUI builds a complete frame but the renderer compares it with the prior frame and writes changed rows only, clearing any rows a shrinking frame leaves behind. Mouse resizing changes the horizontal split without clearing the terminal.
+
+Frame layout is `Ui::compose(width, height)`, a pure function split out of
+rendering: it returns the rows and caret position and is what the unit tests
+assert on (including exact output at 10x4, 23x7, and 80x24). Scrollback is
+virtualized — the transcript is wrapped once into `transcript_lines`, keyed by
+content and pane width, and scrolling reslices that cache instead of
+re-wrapping, so a long history costs nothing per frame. `PageUp`/`PageDown`
+page by the real viewport height, `Home`/`End` jump the transcript when the
+input is empty, the header reports `· ↑N lines` whenever the view is not
+following the bottom, and `/clear` drops the transcript while keeping the
+conversation context. `Ctrl+L` repaints rather than destroys.
+
+Input is never dropped while a model turn is running: keys land in the input
+box, `Enter` queues the message for after the reply (the status line shows
+`queued N`), and `Ctrl+C` cancels only that turn by truncating the messages the
+turn appended. `tests/e2e_tui.rs` drives all of this through a real PTY
+(`script` from util-linux) and skips itself where that helper is unavailable.
 
 Terminal control is decided once per run by `TerminalProfile` (see `src/tui.rs`):
 a pure `decide` function takes the configured alternate-screen flag, the

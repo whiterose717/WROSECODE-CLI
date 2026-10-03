@@ -57,6 +57,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "List, add, or remove MCP servers",
     },
     CommandSpec {
+        name: "/clear",
+        category: "Session",
+        description: "Clear the transcript (conversation context is kept)",
+    },
+    CommandSpec {
         name: "/new",
         category: "Session",
         description: "Archive this session and start a new one",
@@ -222,6 +227,7 @@ mod tests {
     fn registry_contains_all_requested_commands() {
         for name in [
             "/agents",
+            "/clear",
             "/commit",
             "/connect",
             "/debug",

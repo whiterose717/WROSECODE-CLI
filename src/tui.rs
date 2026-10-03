@@ -76,6 +76,17 @@ impl Renderer {
                 Print(&row.text)
             )?;
         }
+        // A shrinking frame (resize, closing a picker) must not leave the old
+        // tail on screen.
+        if rows.len() < self.previous.len() {
+            for index in rows.len()..self.previous.len() {
+                queue!(
+                    out,
+                    cursor::MoveTo(0, index as u16),
+                    Clear(ClearType::CurrentLine)
+                )?;
+            }
+        }
         queue!(
             out,
             SetForegroundColor(Color::Reset),
@@ -281,6 +292,19 @@ struct Ui {
     error_count: usize,
     last_error_kind: &'static str,
     completion: Option<CompletionState>,
+    /// Wrapped transcript rows, rebuilt only when the transcript, the pane
+    /// width, or the verbosity changes. Scrolling just reslices this, which is
+    /// what keeps a long session from re-wrapping every line on every key.
+    transcript_lines: Vec<String>,
+    transcript_key: Option<(usize, usize, usize, bool)>,
+    transcript_rebuilds: u64,
+    /// Rows the transcript viewport could show at the last render; PageUp and
+    /// friends page by this instead of a hardcoded five lines.
+    page_size: usize,
+    /// Largest scroll offset the last render allowed (`0` means "at bottom").
+    max_scroll: usize,
+    /// Messages typed while the agent was thinking, sent after the turn ends.
+    pending: Vec<String>,
 }
 
 /// State for cycling through Tab completions with the same token.
@@ -297,8 +321,66 @@ const LOGO: [&str; 3] = [
     "╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝",
 ];
 
+/// The handful of agent facts the shell paints. Split from `Ui::new` so tests
+/// can build a `Ui` without an `Agent` (constructing one opens the session
+/// store under `$HOME`, which would make tests environment-dependent).
+struct UiMeta {
+    root: String,
+    provider: String,
+    model: String,
+    harness: String,
+    permission: String,
+    verbosity: String,
+    category: String,
+    thinking_level: u8,
+    theme: usize,
+    timeout_seconds: u64,
+    budget_usd: f64,
+}
+
+impl From<&Agent> for UiMeta {
+    fn from(agent: &Agent) -> Self {
+        Self {
+            root: agent.config.root.display().to_string(),
+            provider: agent.config.provider.clone(),
+            model: agent.config.model.clone(),
+            harness: agent.harness.name().into(),
+            permission: format!("{:?}", agent.config.permission).to_ascii_lowercase(),
+            verbosity: agent.config.verbosity.clone(),
+            category: agent.ctf.category.clone(),
+            thinking_level: agent.thinking_level,
+            theme: theme_index(&agent.config.ui_theme),
+            timeout_seconds: agent.config.shell_timeout_seconds,
+            budget_usd: agent.config.budget_usd,
+        }
+    }
+}
+
+#[cfg(test)]
+impl UiMeta {
+    fn for_test() -> Self {
+        Self {
+            root: "/tmp/wrose-test".into(),
+            provider: "stub".into(),
+            model: "stub-model".into(),
+            harness: "Claude".into(),
+            permission: "ask".into(),
+            verbosity: "normal".into(),
+            category: "misc".into(),
+            thinking_level: 5,
+            theme: 0,
+            timeout_seconds: 30,
+            budget_usd: 0.0,
+        }
+    }
+}
+
 impl Ui {
     fn new(agent: &Agent, session_id: String) -> Self {
+        Self::from_meta(UiMeta::from(agent), session_id)
+    }
+
+    fn from_meta(meta: UiMeta, session_id: String) -> Self {
         Self {
             renderer: Renderer::new(),
             entries: vec![Entry {
@@ -306,7 +388,7 @@ impl Ui {
                 text: format!(
                     "WROSECODE v{} · session {}\n\
                      Type a request · /help commands · Ctrl+P palette\n\
-                     Tab build/plan · [ ] thinking · Esc then j/k to scroll",
+                     Tab build/plan · [ ] thinking · PgUp/PgDn scroll · /clear",
                     env!("CARGO_PKG_VERSION"),
                     session_id
                 ),
@@ -321,12 +403,12 @@ impl Ui {
             draft: String::new(),
             busy: false,
             spinner: 0,
-            root: agent.config.root.display().to_string(),
-            provider: agent.config.provider.clone(),
-            model: agent.config.model.clone(),
-            harness: agent.harness.name().into(),
+            root: meta.root,
+            provider: meta.provider,
+            model: meta.model,
+            harness: meta.harness,
             mode: "BUILD".into(),
-            permission: format!("{:?}", agent.config.permission).to_ascii_lowercase(),
+            permission: meta.permission,
             palette: false,
             selected: 0,
             picker: None,
@@ -334,26 +416,26 @@ impl Ui {
             picker_query: String::new(),
             mask_input: false,
             tool_rows: HashMap::new(),
-            verbosity: agent.config.verbosity.clone(),
+            verbosity: meta.verbosity,
             tool_calls: 0,
             tool_failures: 0,
             session_started: std::time::Instant::now(),
             session_id,
-            category: agent.ctf.category.clone(),
-            thinking_level: agent.thinking_level,
+            category: meta.category,
+            thinking_level: meta.thinking_level,
             usage: Usage::default(),
             flags_found: 0,
             navigation_mode: false,
-            theme: theme_index(&agent.config.ui_theme),
+            theme: meta.theme,
             pane_percent: 68,
             dragging_separator: false,
             tool_timeline: Vec::new(),
             metrics: crate::metrics::MetricsSnapshot::default(),
-            timeout_seconds: agent.config.shell_timeout_seconds,
+            timeout_seconds: meta.timeout_seconds,
             search_query: String::new(),
             search_matches: Vec::new(),
             search_position: 0,
-            budget_usd: agent.config.budget_usd,
+            budget_usd: meta.budget_usd,
             last_flag: String::new(),
             turn_tokens: Vec::new(),
             turn_usage: Usage::default(),
@@ -361,6 +443,12 @@ impl Ui {
             last_turn_ms: 0,
             error_count: 0,
             last_error_kind: "",
+            transcript_lines: Vec::new(),
+            transcript_key: None,
+            transcript_rebuilds: 0,
+            page_size: 10,
+            max_scroll: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -383,6 +471,105 @@ impl Ui {
     fn record_error(&mut self, kind: &'static str) {
         self.error_count += 1;
         self.last_error_kind = kind;
+    }
+
+    fn transcript_key(&self, left_width: usize, verbose: bool) -> (usize, usize, usize, bool) {
+        (
+            self.entries.len(),
+            self.entries.iter().map(|entry| entry.text.len()).sum(),
+            left_width,
+            verbose,
+        )
+    }
+
+    /// Rebuild the wrapped transcript only when something it depends on
+    /// changed. Returns true when a rebuild happened (asserted by tests).
+    fn ensure_transcript(&mut self, left_width: usize, verbose: bool) -> bool {
+        let key = self.transcript_key(left_width, verbose);
+        if self.transcript_key == Some(key) {
+            return false;
+        }
+        let mut lines = Vec::new();
+        for entry in &self.entries {
+            lines.extend(entry_lines(entry, left_width, verbose));
+            lines.push(String::new());
+        }
+        self.transcript_lines = lines;
+        self.transcript_key = Some(key);
+        self.transcript_rebuilds += 1;
+        true
+    }
+
+    /// Scroll by `lines` toward the top, clamped to what the last render
+    /// could actually show.
+    fn scroll_up(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_add(lines).min(self.max_scroll);
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    fn scroll_page(&mut self, down: bool) {
+        let page = self.page_size.max(1);
+        if down {
+            self.scroll_down(page);
+        } else {
+            self.scroll_up(page);
+        }
+    }
+
+    fn scroll_home(&mut self) {
+        self.scroll = self.max_scroll;
+    }
+
+    fn scroll_end(&mut self) {
+        self.scroll = 0;
+    }
+
+    fn is_following(&self) -> bool {
+        self.scroll == 0
+    }
+
+    fn clear_input(&mut self) {
+        self.set_input(String::new());
+        self.completion = None;
+    }
+
+    /// Readline-style Ctrl+W: drop the word before the cursor.
+    fn delete_word_before_cursor(&mut self) {
+        let head = &self.input[..self.cursor];
+        // Trim the word itself, leaving the separator that preceded it, so
+        // "hello world" becomes "hello " instead of vanishing entirely.
+        let word_start = head.trim_end_matches(|ch: char| !ch.is_whitespace()).len();
+        if word_start == head.len() {
+            // Only whitespace (or nothing) before the cursor: drop one char.
+            self.backspace();
+            return;
+        }
+        self.input.replace_range(word_start..self.cursor, "");
+        self.cursor = word_start;
+    }
+
+    fn delete_forward(&mut self) {
+        if self.cursor < self.input.len() {
+            let end = self.input[self.cursor..]
+                .chars()
+                .next()
+                .map(|ch| self.cursor + ch.len_utf8())
+                .unwrap_or(self.cursor);
+            self.input.replace_range(self.cursor..end, "");
+        }
+    }
+
+    /// ` · ↑N lines` when the viewport is detached from the bottom, so the
+    /// user can tell follow mode is off.
+    fn follow_marker(&self) -> String {
+        if self.is_following() || self.max_scroll == 0 {
+            String::new()
+        } else {
+            format!(" · ↑{} lines", self.scroll)
+        }
     }
 
     /// Insert a transcript row while keeping a scrolled-up viewport anchored.
@@ -485,11 +672,18 @@ impl Ui {
 
     fn render(&mut self) -> io::Result<()> {
         let (width, height) = terminal::size()?;
+        let (frame, cursor) = self.compose(width, height);
+        self.renderer.draw(&frame, cursor, (width, height))
+    }
+
+    /// Build one frame for a `width` x `height` terminal. Layout only, no IO,
+    /// so tests can assert exact row text at awkward sizes.
+    fn compose(&mut self, width: u16, height: u16) -> (Vec<Row>, (u16, u16)) {
         let width_usize = width as usize;
         let height_usize = height as usize;
         let mut frame = vec![Row::new("", Color::Reset); height_usize];
         if height_usize == 0 {
-            return Ok(());
+            return (frame, (0, 0));
         }
         let colors = theme(self.theme);
         let show_logo = self.entries.len() <= 1 && self.input.is_empty() && !self.busy;
@@ -558,53 +752,52 @@ impl Ui {
         }
         let body_end = height_usize.saturating_sub(3);
         let body_height = body_end.saturating_sub(body_start);
+        // The clamp keeps a usable left pane but must never exceed the
+        // terminal itself: on a 23-column screen the old bounds produced a
+        // 24-column pane and pushed rows two cells past the edge.
         let left_width = width_usize
             .saturating_mul(self.pane_percent)
             .checked_div(100)
             .unwrap_or(0)
-            .clamp(24, width_usize.saturating_sub(22).max(24));
+            .clamp(24, width_usize.saturating_sub(22).max(24))
+            .min(width_usize.saturating_sub(1));
         let right_width = width_usize.saturating_sub(left_width + 1);
         let top_height = body_height.saturating_mul(2).checked_div(3).unwrap_or(0);
         let bottom_height = body_height.saturating_sub(top_height);
-        let mut transcript = Vec::new();
-        // Only stream the live draft into the viewport when it is pinned to the
-        // bottom; otherwise its growth would shift a scrolled-up view every tick.
-        let draft_entry = (self.scroll == 0 && !self.draft.is_empty()).then(|| Entry {
-            speaker: Speaker::Agent,
-            text: self.draft.clone(),
-        });
-        for entry in self.entries.iter().chain(draft_entry.iter()) {
-            let label = match entry.speaker {
-                Speaker::User => "YOU",
-                Speaker::Agent => "WROSE",
-                Speaker::Tool => "TOOL",
-                Speaker::System => "INFO",
-            };
-            let available = left_width.saturating_sub(9).max(1);
-            for (part_index, line) in entry.text.lines().enumerate() {
-                for (wrap_index, part) in if self.verbosity == "verbose" {
-                    wrap(line, available)
-                } else {
-                    vec![clip(line, available)]
-                }
-                .into_iter()
-                .enumerate()
-                {
-                    let prefix = if part_index == 0 && wrap_index == 0 {
-                        format!(" {label:<5} ")
-                    } else {
-                        "       ".into()
-                    };
-                    transcript.push(clip(&format!("{prefix}{part}"), left_width));
-                }
-            }
-            transcript.push(String::new());
-        }
+        // Wrapped rows come from the cache; scrolling reslices instead of
+        // re-wrapping, and only the visible window is ever read below.
+        let verbose = self.verbosity == "verbose";
+        self.ensure_transcript(left_width, verbose);
+        let base = self.transcript_lines.len();
+        // The live draft only joins the view when the viewport is pinned to
+        // the bottom; otherwise its growth would shift a scrolled-up view.
+        let draft_lines: Vec<String> = if self.scroll == 0 && !self.draft.is_empty() {
+            entry_lines(
+                &Entry {
+                    speaker: Speaker::Agent,
+                    text: self.draft.clone(),
+                },
+                left_width,
+                verbose,
+            )
+        } else {
+            Vec::new()
+        };
         let transcript_height = top_height.saturating_sub(1);
-        let max_scroll = transcript.len().saturating_sub(transcript_height);
-        self.scroll = self.scroll.min(max_scroll);
-        let transcript_end = transcript.len().saturating_sub(self.scroll);
+        let total_lines = base + draft_lines.len();
+        self.max_scroll = total_lines.saturating_sub(transcript_height);
+        self.scroll = self.scroll.min(self.max_scroll);
+        self.page_size = transcript_height.max(1);
+        let transcript_end = total_lines.saturating_sub(self.scroll);
         let transcript_start = transcript_end.saturating_sub(transcript_height);
+        let mut visible: Vec<&str> = Vec::with_capacity(transcript_height);
+        for index in transcript_start..transcript_end {
+            if let Some(line) = self.transcript_lines.get(index) {
+                visible.push(line.as_str());
+            } else if let Some(line) = draft_lines.get(index - base) {
+                visible.push(line.as_str());
+            }
+        }
 
         let usage_max = [
             self.usage.input,
@@ -711,19 +904,19 @@ impl Ui {
         for row in 0..top_height {
             let left = if row == 0 {
                 format!(
-                    " TRANSCRIPT  {} {}",
+                    " TRANSCRIPT  {} {}{}",
                     self.entries.len(),
                     if self.entries.len() == 1 {
                         "entry"
                     } else {
                         "entries"
-                    }
+                    },
+                    self.follow_marker()
                 )
             } else {
-                transcript
-                    .get(transcript_start + row - 1)
-                    .filter(|_| transcript_start + row - 1 < transcript_end)
-                    .cloned()
+                visible
+                    .get(row - 1)
+                    .map(|line| (*line).to_string())
                     .unwrap_or_default()
             };
             let right = dashboard.get(row).cloned().unwrap_or_default();
@@ -832,11 +1025,17 @@ impl Ui {
         }
         let status_row = height_usize.saturating_sub(3);
         let spinner = SPINNER;
+        let queue_note = if self.pending.is_empty() {
+            String::new()
+        } else {
+            format!(" · queued {}", self.pending.len())
+        };
         let status_text = if self.busy {
             format!(
-                " {} {} • {} · {}w • tok {}/{} • cost {} • cache {}% • timeout {}s • tools {}:{} • {}s • think {}",
+                " {} {}{} • {} · {}w • tok {}/{} • cost {} • cache {}% • timeout {}s • tools {}:{} • {}s • think {}",
                 spinner[self.spinner % spinner.len()],
                 self.status,
+                queue_note,
                 speed_tier(self.thinking_level),
                 level_workers(self.thinking_level),
                 self.usage.input,
@@ -854,8 +1053,8 @@ impl Ui {
             )
         } else {
             format!(
-                " {} • {} · {}w • tok {}/{} • cost {} • cache {}% • tools {}:{} • errors {} • flags {} • {}s • think {}",
-                self.status, speed_tier(self.thinking_level),
+                " {}{} • {} · {}w • tok {}/{} • cost {} • cache {}% • tools {}:{} • errors {} • flags {} • {}s • think {}",
+                self.status, queue_note, speed_tier(self.thinking_level),
                 level_workers(self.thinking_level), self.usage.input, self.usage.output,
                 self.metrics.cost_usd.map(|cost| format!("${cost:.4}")).unwrap_or_else(|| "n/a".into()),
                 cache_percent(self.usage), self.tool_calls,
@@ -898,8 +1097,7 @@ impl Ui {
             }
         }
         let x = (2 + cursor_chars.saturating_sub(start)).min(width_usize.saturating_sub(1)) as u16;
-        self.renderer
-            .draw(&frame, (x, height.saturating_sub(1)), (width, height))
+        (frame, (x, height.saturating_sub(1)))
     }
 
     fn insert(&mut self, ch: char) {
@@ -940,6 +1138,37 @@ impl Ui {
 
 fn clip(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
+}
+
+/// One transcript entry as rendered rows: label on the first line, indented
+/// continuation lines after it, clipped to the transcript pane.
+fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
+    let label = match entry.speaker {
+        Speaker::User => "YOU",
+        Speaker::Agent => "WROSE",
+        Speaker::Tool => "TOOL",
+        Speaker::System => "INFO",
+    };
+    let available = left_width.saturating_sub(9).max(1);
+    let mut lines = Vec::new();
+    for (part_index, line) in entry.text.lines().enumerate() {
+        for (wrap_index, part) in if verbose {
+            wrap(line, available)
+        } else {
+            vec![clip(line, available)]
+        }
+        .into_iter()
+        .enumerate()
+        {
+            let prefix = if part_index == 0 && wrap_index == 0 {
+                format!(" {label:<5} ")
+            } else {
+                "       ".into()
+            };
+            lines.push(clip(&format!("{prefix}{part}"), left_width));
+        }
+    }
+    lines
 }
 
 #[derive(Clone, Copy)]
@@ -1147,7 +1376,7 @@ fn error_suggestion(kind: &str) -> &'static str {
         "permission" => "Run with `--permission yolo` for full auto-approval, or allow this path in config.toml.",
         "parse" => "The provider returned malformed JSON; retry, or switch model with /models.",
         "network" => "Check connectivity and API keys with /providers, then retry the turn.",
-        "oom" => "Close other panes with Ctrl+U and lower the thinking level with `[`.",
+        "oom" => "Run /clear to drop the transcript and lower the thinking level with `[`.",
         _ => "Run /debug for a stack trace, then /providers to re-test the active provider.",
     }
 }
@@ -1398,12 +1627,8 @@ pub async fn run(
                         .clamp(40, 80);
                 }
                 MouseEventKind::Up(MouseButton::Left) => ui.dragging_separator = false,
-                MouseEventKind::ScrollUp => {
-                    ui.scroll = ui.scroll.saturating_add(agent.config.smooth_scroll_lines)
-                }
-                MouseEventKind::ScrollDown => {
-                    ui.scroll = ui.scroll.saturating_sub(agent.config.smooth_scroll_lines)
-                }
+                MouseEventKind::ScrollUp => ui.scroll_up(agent.config.smooth_scroll_lines),
+                MouseEventKind::ScrollDown => ui.scroll_down(agent.config.smooth_scroll_lines),
                 _ => {}
             }
             continue;
@@ -1418,7 +1643,15 @@ pub async fn run(
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && key.code == KeyCode::Char('c')
         {
-            break;
+            // One press clears what you were typing; a second press from an
+            // empty prompt exits.
+            if ui.input.is_empty() {
+                break;
+            }
+            ui.clear_input();
+            ui.completion = None;
+            ui.status = "Input cleared · Ctrl+C again to exit".into();
+            continue;
         }
         match key.code {
             KeyCode::Esc if ui.picker.is_some() => {
@@ -1441,13 +1674,27 @@ pub async fn run(
                 ui.selected = 0;
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.set_input(String::new());
-                ui.entries.clear();
-                ui.tool_rows.clear();
-                ui.scroll = 0;
-                ui.last_flag.clear();
+                // Readline kill-line when there is text; page up when not, so
+                // the scroll keys never depend on a full input box.
+                if ui.input.is_empty() {
+                    ui.scroll_page(false);
+                } else {
+                    ui.clear_input();
+                }
                 ui.palette = false;
                 ui.selected = 0;
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if ui.input.is_empty() {
+                    ui.scroll_page(true);
+                } else {
+                    ui.delete_forward();
+                }
+                ui.completion = None;
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ui.delete_word_before_cursor();
+                ui.completion = None;
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ui.set_input(String::new());
@@ -1455,17 +1702,14 @@ pub async fn run(
                 ui.selected = 0;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.entries.clear();
-                ui.tool_rows.clear();
-                ui.tool_timeline.clear();
-                ui.scroll = 0;
-                ui.last_flag.clear();
+                // Repaint, do not destroy: a stray Ctrl+L used to wipe the
+                // transcript. Clearing lives in /clear now.
+                ui.renderer.previous.clear();
+                ui.renderer.full_redraw = true;
+                ui.scroll_end();
                 ui.palette = false;
                 ui.selected = 0;
-                ui.push(
-                    Speaker::System,
-                    "Transcript cleared. Session context is preserved.",
-                );
+                ui.status = "Screen repainted".into();
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ui.set_input("/".into());
@@ -1531,14 +1775,10 @@ pub async fn run(
                 agent.thinking_level = (agent.thinking_level + 1).min(20);
                 ui.thinking_level = agent.thinking_level;
             }
-            KeyCode::Char('k') if ui.navigation_mode => {
-                ui.scroll = ui.scroll.saturating_add(1);
-            }
-            KeyCode::Char('j') if ui.navigation_mode => {
-                ui.scroll = ui.scroll.saturating_sub(1);
-            }
-            KeyCode::Char(' ') if ui.navigation_mode => ui.scroll = ui.scroll.saturating_sub(10),
-            KeyCode::Char('b') if ui.navigation_mode => ui.scroll = ui.scroll.saturating_add(10),
+            KeyCode::Char('k') if ui.navigation_mode => ui.scroll_up(1),
+            KeyCode::Char('j') if ui.navigation_mode => ui.scroll_down(1),
+            KeyCode::Char(' ') if ui.navigation_mode => ui.scroll_page(true),
+            KeyCode::Char('b') if ui.navigation_mode => ui.scroll_page(false),
             KeyCode::Char('/') if ui.navigation_mode => {
                 if let Some(query) = ask_line(&mut ui, "Search transcript", "")? {
                     ui.search_query = query.to_ascii_lowercase();
@@ -1603,14 +1843,14 @@ pub async fn run(
             }
             KeyCode::Left => ui.move_left(),
             KeyCode::Right => ui.move_right(),
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_home(),
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_end(),
+            KeyCode::Home if ui.input.is_empty() => ui.scroll_home(),
+            KeyCode::End if ui.input.is_empty() => ui.scroll_end(),
             KeyCode::Home => ui.cursor = 0,
             KeyCode::End => ui.cursor = ui.input.len(),
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.scroll = ui.scroll.saturating_add(5);
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.scroll = ui.scroll.saturating_sub(5);
-            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_up(5),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_down(5),
             KeyCode::Up if ui.palette => {
                 let len = commands::filtered(&ui.input).len();
                 if len > 0 {
@@ -1632,18 +1872,10 @@ pub async fn run(
             }
             // Scroll first whenever the viewport is away from the bottom, so the
             // transcript never gets "stuck" behind prompt-history navigation.
-            KeyCode::Up if ui.input.is_empty() && ui.scroll > 0 => {
-                ui.scroll = ui.scroll.saturating_add(1)
-            }
-            KeyCode::Down if ui.input.is_empty() && ui.scroll > 0 => {
-                ui.scroll = ui.scroll.saturating_sub(1)
-            }
-            KeyCode::Up if ui.input.is_empty() && ui.history_index.is_none() => {
-                ui.scroll = ui.scroll.saturating_add(1);
-            }
-            KeyCode::Down if ui.input.is_empty() && ui.history_index.is_none() => {
-                ui.scroll = ui.scroll.saturating_sub(1);
-            }
+            KeyCode::Up if ui.input.is_empty() && ui.scroll > 0 => ui.scroll_up(1),
+            KeyCode::Down if ui.input.is_empty() && ui.scroll > 0 => ui.scroll_down(1),
+            KeyCode::Up if ui.input.is_empty() && ui.history_index.is_none() => ui.scroll_up(1),
+            KeyCode::Down if ui.input.is_empty() && ui.history_index.is_none() => ui.scroll_down(1),
             KeyCode::Up => {
                 if !ui.history.is_empty() {
                     let index = ui
@@ -1665,8 +1897,8 @@ pub async fn run(
                     }
                 }
             }
-            KeyCode::PageUp => ui.scroll = ui.scroll.saturating_add(5),
-            KeyCode::PageDown => ui.scroll = ui.scroll.saturating_sub(5),
+            KeyCode::PageUp => ui.scroll_page(false),
+            KeyCode::PageDown => ui.scroll_page(true),
             KeyCode::Tab if !ui.input.is_empty() => complete_input(&mut ui, &agent),
             KeyCode::Tab => {
                 let next = if agent.mode == "build" {
@@ -1715,6 +1947,7 @@ pub async fn run(
                     continue;
                 }
                 ui.history.push(line.clone());
+                ui.scroll_end();
                 ui.push(Speaker::User, line.clone());
                 if line == "/quit" || line == "/exit" {
                     break;
@@ -1738,7 +1971,7 @@ pub async fn run(
                 } else if let Some(fact) = line.strip_prefix("#fact ") {
                     ui.push(Speaker::System, agent.memory.save(fact, false)?);
                 } else {
-                    if !run_prompt(&mut agent, &mut ui, &line, &mut events, &mut permissions)
+                    if !run_turn_queue(&mut agent, &mut ui, &line, &mut events, &mut permissions)
                         .await?
                     {
                         break;
@@ -1757,12 +1990,19 @@ pub async fn run(
     Ok(())
 }
 
+/// What ended a turn: the model answered, or the user interrupted it.
+enum TurnOutcome {
+    Done(Result<String>),
+    Cancelled,
+}
+
 async fn run_prompt(
     agent: &mut Agent,
     ui: &mut Ui,
     prompt: &str,
     events: &mut mpsc::UnboundedReceiver<Progress>,
     permissions: &mut mpsc::UnboundedReceiver<PermissionRequest>,
+    scroll_step: usize,
 ) -> Result<bool> {
     ui.category = crate::ctf::categorize(&agent.config.root, prompt);
     ui.busy = true;
@@ -1772,64 +2012,186 @@ async fn run_prompt(
     let project_root = agent.config.root.clone();
     let session_store = agent.store.clone();
     let metrics = agent.metrics.clone();
-    let turn = agent.turn(prompt);
-    tokio::pin!(turn);
-    let mut ticker = tokio::time::interval(Duration::from_millis(16));
-    loop {
-        tokio::select! {
-            result = &mut turn => {
-                while let Ok(message) = events.try_recv() { ui.apply_progress(message); }
-                ui.draft.clear();
-                ui.end_turn();
-                ui.busy = false;
-                ui.status = "Ready".into();
-                match result {
-                    Ok(reply) => ui.push(Speaker::Agent, if reply.is_empty() { "(no response)".into() } else { reply }),
-                    Err(error) => {
-                        crate::ctf::log_error(&project_root, "agent turn", &format!("{error:#}"));
-                        let kind = classify_error(&error.to_string());
-                        if kind == "rate_limit" {
-                            metrics.record_rate_limit();
-                        }
-                        let _ = session_store.record_error(
-                            &ui.session_id,
-                            kind,
-                            &error.to_string(),
-                            "agent turn",
-                        );
-                        ui.record_error(kind);
-                        ui.push(Speaker::System, format!(
-                            "Error [{}]: {error:#}\n   Fix: {}",
-                            kind,
-                            error_suggestion(kind)
-                        ));
-                    }
+    let messages_before = agent.messages.len();
+    // The turn future borrows `agent`, so it is confined to this block. Once
+    // the block ends the borrow is released and a cancelled turn can be
+    // rolled back instead of leaving half a conversation behind.
+    let outcome = {
+        let turn = agent.turn(prompt);
+        tokio::pin!(turn);
+        let mut ticker = tokio::time::interval(Duration::from_millis(16));
+        loop {
+            tokio::select! {
+                result = &mut turn => break TurnOutcome::Done(result),
+                Some(message) = events.recv() => {
+                    ui.apply_progress(message);
+                    ui.status = "Working".into();
+                    ui.render()?;
                 }
-                ui.render()?;
-                return Ok(true);
-            }
-            Some(message) = events.recv() => {
-                ui.apply_progress(message);
-                ui.status = "Working".into();
-                ui.render()?;
-            }
-            Some(request) = permissions.recv() => {
-                if !ask_permission(ui, request).await? { return Ok(false); }
-                ui.status = "Working".into();
-            }
-            _ = ticker.tick() => {
-                ui.spinner = ui.spinner.wrapping_add(1);
-                if event::poll(Duration::ZERO)? {
-                    match event::read()? {
-                        Event::Key(key) if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') => return Ok(false),
-                        Event::Key(key) if key.code == KeyCode::PageUp => ui.scroll = ui.scroll.saturating_add(5),
-                        Event::Key(key) if key.code == KeyCode::PageDown => ui.scroll = ui.scroll.saturating_sub(5),
-                        _ => {}
-                    }
+                Some(request) = permissions.recv() => {
+                    if !ask_permission(ui, request).await? { return Ok(false); }
+                    ui.status = "Working".into();
                 }
-                ui.render()?;
+                _ = ticker.tick() => {
+                    ui.spinner = ui.spinner.wrapping_add(1);
+                    // Keep the terminal usable while the model thinks: keys
+                    // land in the input box instead of being thrown away.
+                    if drain_turn_keys(ui, scroll_step)? {
+                        break TurnOutcome::Cancelled;
+                    }
+                    ui.render()?;
+                }
             }
         }
+    };
+    while let Ok(message) = events.try_recv() {
+        ui.apply_progress(message);
+    }
+    ui.draft.clear();
+    ui.end_turn();
+    ui.busy = false;
+    ui.status = "Ready".into();
+    match outcome {
+        TurnOutcome::Cancelled => {
+            agent.messages.truncate(messages_before);
+            ui.push(
+                Speaker::System,
+                "Turn cancelled. Your input and any queued messages are kept.",
+            );
+        }
+        TurnOutcome::Done(Ok(reply)) => ui.push(
+            Speaker::Agent,
+            if reply.is_empty() {
+                "(no response)".into()
+            } else {
+                reply
+            },
+        ),
+        TurnOutcome::Done(Err(error)) => {
+            crate::ctf::log_error(&project_root, "agent turn", &format!("{error:#}"));
+            let kind = classify_error(&error.to_string());
+            if kind == "rate_limit" {
+                metrics.record_rate_limit();
+            }
+            let _ =
+                session_store.record_error(&ui.session_id, kind, &error.to_string(), "agent turn");
+            ui.record_error(kind);
+            ui.push(
+                Speaker::System,
+                format!(
+                    "Error [{kind}]: {error:#}\n   Fix: {}",
+                    error_suggestion(kind)
+                ),
+            );
+        }
+    }
+    ui.render()?;
+    Ok(true)
+}
+
+/// Consume terminal input while a turn is running. Typing goes to the input
+/// box, Enter queues the message for after the turn, scroll keys move the
+/// viewport, and Ctrl+C cancels the turn (the TUI stays up).
+fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
+    while event::poll(Duration::ZERO)? {
+        match event::read()? {
+            Event::Paste(text) => {
+                for ch in text.chars() {
+                    if ch != '\r' {
+                        ui.insert(ch);
+                    }
+                }
+                ui.completion = None;
+            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => ui.scroll_up(scroll_step),
+                MouseEventKind::ScrollDown => ui.scroll_down(scroll_step),
+                _ => {}
+            },
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                if control && key.code == KeyCode::Char('c') {
+                    return Ok(true);
+                }
+                match key.code {
+                    KeyCode::Char(ch) if !control => {
+                        ui.navigation_mode = false;
+                        ui.insert(ch);
+                    }
+                    KeyCode::Backspace if !control => ui.backspace(),
+                    KeyCode::Delete => ui.delete_forward(),
+                    KeyCode::Left if !control => ui.move_left(),
+                    KeyCode::Right if !control => ui.move_right(),
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        ui.insert('\n');
+                    }
+                    KeyCode::Enter if ui.input.is_empty() => {}
+                    KeyCode::Enter => {
+                        let queued = ui.take_input();
+                        ui.completion = None;
+                        ui.push(
+                            Speaker::System,
+                            format!("Queued while thinking: {}", clip(&queued, 72)),
+                        );
+                        ui.status = format!("Thinking · {} queued", ui.pending.len() + 1);
+                        ui.pending.push(queued);
+                    }
+                    KeyCode::Home if ui.input.is_empty() => ui.scroll_home(),
+                    KeyCode::End if ui.input.is_empty() => ui.scroll_end(),
+                    KeyCode::Home => ui.cursor = 0,
+                    KeyCode::End => ui.cursor = ui.input.len(),
+                    KeyCode::Up => ui.scroll_up(1),
+                    KeyCode::Down => ui.scroll_down(1),
+                    KeyCode::PageUp => ui.scroll_page(false),
+                    KeyCode::PageDown => ui.scroll_page(true),
+                    KeyCode::Char('u') if control => {
+                        if ui.input.is_empty() {
+                            ui.scroll_page(false);
+                        } else {
+                            ui.clear_input();
+                        }
+                    }
+                    KeyCode::Char('d') if control => {
+                        if ui.input.is_empty() {
+                            ui.scroll_page(true);
+                        } else {
+                            ui.delete_forward();
+                        }
+                    }
+                    KeyCode::Char('w') if control => ui.delete_word_before_cursor(),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// Run one prompt, then everything that was queued while it was running.
+/// Returns `false` when the caller should exit the TUI.
+async fn run_turn_queue(
+    agent: &mut Agent,
+    ui: &mut Ui,
+    first: &str,
+    events: &mut mpsc::UnboundedReceiver<Progress>,
+    permissions: &mut mpsc::UnboundedReceiver<PermissionRequest>,
+) -> Result<bool> {
+    let scroll_step = agent.config.smooth_scroll_lines;
+    let mut line = first.to_string();
+    loop {
+        if !run_prompt(agent, ui, &line, events, permissions, scroll_step).await? {
+            return Ok(false);
+        }
+        let Some(next) = ui.pending.first().cloned() else {
+            return Ok(true);
+        };
+        ui.pending.remove(0);
+        ui.scroll_end();
+        ui.push(Speaker::User, next.clone());
+        line = next;
+        ui.status = format!("Queued · {} left", ui.pending.len());
+        ui.render()?;
     }
 }
 
@@ -1860,8 +2222,11 @@ async fn ask_permission(ui: &mut Ui, request: PermissionRequest) -> Result<bool>
                     modifiers,
                     ..
                 }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Deny this one call but keep the session alive; quitting
+                    // the whole TUI from a permission prompt is a trap.
                     let _ = request.response.send(false);
-                    return Ok(false);
+                    ui.push(Speaker::System, format!("Denied {}", request.action));
+                    return Ok(true);
                 }
                 Event::Resize(_, _) => ui.render()?,
                 _ => {}
@@ -2196,6 +2561,20 @@ async fn run_command(
     }
     match name {
         "/help" => ui.push(Speaker::System, commands::help()),
+        "/clear" => {
+            ui.entries.clear();
+            ui.tool_rows.clear();
+            ui.tool_timeline.clear();
+            ui.last_flag.clear();
+            ui.search_query.clear();
+            ui.search_matches.clear();
+            ui.search_position = 0;
+            ui.scroll_end();
+            ui.push(
+                Speaker::System,
+                "Transcript cleared. Session context and history are kept (Ctrl+L repaints without clearing).",
+            );
+        }
         "/build" | "/plan" => {
             let mode = name.trim_start_matches('/');
             agent.set_mode(mode)?;
@@ -2519,8 +2898,17 @@ async fn run_command(
             let prompt = std::fs::read_to_string(&path)?;
             let _ = std::fs::remove_file(path);
             if !prompt.trim().is_empty() {
+                ui.scroll_end();
                 ui.push(Speaker::User, prompt.clone());
-                run_prompt(agent, ui, &prompt, events, permissions).await?;
+                run_prompt(
+                    agent,
+                    ui,
+                    &prompt,
+                    events,
+                    permissions,
+                    agent.config.smooth_scroll_lines,
+                )
+                .await?;
                 save_session(session, agent, ui, &session_dir)?;
             }
         }
@@ -3053,6 +3441,258 @@ mod tests {
     fn sparkline_degrades_gracefully() {
         assert_eq!(sparkline(&[], 10), "·");
         assert!(!sparkline(&[1, 2, 3], 4).is_empty());
+    }
+
+    fn shell() -> Ui {
+        Ui::from_meta(UiMeta::for_test(), "test".into())
+    }
+
+    fn fill_transcript(ui: &mut Ui, entries: usize) {
+        for index in 0..entries {
+            ui.push(
+                Speaker::User,
+                format!("entry {index} padded with plenty of characters to wrap in narrow panes"),
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_helpers_clamp_and_track_follow_mode() {
+        let mut ui = shell();
+        assert!(ui.is_following());
+        fill_transcript(&mut ui, 60);
+        let (frame, _) = ui.compose(100, 30);
+        assert_eq!(frame.len(), 30);
+        assert!(ui.max_scroll > 0, "a long transcript must be scrollable");
+
+        ui.scroll_up(5);
+        assert_eq!(ui.scroll, 5);
+        assert!(!ui.is_following());
+        assert_eq!(ui.follow_marker(), " · ↑5 lines");
+
+        ui.scroll_up(10_000);
+        assert_eq!(ui.scroll, ui.max_scroll, "scroll_up clamps at the top");
+
+        ui.scroll_down(10_000);
+        assert!(ui.is_following(), "scroll_down clamps back to the bottom");
+
+        ui.scroll_page(false);
+        assert_eq!(ui.scroll, ui.page_size.min(ui.max_scroll));
+        assert!(!ui.is_following());
+        ui.scroll_page(true);
+        assert!(ui.is_following(), "one page down returns to follow mode");
+
+        ui.scroll_home();
+        assert_eq!(ui.scroll, ui.max_scroll);
+        ui.scroll_end();
+        assert_eq!(ui.scroll, 0);
+        assert_eq!(ui.follow_marker(), String::new());
+    }
+
+    #[test]
+    fn transcript_cache_only_rebuilds_when_the_wrapped_lines_change() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 40);
+        ui.compose(80, 24);
+        let first = ui.transcript_rebuilds;
+        assert_eq!(first, 1);
+
+        for _ in 0..5 {
+            ui.scroll_up(3);
+            ui.compose(80, 24);
+            ui.scroll_end();
+            ui.compose(80, 24);
+        }
+        assert_eq!(
+            ui.transcript_rebuilds, first,
+            "scrolling must reslice the cache, not re-wrap the transcript"
+        );
+
+        ui.push(Speaker::Agent, "fresh entry");
+        ui.compose(80, 24);
+        let after_entry = ui.transcript_rebuilds;
+        assert!(after_entry > first, "new content invalidates the cache");
+
+        ui.pane_percent = 50;
+        ui.compose(80, 24);
+        let after_width = ui.transcript_rebuilds;
+        assert!(after_width > after_entry, "a different pane width re-wraps");
+
+        ui.verbosity = "verbose".into();
+        ui.compose(80, 24);
+        assert!(
+            ui.transcript_rebuilds > after_width,
+            "verbosity changes the wrapped output"
+        );
+    }
+
+    #[test]
+    fn compose_writes_exact_rows_at_awkward_sizes() {
+        for (width, height) in [(10u16, 4u16), (23, 7), (80, 24)] {
+            let mut ui = shell();
+            fill_transcript(&mut ui, 30);
+            let (frame, cursor) = ui.compose(width, height);
+            let height = height as usize;
+            let width = width as usize;
+
+            assert_eq!(frame.len(), height, "one row per terminal line");
+            for (index, row) in frame.iter().enumerate() {
+                assert!(
+                    row.text.chars().count() <= width,
+                    "row {index} of {width}x{height} overflows: {:?}",
+                    row.text
+                );
+            }
+            assert_eq!(frame[height - 1].text, "> ", "the prompt owns the last row");
+            assert_eq!(
+                frame[height - 2].text,
+                "─".repeat(width),
+                "the divider owns the second-to-last row"
+            );
+            assert!(
+                frame[0].text.starts_with(" BUILD"),
+                "row 0 is the mode header: {:?}",
+                frame[0].text
+            );
+            assert_eq!(
+                cursor,
+                (2, (height - 1) as u16),
+                "the caret sits in the empty prompt"
+            );
+
+            if height >= 7 {
+                assert!(
+                    frame[1].text.chars().all(|ch| ch == '─'),
+                    "row 1 is the full-width rule: {:?}",
+                    frame[1].text
+                );
+                assert!(
+                    frame[2].text.starts_with(" TRANSCRIPT  31"),
+                    "row 2 is the transcript header: {:?}",
+                    frame[2].text
+                );
+            } else {
+                // A four-row terminal is too short for a transcript: the
+                // status line takes the slot under the mode header.
+                assert!(
+                    frame[1].text.starts_with(" Ready"),
+                    "row 1 is the status line: {:?}",
+                    frame[1].text
+                );
+            }
+            if width >= 80 {
+                // Following the bottom of a 30-entry transcript shows the
+                // newest lines, not the oldest ones.
+                assert!(
+                    frame.iter().any(|row| row.text.contains("entry 29 padded")),
+                    "the newest scrollback content renders at full size"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compose_pins_scrolled_history_and_releases_the_draft() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 40);
+        ui.draft = "streaming reply in progress".into();
+
+        let (frame, _) = ui.compose(80, 24);
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.text.contains("streaming reply in progress")),
+            "the live draft is visible while following"
+        );
+
+        ui.scroll_up(4);
+        let (frame, _) = ui.compose(80, 24);
+        assert!(
+            !frame
+                .iter()
+                .any(|row| row.text.contains("streaming reply in progress")),
+            "a scrolled-up view stays put while the draft grows"
+        );
+        assert!(
+            frame[2].text.contains("↑4 lines"),
+            "the header advertises how far back you are: {:?}",
+            frame[2].text
+        );
+
+        ui.scroll_end();
+        let (frame, _) = ui.compose(80, 24);
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.text.contains("streaming reply in progress")),
+            "returning to the bottom restores the draft"
+        );
+    }
+
+    #[test]
+    fn queued_messages_are_visible_in_the_status_line() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 10);
+        ui.busy = true;
+        ui.status = "Thinking".into();
+        ui.pending.push("second request".into());
+        let (frame, _) = ui.compose(80, 24);
+        let status = &frame[21].text;
+        assert!(status.contains("queued 1"), "status: {status}");
+    }
+
+    #[test]
+    fn input_editing_matches_readline_expectations() {
+        let mut ui = shell();
+        for ch in "hello world".chars() {
+            ui.insert(ch);
+        }
+        ui.delete_word_before_cursor();
+        assert_eq!(ui.input, "hello ", "Ctrl+W keeps the separator");
+
+        ui.delete_word_before_cursor();
+        assert_eq!(
+            ui.input, "hello",
+            "Ctrl+W on bare whitespace drops one char"
+        );
+        ui.delete_word_before_cursor();
+        assert_eq!(ui.input, "");
+        ui.delete_word_before_cursor();
+        assert_eq!(ui.input, "", "Ctrl+W on an empty line is a no-op");
+
+        for ch in "abc".chars() {
+            ui.insert(ch);
+        }
+        ui.cursor = 1;
+        ui.delete_forward();
+        assert_eq!(ui.input, "ac", "Delete removes forward only");
+
+        ui.cursor = 0;
+        ui.backspace();
+        assert_eq!(ui.input, "ac", "Backspace at the start does nothing");
+
+        for ch in "more".chars() {
+            ui.insert(ch);
+        }
+        ui.clear_input();
+        assert_eq!(ui.input, "");
+        assert_eq!(ui.cursor, 0);
+    }
+
+    #[test]
+    fn pushes_while_scrolled_stay_anchored() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 60);
+        ui.compose(80, 24);
+        ui.scroll_up(6);
+        let before = ui.scroll;
+        ui.push(Speaker::Agent, "new message while scrolled up");
+        ui.compose(80, 24);
+        assert!(
+            ui.scroll >= before,
+            "the viewport follows the content instead of jumping"
+        );
+        assert!(ui.scroll <= ui.max_scroll);
     }
 
     #[test]

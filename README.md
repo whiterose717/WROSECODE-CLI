@@ -78,7 +78,7 @@ File magic and extensions categorize common web, pwn, crypto, reverse
 engineering, and forensics tasks.
 
 A found flag raises a `🚩 FLAG ALERT` banner under the header and survives until
-the next turn or `Ctrl+L`. It also emits a terminal bell (`\x07`, disabled with
+the next turn or `/clear`. It also emits a terminal bell (`\x07`, disabled with
 `alert_bell = false`) and a desktop notification when `notify-send` is available,
 so a flag found in a background pane is not missed.
 
@@ -98,17 +98,22 @@ CTF skills cover recon, web, pwn, crypto, reverse engineering, forensics, stego,
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` | Scroll the transcript whenever the input box is empty |
-| `PageUp` / `PageDown` | Jump the transcript a screen at a time |
-| `Esc`, then `j` / `k` | Enter navigation mode and scroll with the single keys |
+| `PageUp` / `PageDown` | Move the transcript a full viewport at a time (at the real page size, not a fixed five lines) |
+| `Home` / `End` | Jump to the top or bottom of the transcript when the input is empty; otherwise move the caret |
+| `Ctrl+Home` / `Ctrl+End` | Always jump to the top or bottom of the transcript |
+| `Esc`, then `j` / `k` | Enter navigation mode and scroll with the single keys; `Space`/`b` page down/up |
 | `Shift+Enter` | Insert a newline |
-| `Enter` | Submit prompt or selected command |
+| `Enter` | Submit the prompt or selected command; during a turn it queues the message for after the reply |
 | `Ctrl+K` | Clear input |
-| `Ctrl+U` | Clear input and dismiss a flag alert |
-| `Ctrl+L` | Clear the transcript, tool timeline, and flag alert |
+| `Ctrl+U` | Clear input when there is text, otherwise page up |
+| `Ctrl+D` | Delete the character under the caret when there is text, otherwise page down |
+| `Ctrl+W` | Delete the word before the caret |
+| `Ctrl+L` | Repaint the screen and return to the bottom (it never clears the transcript; `/clear` does that) |
 | `Ctrl+Shift+C` | Copy latest output |
 | `[` / `]` | Lower or raise thinking level (0–20) |
 | `Tab` | Complete the current word (paths, slash commands, tool names) when the input is not empty; otherwise switch build and plan modes |
-| `Ctrl+C` | Exit |
+| `Ctrl+C` | Clear what you are typing, then exit on a second press. During a turn it cancels the turn instead of closing the shell |
+| Mouse wheel | Scroll the transcript (smooth scrolling follows `smooth_scroll_lines`) |
 
 Shell calls have a 30 second timeout and are terminated if stuck. Panics and turn errors are written to `.ctf/errors.log`; the TUI keeps provider errors visible with a recovery suggestion. One-shot runs print a computed usage report, and `--summary json` emits a machine-readable `TaskComplete` object.
 
@@ -244,7 +249,7 @@ docker run --rm -it -v "$PWD:/workspace" \
   -e ANTHROPIC_API_KEY wrosecode-sandbox --permission yolo
 ```
 
-With an interactive terminal, `wrosecode` opens a full-screen chat UI showing the conversation, tool activity, status, and a persistent input box. Anthropic text appears as it streams; the OpenAI-compatible backend displays its completed response. The UI redraws only changed lines. Type `/` at the start of the input to open the command palette. Keep typing to filter, use the arrow keys to select, press Enter to run, or Esc to close. `Tab` switches between build and read-only plan modes. Use `PageUp`/`PageDown` to scroll, `Up`/`Down` for prompt history, and `Ctrl+C` to exit. One-shot calls and piped input keep plain text output. The UI displays permission requests and accepts `y` or `n`.
+With an interactive terminal, `wrosecode` opens a full-screen chat UI showing the conversation, tool activity, status, and a persistent input box. Anthropic text appears as it streams; the OpenAI-compatible backend displays its completed response. The UI redraws only changed lines, renders just the visible slice of a long transcript, and pins itself to the bottom while new output arrives (the header shows `· ↑N lines` when you have scrolled away). Type `/` at the start of the input to open the command palette. Keep typing to filter, use the arrow keys to select, press Enter to run, or Esc to close. `Tab` switches between build and read-only plan modes. Use `PageUp`/`PageDown` to scroll, `Up`/`Down` for prompt history, and `Ctrl+C` to exit. Messages typed while a turn is running are kept: they are queued and sent after the reply, and `Ctrl+C` during a turn cancels just that turn. One-shot calls and piped input keep plain text output. The UI displays permission requests and accepts `y` or `n`; `Ctrl+C` there denies the request and stays in the session.
 
 The `delegate_task` tool can select a different `provider` and `model` for a child task. Supported provider names are `anthropic`, `openai-compat`, `ollama`, and `lm-studio`.
 
