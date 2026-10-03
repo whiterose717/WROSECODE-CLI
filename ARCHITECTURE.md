@@ -65,10 +65,36 @@ unit test), and `tests/e2e_tui.rs` proves from a real PTY that the stamp lands
 in the first bytes the process writes — the splash is the first frame, and
 provider/MCP/skill init never sit in front of it.
 
-Themes are one `const THEMES` list in `src/tui.rs`: `theme(index)` wraps,
-`theme_index` keeps legacy names like `wrose-dark` resolving to dark,
-`theme_position` answers `Ctrl+T` and `/theme NAME`, and `theme_names` feeds the
-picker and the unknown-theme list, so a palette cannot drift from the registry.
+Colour is decided once per process: `TerminalProfile::decide` maps `NO_COLOR`
+(or `--no-color`), `TERM`, and `COLORTERM` to a `ColorSupport` of `None`,
+`Ansi16`, `Ansi256`, or `TrueColor`, which drives both the splash's wordmark
+gradient (`gradient_paint` embeds SGR per character, degrading to a single
+accent wrap on Ansi16 and plain text on `None`; below 80 columns the art
+collapses to one `WROSECODE v…` line) and the compose path's per-character
+`Row::colors` gradient. Under `None` compose swaps in `PLAIN_THEME`, so frames
+emit no colour codes at all.
+
+Themes are one `const THEMES` list in `src/tui.rs` — dark, light, solarized,
+dracula, nord, mono — plus `USER_THEMES` loaded once from
+`~/.wrosecode/themes/*.toml` (`parse_theme` requires five hex colours and skips
+bad hex, unparsable files, or a shadow of a built-in name) at the top of
+`tui::run`, before `Ui::new` so `config.toml` can already name a user palette.
+`theme(index)` wraps over built-ins then user palettes, `theme_index` keeps
+legacy names like `wrose-dark` resolving to dark, `theme_position` answers
+`Ctrl+T` and `/theme NAME`, and `theme_names` feeds the picker and the
+unknown-theme list, so a palette cannot drift from the registry.
+
+While the transcript is empty, `compose` renders the start screen: the gradient
+wordmark (session, category, speed tier, paint stamp), an info panel with
+provider/model, thinking and resource budget, sandbox and approval, working
+directory, mode, harness, git branch, and MCP and skill counts, then provider
+health with a `/providers` hint, a rotating tip advanced from the spinner tick,
+three recent sessions with one-line `resume` suggestions, and a `/ctf` hint.
+After the first message it collapses to a one-line `WROSECODE v…` header. The
+bottom status line leads with the run state, model, `think:` level, tokens,
+cache hit rate, elapsed seconds, and the per-turn tool step, then sandbox,
+tier, workers, cost, and tool counts — front-loaded so the fields that matter
+survive clipping on narrow terminals.
 
 Metrics are a separate hot-path object shared as `Arc`: every provider response
 and tool call records into counters, per-model totals, and a fixed-bucket

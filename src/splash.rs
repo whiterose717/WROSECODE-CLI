@@ -52,13 +52,48 @@ pub fn banner(paint_ms: Option<u128>) -> Vec<String> {
         env!("CARGO_PKG_VERSION")
     ));
     if let Some(ms) = paint_ms {
-        lines.push(if ms <= FIRST_PAINT_BUDGET_MS {
-            format!("  first paint {ms}ms · budget {FIRST_PAINT_BUDGET_MS}ms")
-        } else {
-            format!("  first paint {ms}ms · over budget {FIRST_PAINT_BUDGET_MS}ms")
-        });
+        lines.push(timing_line(ms));
     }
     lines
+}
+
+fn timing_line(ms: u128) -> String {
+    if ms <= FIRST_PAINT_BUDGET_MS {
+        format!("  first paint {ms}ms · budget {FIRST_PAINT_BUDGET_MS}ms")
+    } else {
+        format!("  first paint {ms}ms · over budget {FIRST_PAINT_BUDGET_MS}ms")
+    }
+}
+
+/// Splash rows for a specific terminal: wordmark rows first (gradient-painted
+/// to match `colors`), then the plain tail lines. Below 80 columns the block
+/// art collapses to a single `WROSECODE v…` line.
+pub fn paint_lines(
+    width: u16,
+    colors: crate::tui::ColorSupport,
+    paint_ms: Option<u128>,
+) -> Vec<String> {
+    if width < 80 {
+        let mut painted = vec![crate::tui::gradient_paint(
+            &format!("WROSECODE v{}", env!("CARGO_PKG_VERSION")),
+            colors,
+        )];
+        if let Some(ms) = paint_ms {
+            painted.push(timing_line(ms));
+        }
+        return painted;
+    }
+    banner(paint_ms)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if index < LOGO.len() {
+                crate::tui::gradient_paint(&row, colors)
+            } else {
+                row
+            }
+        })
+        .collect()
 }
 
 /// Take over the screen: clear it (alternate screens start as whatever was
@@ -67,11 +102,14 @@ pub fn banner(paint_ms: Option<u128>) -> Vec<String> {
 pub fn paint(profile: TerminalProfile, boot: &Instant) -> io::Result<()> {
     let ms = boot.elapsed().as_millis();
     let _ = FIRST_PAINT_MS.set(ms);
+    let width = crossterm::terminal::size()
+        .map(|(width, _)| width)
+        .unwrap_or(80);
     let mut out = io::stdout().lock();
     if profile.alternate {
         execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
     }
-    for line in banner(Some(ms)) {
+    for line in paint_lines(width, profile.colors, Some(ms)) {
         writeln!(out, "{line}")?;
     }
     out.flush()

@@ -29,6 +29,9 @@ struct Row {
     text: String,
     fg: Color,
     bg: Color,
+    /// Per-character colours for the wordmark gradient. `None` keeps the
+    /// single-`fg` fast path every other row uses.
+    colors: Option<Vec<Color>>,
 }
 
 impl Row {
@@ -37,6 +40,7 @@ impl Row {
             text: text.into(),
             fg,
             bg: Color::Reset,
+            colors: None,
         }
     }
 }
@@ -74,9 +78,25 @@ impl Renderer {
                 cursor::MoveTo(0, index as u16),
                 SetForegroundColor(row.fg),
                 SetBackgroundColor(row.bg),
-                Clear(ClearType::CurrentLine),
-                Print(&row.text)
+                Clear(ClearType::CurrentLine)
             )?;
+            match &row.colors {
+                // Gradient rows paint one colour per character; the row-level
+                // `fg` above still lands first so the tail after the gradient
+                // has a sane colour even if the colour list runs short.
+                Some(palette) => {
+                    let mut painted = 0usize;
+                    for (character, color) in row.text.chars().zip(palette) {
+                        queue!(out, SetForegroundColor(*color), Print(character))?;
+                        painted += 1;
+                    }
+                    let rest: String = row.text.chars().skip(painted).collect();
+                    if !rest.is_empty() {
+                        queue!(out, SetForegroundColor(row.fg), Print(rest))?;
+                    }
+                }
+                None => queue!(out, Print(&row.text))?,
+            }
         }
         // A shrinking frame (resize, closing a picker) must not leave the old
         // tail on screen.
@@ -110,6 +130,7 @@ pub struct TerminalProfile {
     pub alternate: bool,
     pub mouse: bool,
     pub full_redraw: bool,
+    pub colors: ColorSupport,
 }
 
 /// The terminal facts [`TerminalProfile::decide`] reasons over. Collected from the
@@ -122,6 +143,10 @@ pub struct TerminalEnv {
     pub multiplexer: bool,
     pub no_alt_screen: bool,
     pub force_full_redraw: bool,
+    /// `NO_COLOR` set to a non-empty value, or `--no-color` on the command line.
+    pub force_no_color: bool,
+    /// `COLORTERM` — `truecolor`/`24bit` advertises 24-bit colour.
+    pub colorterm: String,
 }
 
 impl TerminalEnv {
@@ -137,19 +162,23 @@ impl TerminalEnv {
             multiplexer: std::env::var_os("ZELLIJ").is_some(),
             no_alt_screen: std::env::var_os("WROSECODE_NO_ALT_SCREEN").is_some(),
             force_full_redraw: std::env::var_os("WROSECODE_FULL_REDRAW").is_some(),
+            force_no_color: std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+            colorterm: std::env::var("COLORTERM").unwrap_or_default(),
         }
     }
 }
 
 impl TerminalProfile {
     /// `configured_alternate` comes from `[ui] alternate_screen`; `mouse_capture`
-    /// is `"auto"`, `"on"` or `"off"`.
-    pub fn detect(configured_alternate: bool, mouse_capture: Option<&str>) -> Self {
-        Self::decide(
-            configured_alternate,
-            mouse_capture,
-            &TerminalEnv::from_process(),
-        )
+    /// is `"auto"`, `"on"` or `"off"`. `no_color_flag` is `--no-color`.
+    pub fn detect(
+        configured_alternate: bool,
+        mouse_capture: Option<&str>,
+        no_color_flag: bool,
+    ) -> Self {
+        let mut env = TerminalEnv::from_process();
+        env.force_no_color |= no_color_flag;
+        Self::decide(configured_alternate, mouse_capture, &env)
     }
 
     /// Pure decision function. `mouse_capture` of `None` means `"auto"`.
@@ -174,12 +203,228 @@ impl TerminalProfile {
         // Multiplexers that composite their own cell grid keep stale glyphs unless
         // the whole frame is repainted every tick.
         let full_redraw = env.multiplexer || env.force_full_redraw;
+        // `NO_COLOR` (and `--no-color`) turn colour off entirely; otherwise pick
+        // the richest channel the terminal advertises so the wordmark gradient
+        // can degrade from truecolor to the 256-colour cube to plain ANSI.
+        let colors = if env.force_no_color || dumb {
+            ColorSupport::None
+        } else if env.colorterm.contains("truecolor") || env.colorterm.contains("24bit") {
+            ColorSupport::TrueColor
+        } else if env.term.contains("256color") {
+            ColorSupport::Ansi256
+        } else {
+            ColorSupport::Ansi16
+        };
         Self {
             alternate,
             mouse,
             full_redraw,
+            colors,
         }
     }
+}
+
+/// How much colour the current terminal can show. Drives the wordmark
+/// gradient (truecolor → 256 → plain) and everything that opts out of
+/// painting via `NO_COLOR` / `--no-color`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ColorSupport {
+    None,
+    Ansi16,
+    Ansi256,
+    TrueColor,
+}
+
+impl ColorSupport {
+    /// Whether per-character gradient painting is worth doing at this level.
+    pub fn gradient(self) -> bool {
+        matches!(self, Self::Ansi256 | Self::TrueColor)
+    }
+}
+
+/// Sample points for the wordmark gradient: sky → violet → pink.
+const GRADIENT_STOPS: [(u8, u8, u8); 3] = [(90, 200, 250), (167, 139, 250), (244, 114, 182)];
+
+fn lerp8(from: u8, to: u8, t: f32) -> u8 {
+    (from as f32 + (to as f32 - from as f32) * t).round() as u8
+}
+
+/// Sample the gradient at `t` in `0.0..=1.0`, piecewise-linear across the stops.
+fn sample_gradient(t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let segments = GRADIENT_STOPS.len() - 1;
+    let scaled = t * segments as f32;
+    let index = (scaled.floor() as usize).min(segments - 1);
+    let local = scaled - index as f32;
+    let (r1, g1, b1) = GRADIENT_STOPS[index];
+    let (r2, g2, b2) = GRADIENT_STOPS[index + 1];
+    (
+        lerp8(r1, r2, local),
+        lerp8(g1, g2, local),
+        lerp8(b1, b2, local),
+    )
+}
+
+/// Map 24-bit colour onto the xterm 6×6×6 colour cube for 256-colour terminals.
+fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    let component = |value: u8| -> u8 {
+        if value < 48 {
+            0
+        } else {
+            (((value as u16 - 35) / 40) as u8).min(5)
+        }
+    };
+    16 + 36 * component(r) + 6 * component(g) + component(b)
+}
+
+/// One colour per character of `text`, sampled from the wordmark gradient.
+/// `None` when the terminal cannot show the gradient (`Ansi16` falls back to
+/// the theme accent at the row level instead, `None` paints nothing).
+pub(crate) fn gradient_colors(text: &str, support: ColorSupport) -> Option<Vec<Color>> {
+    if !support.gradient() {
+        return None;
+    }
+    let chars = text.chars().count();
+    if chars == 0 {
+        return Some(Vec::new());
+    }
+    Some(
+        (0..chars)
+            .map(|index| {
+                let t = if chars == 1 {
+                    0.5
+                } else {
+                    index as f32 / (chars - 1) as f32
+                };
+                let (r, g, b) = sample_gradient(t);
+                match support {
+                    ColorSupport::TrueColor => Color::Rgb { r, g, b },
+                    _ => Color::AnsiValue(rgb_to_ansi256(r, g, b)),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The splash's pre-TUI equivalent of [`gradient_colors`]: returns `text`
+/// either plain (no colour), wrapped in one ANSI-16 accent, or carrying
+/// embedded SGR sequences per character. The escape codes live in the string
+/// because the splash writes bytes before the row renderer exists.
+pub(crate) fn gradient_paint(text: &str, support: ColorSupport) -> String {
+    let Some(palette) = gradient_colors(text, support) else {
+        return match support {
+            // The 16-colour fallback: the whole wordmark in the accent cyan.
+            ColorSupport::Ansi16 => format!("\x1b[36m{text}\x1b[0m"),
+            _ => text.to_string(),
+        };
+    };
+    let mut painted = String::new();
+    for (character, color) in text.chars().zip(&palette) {
+        match *color {
+            Color::Rgb { r, g, b } => painted.push_str(&format!("\x1b[38;2;{r};{g};{b}m")),
+            Color::AnsiValue(value) => painted.push_str(&format!("\x1b[38;5;{value}m")),
+            _ => {}
+        }
+        painted.push(character);
+    }
+    painted.push_str("\x1b[0m");
+    painted
+}
+
+/// The splash's rotating tips row (spec: Phase 2).
+const TIPS: [&str; 5] = [
+    "/ commands",
+    "@ files",
+    "ctrl+t thinking level",
+    "ctrl+d dashboard",
+    "ctrl+o expand output",
+];
+
+/// The wordmark / header when colour is off: every field `Reset` so a
+/// `NO_COLOR` session paints no foreground at all.
+const PLAIN_THEME: Theme = Theme {
+    name: "plain",
+    text: Color::Reset,
+    muted: Color::Reset,
+    accent: Color::Reset,
+    status: Color::Reset,
+    background: Color::Reset,
+};
+
+/// The project root's git branch, with a trailing `*` when tracked files are
+/// dirty. `None` outside a repository (or when git is not installed).
+fn git_state(root: &std::path::Path) -> Option<String> {
+    let branch = git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .or_else(|| git_stdout(root, &["symbolic-ref", "--short", "HEAD"]))?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return None;
+    }
+    // `diff-index` skips untracked files, which keeps this fast on big trees.
+    let dirty = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff-index", "--quiet", "HEAD", "--"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(false);
+    Some(if dirty {
+        format!("{branch}*")
+    } else {
+        branch.to_string()
+    })
+}
+
+fn git_stdout(root: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// One-line provider health for the splash: `3 connected · 2 need setup`.
+fn provider_health_line() -> String {
+    let Ok(settings) = Settings::load() else {
+        return "providers unavailable".into();
+    };
+    if settings.providers.is_empty() {
+        return "no providers yet · /connect".into();
+    }
+    let mut connected = 0usize;
+    let mut setup = 0usize;
+    for profile in &settings.providers {
+        if settings.key(profile).is_some() || settings.no_key_needed(profile) {
+            connected += 1;
+        } else {
+            setup += 1;
+        }
+    }
+    format!("{connected} connected · {setup} need setup")
+}
+
+/// The last three saved sessions (newest first) for the splash's resume rows.
+fn recent_sessions() -> Vec<(String, String)> {
+    Session::dir()
+        .ok()
+        .and_then(|dir| Session::list(&dir).ok())
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .take(3)
+                .map(|session| (session.name, session.summary))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Owns the raw-mode / alternate-screen / mouse capture state for the whole
@@ -322,6 +567,27 @@ struct Ui {
     /// A large bracketed paste waiting to be inserted: the text and its
     /// line count, so one big paste never hammers the key handlers.
     paste_chip: Option<(String, usize)>,
+    /// Colour depth for the wordmark gradient (from the terminal profile).
+    colors: ColorSupport,
+    /// `NO_COLOR` / `--no-color`: paint every row with the plain theme.
+    no_color: bool,
+    /// Current git branch of the project root, with a `*` when tracked files
+    /// are dirty. `None` outside a git repository.
+    git: Option<String>,
+    /// Connected MCP servers.
+    mcp_count: usize,
+    /// Discovered skills.
+    skill_count: usize,
+    /// Sandbox engine name (`none`, `docker`, …).
+    sandbox: String,
+    /// One-line provider health, e.g. `3 connected · 2 need setup`.
+    provider_health: String,
+    /// The last three saved sessions, newest first: (id, summary).
+    recent: Vec<(String, String)>,
+    /// Index into [`TIPS`] for the rotating splash tip row.
+    tip_index: usize,
+    /// Tool calls in the current turn — the status bar's `step n`.
+    turn_steps: usize,
 }
 
 /// State for cycling through Tab completions with the same token.
@@ -347,6 +613,12 @@ struct UiMeta {
     theme: usize,
     timeout_seconds: u64,
     budget_usd: f64,
+    git: Option<String>,
+    mcp_count: usize,
+    skill_count: usize,
+    sandbox: String,
+    provider_health: String,
+    recent: Vec<(String, String)>,
 }
 
 impl From<&Agent> for UiMeta {
@@ -363,6 +635,12 @@ impl From<&Agent> for UiMeta {
             theme: theme_index(&agent.config.ui_theme),
             timeout_seconds: agent.config.shell_timeout_seconds,
             budget_usd: agent.config.budget_usd,
+            git: git_state(std::path::Path::new(&agent.config.root)),
+            mcp_count: agent.tools.mcps.len(),
+            skill_count: agent.skills.len(),
+            sandbox: agent.config.sandbox.engine.clone(),
+            provider_health: provider_health_line(),
+            recent: recent_sessions(),
         }
     }
 }
@@ -382,6 +660,12 @@ impl UiMeta {
             theme: 0,
             timeout_seconds: 30,
             budget_usd: 0.0,
+            git: None,
+            mcp_count: 0,
+            skill_count: 0,
+            sandbox: "none".into(),
+            provider_health: "0 connected · 0 need setup".into(),
+            recent: Vec::new(),
         }
     }
 }
@@ -462,12 +746,28 @@ impl Ui {
             pending: Vec::new(),
             new_since_detach: 0,
             paste_chip: None,
+            colors: ColorSupport::None,
+            no_color: false,
+            git: meta.git,
+            mcp_count: meta.mcp_count,
+            skill_count: meta.skill_count,
+            sandbox: meta.sandbox,
+            provider_health: meta.provider_health,
+            recent: meta.recent,
+            tip_index: 0,
+            turn_steps: 0,
         }
     }
 
     fn begin_turn(&mut self) {
         self.turn_usage = Usage::default();
         self.turn_started = Some(std::time::Instant::now());
+        self.turn_steps = 0;
+    }
+
+    /// Advance the rotating splash tip (called from the spinner tick).
+    fn advance_tip(&mut self) {
+        self.tip_index = (self.tip_index + 1) % TIPS.len();
     }
 
     fn end_turn(&mut self) {
@@ -712,6 +1012,7 @@ impl Ui {
         match progress {
             Progress::ToolBegin { id, title } => {
                 self.tool_calls += 1;
+                self.turn_steps += 1;
                 let row = self.entries.len();
                 self.push_scrolled(
                     Entry {
@@ -805,43 +1106,152 @@ impl Ui {
         if height_usize == 0 {
             return (frame, (0, 0));
         }
-        let colors = theme(self.theme);
+        let colors = if self.no_color {
+            &PLAIN_THEME
+        } else {
+            theme(self.theme)
+        };
         let show_logo = self.entries.len() <= 1 && self.input.is_empty() && !self.busy;
         let show_alert = !self.last_flag.is_empty();
         let mut body_start = 0usize;
         if show_logo {
             let spin = SPINNER[self.spinner % SPINNER.len()];
-            for (index, line) in LOGO.iter().enumerate() {
+            let paint_note = match splash::first_paint_ms() {
+                Some(ms) => format!(" · paint {ms}ms"),
+                None => String::new(),
+            };
+            // Narrow terminals get a one-line wordmark instead of the block art.
+            let (lines, wide) = if width_usize < 80 {
+                (
+                    vec![format!("WROSECODE v{}", env!("CARGO_PKG_VERSION"))],
+                    false,
+                )
+            } else {
+                (LOGO.iter().map(|line| (*line).to_string()).collect(), true)
+            };
+            for (index, line) in lines.iter().enumerate() {
                 if body_start >= height_usize {
                     break;
                 }
-                let paint_note = match splash::first_paint_ms() {
-                    Some(ms) => format!(" · paint {ms}ms"),
-                    None => String::new(),
-                };
-                let tail = match index {
-                    0 => format!(
+                let tail = match (wide, index) {
+                    (false, 0) => format!(
+                        "  {spin}  session {} · [{}] · {}{paint_note}",
+                        self.session_id,
+                        self.category,
+                        speed_tier(self.thinking_level)
+                    ),
+                    (true, 0) => format!(
                         "  {spin}  session {} · [{}]{paint_note}",
                         self.session_id, self.category
                     ),
-                    2 => format!(
-                        "  WROSECODE v{} · {} · {}",
+                    (true, 2) => format!(
+                        "  WROSECODE v{} · {}",
                         env!("CARGO_PKG_VERSION"),
-                        speed_tier(self.thinking_level),
-                        self.root
+                        speed_tier(self.thinking_level)
                     ),
                     _ => String::new(),
                 };
-                frame[body_start] =
-                    Row::new(clip(&format!("{line}{tail}"), width_usize), colors.accent);
+                let text = clip(&format!("{line}{tail}"), width_usize);
+                let mut row = Row::new(text, colors.accent);
+                row.colors = gradient_colors(&row.text, self.colors);
+                frame[body_start] = row;
                 body_start += 1;
             }
-        }
-        if body_start < height_usize {
+            // Compact info panel beneath the wordmark: provider/model ·
+            // thinking · sandbox · approval · cwd, then mode/harness and the
+            // git, MCP, and skill counts.
+            if body_start < height_usize {
+                frame[body_start] = Row::new(
+                    clip(
+                        &format!(
+                            " {} / {} · think {} · {} · sandbox {} · {} · {}",
+                            self.provider,
+                            self.model,
+                            self.thinking_level,
+                            level_resources(self.thinking_level),
+                            self.sandbox,
+                            self.permission,
+                            self.root
+                        ),
+                        width_usize,
+                    ),
+                    colors.muted,
+                );
+                body_start += 1;
+            }
+            if body_start < height_usize {
+                let git = match &self.git {
+                    Some(branch) => format!(" · git {branch}"),
+                    None => String::new(),
+                };
+                frame[body_start] = Row::new(
+                    clip(
+                        &format!(
+                            " {} · {} · [{}]{} · {} mcp · {} skills",
+                            self.mode,
+                            self.harness,
+                            self.category,
+                            git,
+                            self.mcp_count,
+                            self.skill_count
+                        ),
+                        width_usize,
+                    ),
+                    colors.muted,
+                );
+                body_start += 1;
+            }
+            // Provider health with the hint to open /providers.
+            if body_start < height_usize {
+                frame[body_start] = Row::new(
+                    clip(
+                        &format!(" {} · /providers", self.provider_health),
+                        width_usize,
+                    ),
+                    colors.status,
+                );
+                body_start += 1;
+            }
+            // Rotating tips row.
+            if body_start < height_usize {
+                frame[body_start] = Row::new(
+                    clip(
+                        &format!(" tip · {}", TIPS[self.tip_index % TIPS.len()]),
+                        width_usize,
+                    ),
+                    colors.accent,
+                );
+                body_start += 1;
+            }
+            // Recent sessions with the resume shortcut, then the CTF hint.
+            for (name, summary) in &self.recent {
+                if body_start >= height_usize {
+                    break;
+                }
+                frame[body_start] = Row::new(
+                    clip(&format!("  resume {name}  ·  {summary}"), width_usize),
+                    colors.muted,
+                );
+                body_start += 1;
+            }
+            if body_start < height_usize {
+                frame[body_start] = Row::new(
+                    clip(
+                        "  ctf  wrosecode ctf <file|dir|url>  ·  or /ctf here",
+                        width_usize,
+                    ),
+                    colors.status,
+                );
+                body_start += 1;
+            }
+        } else if body_start < height_usize {
+            // The splash collapses into this slim header once the first
+            // message is sent: identity plus the facts that still matter.
             frame[body_start] = Row::new(
                 clip(
                     &format!(
-                        " {} • {} / {} • {} • {} • [{}] • think {} · {}",
+                        " WROSECODE v{} • {} • {} / {} • {} • {} • [{}] • think {} · {}",
+                        env!("CARGO_PKG_VERSION"),
                         self.mode,
                         self.provider,
                         self.model,
@@ -1051,7 +1461,7 @@ impl Ui {
             let right = dashboard.get(row).cloned().unwrap_or_default();
             frame[body_start + row] = Row::new(
                 join_panes(&left, &right, left_width, right_width),
-                theme(self.theme).text,
+                colors.text,
             );
         }
         let active: Vec<String> = self
@@ -1097,7 +1507,7 @@ impl Ui {
             if target < body_end {
                 frame[target] = Row::new(
                     join_panes(&left, &right, left_width, right_width),
-                    theme(self.theme).muted,
+                    colors.muted,
                 );
             }
         }
@@ -1131,8 +1541,9 @@ impl Ui {
             if top < body_end {
                 frame[top] = Row {
                     text: clip(&heading, width_usize),
-                    fg: theme(self.theme).accent,
+                    fg: colors.accent,
                     bg: Color::Black,
+                    colors: None,
                 };
             }
             let offset = self.selected.saturating_sub(visible.saturating_sub(1));
@@ -1145,10 +1556,11 @@ impl Ui {
                     ),
                     fg: if selected { Color::Black } else { Color::Grey },
                     bg: if selected {
-                        theme(self.theme).accent
+                        colors.accent
                     } else {
                         Color::Black
                     },
+                    colors: None,
                 };
             }
         }
@@ -1161,42 +1573,58 @@ impl Ui {
         };
         let status_text = if self.busy {
             format!(
-                " {} {}{} • {} · {}w • tok {}/{} • cost {} • cache {}% • timeout {}s • tools {}:{} • {}s • think {}",
+                " {} {}{} · {} · think:{} · tok {}/{} · cache {}% · {}s · step {} · {}/{} · {} · {}w · cost {} · timeout {}s · tools {}:{}",
                 spinner[self.spinner % spinner.len()],
                 self.status,
                 queue_note,
-                speed_tier(self.thinking_level),
-                level_workers(self.thinking_level),
+                self.model,
+                self.thinking_level,
                 self.usage.input,
                 self.usage.output,
+                cache_percent(self.usage),
+                self.session_started.elapsed().as_secs(),
+                self.turn_steps,
+                self.sandbox,
+                self.permission,
+                speed_tier(self.thinking_level),
+                level_workers(self.thinking_level),
                 self.metrics
                     .cost_usd
                     .map(|cost| format!("${cost:.4}"))
                     .unwrap_or_else(|| "n/a".into()),
-                cache_percent(self.usage),
                 self.timeout_seconds,
                 self.tool_calls,
                 self.tool_rows.len(),
-                self.session_started.elapsed().as_secs(),
-                self.thinking_level
             )
         } else {
             format!(
-                " {}{} • {} · {}w • tok {}/{} • cost {} • cache {}% • tools {}:{} • errors {} • flags {} • {}s • think {}",
-                self.status, queue_note, speed_tier(self.thinking_level),
-                level_workers(self.thinking_level), self.usage.input, self.usage.output,
+                " {}{} · {} · think:{} · tok {}/{} · cache {}% · {}s · step {} · {}/{} · {} · {}w · cost {} · tools {}:{} · errors {} · flags {}",
+                self.status,
+                queue_note,
+                self.model,
+                self.thinking_level,
+                self.usage.input,
+                self.usage.output,
+                cache_percent(self.usage),
+                self.session_started.elapsed().as_secs(),
+                self.turn_steps,
+                self.sandbox,
+                self.permission,
+                speed_tier(self.thinking_level),
+                level_workers(self.thinking_level),
                 self.metrics.cost_usd.map(|cost| format!("${cost:.4}")).unwrap_or_else(|| "n/a".into()),
-                cache_percent(self.usage), self.tool_calls,
-                self.tool_rows.len(), self.tool_failures, self.flags_found,
-                self.session_started.elapsed().as_secs(), self.thinking_level
+                self.tool_calls,
+                self.tool_rows.len(),
+                self.tool_failures,
+                self.flags_found,
             )
         };
         if status_row < height_usize {
-            frame[status_row] = Row::new(clip(&status_text, width_usize), theme(self.theme).status);
+            frame[status_row] = Row::new(clip(&status_text, width_usize), colors.status);
         }
         let separator_row = status_row.saturating_add(1);
         if separator_row < height_usize {
-            frame[separator_row] = Row::new("─".repeat(width_usize), theme(self.theme).muted);
+            frame[separator_row] = Row::new("─".repeat(width_usize), colors.muted);
         }
         if let Some((_, pasted_lines)) = &self.paste_chip {
             let chip_row = separator_row.saturating_add(1);
@@ -1206,7 +1634,7 @@ impl Ui {
                         &format!(" [Pasted {pasted_lines} lines]  ⏎ insert  ·  Esc discard"),
                         width_usize,
                     ),
-                    theme(self.theme).accent,
+                    colors.accent,
                 );
             }
         }
@@ -1215,7 +1643,7 @@ impl Ui {
         // and only the first line of the draft keeps the "> " marker.
         let input_top = height_usize.saturating_sub(input_rows);
         let input_width = width_usize.saturating_sub(3);
-        let input_color = input_syntax_color(&self.input, theme(self.theme));
+        let input_color = input_syntax_color(&self.input, colors);
         let draft_lines: Vec<&str> = self.input.split('\n').collect();
         let caret_line = self.input[..self.cursor].matches('\n').count();
         let skip = caret_line.saturating_sub(input_rows.saturating_sub(1));
@@ -1266,7 +1694,7 @@ impl Ui {
         }
         for row in &mut frame {
             if row.bg == Color::Reset {
-                row.bg = theme(self.theme).background;
+                row.bg = colors.background;
             }
         }
         let x = caret_x.min(width_usize.saturating_sub(1)) as u16;
@@ -1347,7 +1775,7 @@ fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
     lines
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Theme {
     name: &'static str,
     text: Color,
@@ -1409,12 +1837,41 @@ const THEMES: &[Theme] = &[
             b: 64,
         },
     },
+    // The NO_COLOR-friendly palette: named colours only, no RGB, so the whole
+    // frame stays inside the 16-colour baseline.
+    Theme {
+        name: "mono",
+        text: Color::White,
+        muted: Color::DarkGrey,
+        accent: Color::Grey,
+        status: Color::White,
+        background: Color::Black,
+    },
 ];
+
+/// User palettes from `~/.wrosecode/themes/*.toml`, loaded once at startup.
+/// `&'static Theme` because `theme()` hands out borrowed palettes on the hot
+/// render path.
+static USER_THEMES: std::sync::RwLock<Vec<&'static Theme>> = std::sync::RwLock::new(Vec::new());
+
+/// Built-in plus user palette count — what `Ctrl+T` and `/theme <name>`
+/// indices wrap over.
+fn theme_total() -> usize {
+    THEMES.len() + USER_THEMES.read().map(|extra| extra.len()).unwrap_or(0)
+}
 
 fn theme(index: usize) -> &'static Theme {
     // The index is a live cursor (Ctrl+T cycles it), so it wraps rather than
     // panicking when a palette is removed.
-    &THEMES[index % THEMES.len()]
+    let index = index % theme_total();
+    if index < THEMES.len() {
+        return &THEMES[index];
+    }
+    USER_THEMES
+        .read()
+        .ok()
+        .and_then(|extra| extra.get(index - THEMES.len()).copied())
+        .unwrap_or(&THEMES[0])
 }
 
 /// Config spelling to palette index. `"wrose-dark"` is the historical name of
@@ -1427,9 +1884,17 @@ fn theme_index(name: &str) -> usize {
 /// bogus` can say so instead of silently going dark.
 fn theme_position(name: &str) -> Option<usize> {
     let name = name.trim().to_ascii_lowercase();
-    THEMES
+    if let Some(index) = THEMES
         .iter()
         .position(|theme| theme.name == name || (theme.name == "dark" && name == "wrose-dark"))
+    {
+        return Some(index);
+    }
+    let extra = USER_THEMES.read().ok()?;
+    extra
+        .iter()
+        .position(|theme| theme.name == name)
+        .map(|index| THEMES.len() + index)
 }
 
 /// Startup timing for `/debug`: where the first frame landed against the
@@ -1450,7 +1915,114 @@ fn first_paint_line() -> String {
 }
 
 fn theme_names() -> Vec<&'static str> {
-    THEMES.iter().map(|theme| theme.name).collect()
+    let mut names: Vec<&'static str> = THEMES.iter().map(|theme| theme.name).collect();
+    if let Ok(extra) = USER_THEMES.read() {
+        names.extend(extra.iter().map(|theme| theme.name));
+    }
+    names
+}
+
+/// Flat theme file shape: five hex colours plus an optional name override.
+/// Anything missing or unparsable skips the file — a broken theme must never
+/// block startup.
+#[derive(serde::Deserialize)]
+struct ThemeFile {
+    #[serde(default)]
+    name: Option<String>,
+    text: String,
+    #[serde(default)]
+    muted: Option<String>,
+    accent: String,
+    status: String,
+    #[serde(default)]
+    background: Option<String>,
+}
+
+/// `#rrggbb` (or `rrggbb`) to a truecolor entry.
+fn hex_colour(value: &str) -> Option<Color> {
+    let hex = value.trim().trim_start_matches('#');
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(Color::Rgb {
+        r: u8::from_str_radix(&hex[0..2], 16).ok()?,
+        g: u8::from_str_radix(&hex[2..4], 16).ok()?,
+        b: u8::from_str_radix(&hex[4..6], 16).ok()?,
+    })
+}
+
+/// Parse one theme file. `fallback_name` is the file stem, used when the file
+/// carries no `name` key. Names are lowercased and may not shadow a
+/// built-in (that palette would be unreachable in `theme_position`).
+fn parse_theme(fallback_name: &str, source: &str) -> Option<Theme> {
+    let file: ThemeFile = toml::from_str(source).ok()?;
+    let text = hex_colour(&file.text)?;
+    let accent = hex_colour(&file.accent)?;
+    let status = hex_colour(&file.status)?;
+    let muted = match &file.muted {
+        Some(value) => hex_colour(value)?,
+        None => text,
+    };
+    let background = match &file.background {
+        Some(value) => hex_colour(value)?,
+        None => Color::Black,
+    };
+    let name = file
+        .name
+        .map(|name| name.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| fallback_name.trim().to_ascii_lowercase());
+    if name.is_empty() || THEMES.iter().any(|theme| theme.name == name) {
+        return None;
+    }
+    let name: &'static str = Box::leak(name.into_boxed_str());
+    Some(Theme {
+        name,
+        text,
+        muted,
+        accent,
+        status,
+        background,
+    })
+}
+
+/// Read every `*.toml` in `dir` into leaked palettes. Missing directory or
+/// unreadable files yield nothing.
+fn load_theme_files(dir: &std::path::Path) -> Vec<&'static Theme> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut loaded = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(theme) = parse_theme(stem, &source) {
+            loaded.push(&*Box::leak(Box::new(theme)));
+        }
+    }
+    loaded
+}
+
+/// Load `~/.wrosecode/themes/*.toml` into the shared registry. Called once
+/// from `tui::run` before `Ui::new` so `config.toml` can already name a user
+/// theme. A broken themes directory is silent, not fatal.
+fn register_user_themes() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = PathBuf::from(home).join(".wrosecode").join("themes");
+    let loaded = load_theme_files(&dir);
+    if let Ok(mut extra) = USER_THEMES.write() {
+        extra.clear();
+        extra.extend(loaded);
+    }
 }
 
 fn join_panes(left: &str, right: &str, left_width: usize, right_width: usize) -> String {
@@ -1774,11 +2346,16 @@ pub async fn run(
     agent.event_tx = Some(event_tx);
     agent.tools.permission_tx = Some(permission_tx);
     let mut settings = Settings::load()?;
+    // User palettes must exist before Ui::new: `ui_theme` in config.toml may
+    // name one.
+    register_user_themes();
     let session_dir = Session::dir()?;
     let mut session = initial_session.unwrap_or_else(Session::fresh);
     let mut ui = Ui::new(&agent, session.name.clone());
     ui.history = load_history();
     ui.renderer.full_redraw = profile.full_redraw;
+    ui.colors = profile.colors;
+    ui.no_color = profile.colors == ColorSupport::None;
     // Test hook: the PTY suite floods the transcript with
     // `WROSECODE_E2E_LINES` entries at startup so it can prove bottom-pinned
     // auto-follow and the detached-scroll indicator without a model. Unknown
@@ -1806,6 +2383,7 @@ pub async fn run(
     }
     let mut last_checkpoint = std::time::Instant::now();
     let mut last_spin = std::time::Instant::now();
+    let mut last_tip = std::time::Instant::now();
     loop {
         ui.render()?;
         if last_checkpoint.elapsed() >= Duration::from_secs(10) {
@@ -1817,6 +2395,10 @@ pub async fn run(
             if last_spin.elapsed() >= Duration::from_millis(90) {
                 ui.spinner = ui.spinner.wrapping_add(1);
                 last_spin = std::time::Instant::now();
+            }
+            if last_tip.elapsed() >= Duration::from_secs(4) {
+                ui.advance_tip();
+                last_tip = std::time::Instant::now();
             }
             continue;
         }
@@ -1944,7 +2526,7 @@ pub async fn run(
                 ui.status = "Command palette".into();
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.theme = (ui.theme + 1) % THEMES.len();
+                ui.theme = (ui.theme + 1) % theme_total();
                 ui.status = format!("Theme: {}", theme(ui.theme).name);
             }
             KeyCode::Char('e')
@@ -3797,7 +4379,7 @@ mod tests {
     fn theme_registry_is_stable_and_round_trips() {
         assert_eq!(
             theme_names(),
-            ["dark", "light", "solarized", "dracula", "nord"]
+            ["dark", "light", "solarized", "dracula", "nord", "mono"]
         );
         for (position, name) in theme_names().iter().enumerate() {
             assert_eq!(theme_position(name), Some(position), "{name}");
@@ -3806,6 +4388,215 @@ mod tests {
         }
         assert_eq!(theme_position("nope"), None);
         assert_eq!(theme(THEMES.len()).name, "dark", "the cycle wraps");
+    }
+
+    #[test]
+    fn mono_stays_inside_the_16_colour_baseline() {
+        let mono = theme(theme_position("mono").expect("mono registered"));
+        for (label, colour) in [
+            ("text", mono.text),
+            ("muted", mono.muted),
+            ("accent", mono.accent),
+            ("status", mono.status),
+            ("background", mono.background),
+        ] {
+            assert!(
+                !matches!(colour, Color::Rgb { .. } | Color::AnsiValue(_)),
+                "mono {label} must be a named colour, got {colour:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_color_profile_disables_every_channel() {
+        let mut forced = env("xterm-256color");
+        forced.force_no_color = true;
+        assert_eq!(
+            TerminalProfile::decide(true, None, &forced).colors,
+            ColorSupport::None
+        );
+        let mut truecolor = env("xterm-256color");
+        truecolor.colorterm = "truecolor".into();
+        assert_eq!(
+            TerminalProfile::decide(true, None, &truecolor).colors,
+            ColorSupport::TrueColor
+        );
+        assert_eq!(
+            TerminalProfile::decide(true, None, &env("xterm-256color")).colors,
+            ColorSupport::Ansi256
+        );
+        assert_eq!(
+            TerminalProfile::decide(true, None, &env("xterm")).colors,
+            ColorSupport::Ansi16
+        );
+    }
+
+    #[test]
+    fn gradient_paint_honours_colour_support() {
+        let plain = gradient_paint("WROSECODE", ColorSupport::None);
+        assert_eq!(plain, "WROSECODE", "NO_COLOR means no escapes");
+        let ansi16 = gradient_paint("WROSECODE", ColorSupport::Ansi16);
+        assert!(
+            ansi16.starts_with("\x1b[36m") && ansi16.ends_with("\x1b[0m"),
+            "the 16-colour fallback wraps the whole line: {ansi16:?}"
+        );
+        assert!(
+            gradient_paint("WROSECODE", ColorSupport::Ansi256).contains("38;5;"),
+            "the 256-colour cube speaks its own dialect"
+        );
+        assert!(
+            gradient_paint("WROSECODE", ColorSupport::TrueColor).contains("38;2;"),
+            "truecolor gets per-channel codes"
+        );
+    }
+
+    #[test]
+    fn wordmark_gradient_tracks_the_profile() {
+        let mut ui = shell();
+        ui.colors = ColorSupport::TrueColor;
+        let (frame, _) = ui.compose(100, 30);
+        let colours = frame[0]
+            .colors
+            .as_ref()
+            .expect("truecolor splashes the wordmark");
+        assert_eq!(colours.len(), frame[0].text.chars().count());
+        ui.no_color = true;
+        ui.colors = ColorSupport::None;
+        let (frame, _) = ui.compose(100, 30);
+        for (index, row) in frame.iter().take(splash::LOGO.len()).enumerate() {
+            assert!(
+                row.colors.is_none(),
+                "row {index} stays uncoloured under NO_COLOR"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_splash_collapses_the_wordmark() {
+        let wide = splash::paint_lines(100, ColorSupport::Ansi256, None);
+        assert!(
+            wide.len() > splash::LOGO.len(),
+            "the wide splash keeps art plus tails: {} rows",
+            wide.len()
+        );
+        assert!(wide[0].contains("38;5;"), "the art is gradient-painted");
+        let narrow = splash::paint_lines(79, ColorSupport::Ansi256, None);
+        assert_eq!(narrow.len(), 1, "one line below 80 columns");
+        assert!(
+            strip_sgr(&narrow[0]).contains("WROSECODE v"),
+            "the collapsed wordmark keeps the version: {:?}",
+            narrow[0]
+        );
+        let muted = splash::paint_lines(79, ColorSupport::None, Some(3));
+        assert!(
+            !muted[0].contains('\x1b'),
+            "NO_COLOR splash is plain text: {:?}",
+            muted[0]
+        );
+        assert!(
+            muted.iter().any(|row| row.contains("first paint 3ms")),
+            "the timing line survives: {muted:?}"
+        );
+    }
+
+    #[test]
+    fn info_panel_reports_health_tips_and_ctf() {
+        let mut ui = shell();
+        let (frame, _) = ui.compose(120, 40);
+        let joined = frame
+            .iter()
+            .map(|row| row.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [
+            "/providers",
+            "tip ·",
+            "ctf",
+            "sandbox",
+            "think ",
+            "mcp",
+            "skills",
+        ] {
+            assert!(
+                joined.contains(needle),
+                "info panel shows {needle:?}:\n{joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_bar_leads_with_the_run_state_and_key_fields() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 5);
+        let (frame, _) = ui.compose(200, 40);
+        let status = frame
+            .iter()
+            .map(|row| &row.text)
+            .find(|text| text.contains("tok ") && text.contains("think:"))
+            .expect("a status bar row");
+        for needle in ["think:", "tok ", "step ", "/"] {
+            assert!(status.contains(needle), "status shows {needle:?}: {status}");
+        }
+        let model = status
+            .find(&ui.model)
+            .expect("the model is named in the status bar");
+        let tokens = status.find("tok ").expect("token counts");
+        assert!(model < tokens, "model leads the line: {status}");
+        assert!(
+            status.starts_with(&format!(" {}", ui.status)),
+            "the state word opens the line: {status}"
+        );
+    }
+
+    #[test]
+    fn tips_rotate_and_wrap() {
+        let mut ui = shell();
+        for _ in 0..TIPS.len() {
+            ui.advance_tip();
+        }
+        assert_eq!(ui.tip_index, 0, "the tip list wraps");
+        ui.advance_tip();
+        assert_eq!(ui.tip_index, 1);
+    }
+
+    #[test]
+    fn user_theme_files_load_and_reject_bad_ones() {
+        let dir = std::env::temp_dir().join(format!("wrose-themes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("copper.toml"),
+            "text = \"#e0e0e0\"\naccent = \"#d78700\"\nstatus = \"#afaf00\"\n",
+        )
+        .unwrap();
+        // Bad hex, a shadow of a built-in name, and a non-toml file: all skip.
+        std::fs::write(
+            dir.join("broken.toml"),
+            "text = \"nope\"\naccent = \"#112233\"\nstatus = \"#112233\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("shadow.toml"),
+            "text = \"#ffffff\"\naccent = \"#000000\"\nstatus = \"#000000\"\nname = \"dark\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+
+        let loaded = load_theme_files(&dir);
+        assert_eq!(loaded.len(), 1, "only the valid palette loads: {loaded:?}");
+        assert_eq!(loaded[0].name, "copper", "file stem names the palette");
+        assert_eq!(
+            loaded[0].background,
+            Color::Black,
+            "an omitted background defaults to black"
+        );
+        let with_name = parse_theme(
+            "stem",
+            "name = \"copper\"\ntext = \"#e0e0e0\"\naccent = \"#d78700\"\nstatus = \"#afaf00\"\n",
+        )
+        .expect("a named palette parses");
+        assert_eq!(with_name.name, "copper", "the name key wins over the stem");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3846,6 +4637,24 @@ mod tests {
                 format!("entry {index} padded with plenty of characters to wrap in narrow panes"),
             );
         }
+    }
+
+    /// Drop SGR sequences so assertions can read gradient-painted text.
+    fn strip_sgr(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                for next in chars.by_ref() {
+                    if next == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     #[test]
@@ -3973,8 +4782,8 @@ mod tests {
                 "the divider owns the second-to-last row"
             );
             assert!(
-                frame[0].text.starts_with(" BUILD"),
-                "row 0 is the mode header: {:?}",
+                frame[0].text.starts_with(" WROSECODE"),
+                "row 0 is the slim header: {:?}",
                 frame[0].text
             );
             assert_eq!(

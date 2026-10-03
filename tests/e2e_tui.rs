@@ -330,3 +330,46 @@ fn pty_scrolls_up_counts_new_lines_and_reengages_follow() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// `NO_COLOR` (spec 2.4) must reach both the splash and the row renderer:
+/// no 256-colour cube codes, no truecolor channels, in the whole session.
+#[test]
+fn no_color_session_emits_no_palette_codes() {
+    if !pty_helper() {
+        eprintln!("skipping: util-linux script(1) is not available");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("wrosecode-nocolor-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("temp HOME");
+    let binary = env!("CARGO_BIN_EXE_wrosecode").to_string();
+
+    let mut pty = Pty::start_with(&binary, &home, &[("NO_COLOR", "1")]);
+    // Splash first paint, then the theme picker (a full themed frame), then
+    // a transcript entry — all three paint paths must stay monochrome.
+    std::thread::sleep(Duration::from_millis(900));
+    pty.send_text("/theme", 300);
+    pty.send(b"\r", 500);
+    pty.send_text("/help", 300);
+    pty.send(b"\r", 600);
+    pty.send_text("/quit", 300);
+    pty.send(b"\r", 400);
+    let (exited_cleanly, transcript) = pty.finish();
+
+    assert!(
+        exited_cleanly,
+        "the TUI must leave through /quit, not a panic\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("38;5;"),
+        "NO_COLOR drops the 256-colour cube codes\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("38;2;"),
+        "NO_COLOR drops truecolor codes\n{transcript}"
+    );
+    assert!(
+        transcript.contains("WROSECODE v"),
+        "the splash still paints its wordmark\n{transcript}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

@@ -15,38 +15,50 @@ Rust was chosen for low input latency, predictable memory use, a single native b
 
 ## CTF dashboard
 
-The first view is an opencode-style start screen: the `WROSECODE` wordmark, a
-live spinner, the session ID, the challenge category, the speed tier the current
-thinking level maps to, and the keybinding hints. It only draws while the
-transcript is still empty — as soon as you type or a turn produces output it
-folds back into the header so the conversation gets the screen.
+The first view is an opencode-style start screen: a large `WROSECODE` wordmark
+with a smooth colour gradient (truecolor where the terminal advertises it, 256
+or 16 colours otherwise, plain text under `NO_COLOR`/`--no-color`), carrying the
+live spinner, the session ID, the challenge category, and the speed tier the
+current thinking level maps to. Under it an info panel shows the provider and
+model, thinking level and resource budget, sandbox and approval modes, working
+directory, mode, harness, git branch, and MCP and skill counts — followed by
+provider health with a `/providers` hint, a rotating tip (`/` commands, `@`
+files, `ctrl+t` thinking, `ctrl+d` dashboard, `ctrl+o` output), the three most
+recent sessions with one-line `resume` suggestions, and a `/ctf` hint. It only
+draws while the transcript is still empty — as soon as you type or a turn
+produces output it folds back into a slim `WROSECODE v…` header so the
+conversation gets the screen. Below 80 columns the block art collapses to a
+single `WROSECODE v…` line.
 
 Captured at 110×36 straight from a real run:
 
 ```
-╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗  ⠧  session 1791039835-413394-0 · [misc]
+╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗  ⠋  session 1791068182-690349-0 · [misc] · paint 42ms
 ║ ║╠╩╗│ │╠═╝╠═╗│  │ │║ ║╠═╗
-╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝  WROSECODE v0.2.0 · FAST · /home/kali/Desktop/wrose
- BUILD • anthropic / claude-sonnet-5 • claude • ask • [misc] • think 5 · up to 3 agents
+╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝  WROSECODE v0.2.0 · FAST
+ anthropic / claude-sonnet-5 · think 5 · up to 3 agents · sandbox none · ask · /home/kali/Desktop/wrose
+ BUILD · claude · [misc] · git master* · 0 mcp · 636 skills
+ 3 connected · 10 need setup · /providers
+ tip · / commands
+  resume 1791064953-653197-0  ·  New session
+  resume 1791064794-651035-0  ·  hiii
+  resume 1791058676-580737-0  ·  emoEasy4.8(475)Challenge RatingXP reward260XP rewardDifficulty distribution b
+  ctf  wrosecode ctf <file|dir|url>  ·  or /ctf here
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
  TRANSCRIPT  1 entry                                                      │ TOKEN DASHBOARD
- INFO  WROSECODE v0.2.0 · session 1791039835-413394-0                     │ input         0 ░░░░░░░░░░░░░░░░
+ INFO  WROSECODE v0.2.0 · session 1791068182-690349-0                     │ input         0 ░░░░░░░░░░░░░░░░
        Type a request · /help commands · Ctrl+P palette                   │ output        0 ░░░░░░░░░░░░░░░░
-       Tab build/plan · [ ] thinking · Esc then j/k to scroll             │ reason        0 ░░░░░░░░░░░░░░░░
+       Tab build/plan · [ ] thinking · PgUp/PgDn scroll · /clear          │ reason        0 ░░░░░░░░░░░░░░░░
                                                                           │ cache R       0 ░░░░░░░░░░░░░░░░
                                                                           │ cache W       0 ░░░░░░░░░░░░░░░░
                                                                           │ model  claude-sonnet-5
                                                                           │ cost   n/a
                                                                           │ budget unlimited
                                                                           │ p50/p95/p99 0/0/0ms
+                                                                          │ lat  ·
                                                                           │ cache  0%
                                                                           │ flags  0
                                                                           │ turn   ·
-                                                                          │ errors 0
-                                                                          │ tier   FAST · 3 workers
-                                                                          │
-                                                                          │
-                                                                          │
  SUBAGENT TREE  0 active                                                  │ TOOL TIMELINE  0 calls
  root [misc] think 5/20 · up to 3 agents                                  │
                                                                           │
@@ -54,25 +66,26 @@ Captured at 110×36 straight from a real run:
                                                                           │
                                                                           │
                                                                           │
-                                                                          │
-                                                                          │
-                                                                          │
- Ready • FAST · 3w • tok 0/0 • cost n/a • cache 0% • tools 0:0 • errors 0 • flags 0 • 3s • think 5
+ Ready · claude-sonnet-5 · think:5 · tok 0/0 · cache 0% · 3s · step 0 · none/ask · FAST · 3w · cost n/a · tool
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 >
 ```
 
-Rows 7–9 are the welcome entry in the transcript; rows 1–4 are the rendered
-header drawn above it. The header is what the spinner animates in, and it
-carries `TURBO` / `FAST` / `SMART` / `DEEP` plus the worker count that tier
-actually allows (1 / 3 / 5 / 10).
+The rows above the rule are the start screen — wordmark, info panel, provider
+health, rotating tip, recent sessions, and the `/ctf` hint — and they are what
+the spinner animates in. The wordmark carries `TURBO` / `FAST` / `SMART` /
+`DEEP` plus the worker count that tier actually allows (1 / 3 / 5 / 10).
 
 The right-hand dashboard shows input, output, reasoning, and cache traffic as
 bars, then the model, cost, budget, latency percentiles, cache hit rate, found
 flags, a per-turn token sparkline with the last turn duration, an error counter
-with the kind of the most recent failure, and the speed tier. Once a turn ends
-the status line reads `Ready` and keeps `tools`/`errors`/`flags` totals. During
-a turn the status line swaps in an animated spinner and the live token counts.
+with the kind of the most recent failure, and the speed tier. The bottom status
+line leads with the run state, model, and `think:` level, then tokens, cache
+hit rate, elapsed time, tool step, sandbox and approval, speed tier and
+workers, cost, and tool counts — for example
+` Ready · claude-sonnet-5 · think:5 · tok 0/0 · cache 0% · 3s · step 0 ·
+none/ask · FAST · 3w · cost n/a · tools 0:0`. During a turn it swaps in an
+animated spinner, the queue note, and the live timeout and tool progress.
 
 File magic and extensions categorize common web, pwn, crypto, reverse
 engineering, and forensics tasks.
@@ -126,7 +139,7 @@ Shell calls have a 30 second timeout and are terminated if stuck. Panics and tur
 
 ## Advanced dashboard and persistence
 
-The terminal dashboard has four live panes: transcript, token and cost metrics, subagent tree, and tool timeline. Drag the vertical separator with the mouse. `Ctrl+T` cycles dark, light, solarized, Dracula, and Nord themes; `/theme` opens a picker and `/theme NAME` applies one directly (`/theme` on an unknown name lists what exists). The shell paints its first frame — wordmark, version, and session line — before provider setup, skill discovery, MCP reconnects, and session restore, so startup never waits on the network: the measured time is stamped next to the session line (`· paint 9ms`), reported by `/debug` as `First paint`, and must stay inside a 50 ms budget. `Ctrl+P` opens fuzzy command search; `Ctrl+F` and `Ctrl+R` open the flag and prompt pickers with the same filter-as-you-type behaviour. The renderer targets 60 frames per second while writing only changed terminal rows.
+The terminal dashboard has four live panes: transcript, token and cost metrics, subagent tree, and tool timeline. Drag the vertical separator with the mouse. `Ctrl+T` cycles the palettes — dark, light, solarized, Dracula, Nord, and Mono — and `/theme` opens a picker and `/theme NAME` applies one directly (`/theme` on an unknown name lists what exists). Your own palettes drop into `~/.wrosecode/themes/*.toml` as five hex colours (`text`, `muted`, `accent`, `status`, `background`, with an optional `name`); a file that fails to parse, has bad hex, or reuses a built-in name is skipped. `NO_COLOR` (any non-empty value) or `--no-color` turns colour off everywhere: the gradient wordmark becomes plain text and every frame renders without colour codes. The shell paints its first frame — gradient wordmark, info panel with provider, thinking, sandbox, approval, git, MCP and skill counts, provider health, a rotating tip, recent sessions, and the `/ctf` hint — before provider setup, skill discovery, MCP reconnects, and session restore, so startup never waits on the network: the measured time is stamped next to the session line (`· paint 9ms`), reported by `/debug` as `First paint`, and must stay inside a 50 ms budget. `Ctrl+P` opens fuzzy command search; `Ctrl+F` and `Ctrl+R` open the flag and prompt pickers with the same filter-as-you-type behaviour. The renderer targets 60 frames per second while writing only changed terminal rows.
 
 Sessions checkpoint to SQLite WAL every ten seconds at `~/.wrosecode/state.db`, while portable JSON session files remain available. Resume or fork work with:
 
@@ -154,6 +167,7 @@ assuming a full xterm:
 | VS Code / Cursor integrated terminal (`TERM_PROGRAM=vscode`, `VSCODE_PID`, `VSCODE_CWD`) | Mouse capture stays off so the terminal's native wheel scroll and text selection keep working |
 | Zellij (`ZELLIJ` set) or `WROSECODE_FULL_REDRAW=1` | Every frame repaints fully (multiplexers composite their own grid and keep stale glyphs otherwise) |
 | `WROSECODE_NO_ALT_SCREEN=1` | Run inline instead of switching to the alternate screen |
+| `NO_COLOR` set to a non-empty value, or `--no-color` on the command line | No colour anywhere: the gradient wordmark falls back to plain text and frames emit no colour codes |
 
 `mouse_capture` in `config.toml` overrides detection:
 

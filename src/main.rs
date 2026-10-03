@@ -89,6 +89,9 @@ struct Cli {
     import_session: Option<PathBuf>,
     #[arg(long = "race", value_name = "PROVIDER:MODEL")]
     race: Vec<String>,
+    /// Disable all colour output (same as setting `NO_COLOR`)
+    #[arg(long)]
+    no_color: bool,
 }
 
 #[tokio::main]
@@ -204,8 +207,11 @@ async fn main() -> Result<()> {
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
     let guard = if tui_mode {
-        let profile =
-            tui::TerminalProfile::detect(config.alternate_screen, config.mouse_capture.as_deref());
+        let profile = tui::TerminalProfile::detect(
+            config.alternate_screen,
+            config.mouse_capture.as_deref(),
+            cli.no_color,
+        );
         let guard = tui::TerminalGuard::enter(profile)?;
         splash::paint(profile, &boot)?;
         Some(guard)
