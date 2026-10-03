@@ -2,6 +2,7 @@ use crate::agent::Agent;
 use crate::harness::Harness;
 use crate::provider::Progress;
 use crate::provider::Usage;
+use crate::splash::{self, LOGO};
 use crate::tools::PermissionRequest;
 use crate::{
     commands, project, provider,
@@ -180,10 +181,15 @@ impl TerminalProfile {
     }
 }
 
-struct TerminalGuard;
+/// Owns the raw-mode / alternate-screen / mouse capture state for the whole
+/// session. `main` enters it early (so the splash can paint) and hands it to
+/// [`run`], which keeps it alive until the session ends.
+pub struct TerminalGuard {
+    profile: TerminalProfile,
+}
 
 impl TerminalGuard {
-    fn enter(profile: TerminalProfile) -> io::Result<Self> {
+    pub fn enter(profile: TerminalProfile) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let entered = match (profile.alternate, profile.mouse) {
             (true, true) => execute!(
@@ -211,7 +217,11 @@ impl TerminalGuard {
             let _ = terminal::disable_raw_mode();
             return Err(error);
         }
-        Ok(Self)
+        Ok(Self { profile })
+    }
+
+    pub fn profile(&self) -> TerminalProfile {
+        self.profile
     }
 }
 
@@ -314,12 +324,6 @@ struct CompletionState {
     matches: Vec<String>,
     index: usize,
 }
-
-const LOGO: [&str; 3] = [
-    "╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗",
-    "║ ║╠╩╗│ │╠═╝╠═╗│  │ │║ ║╠═╗",
-    "╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝",
-];
 
 /// The handful of agent facts the shell paints. Split from `Ui::new` so tests
 /// can build a `Ui` without an `Agent` (constructing one opens the session
@@ -695,9 +699,13 @@ impl Ui {
                 if body_start >= height_usize {
                     break;
                 }
+                let paint_note = match splash::first_paint_ms() {
+                    Some(ms) => format!(" · paint {ms}ms"),
+                    None => String::new(),
+                };
                 let tail = match index {
                     0 => format!(
-                        "  {spin}  session {} · [{}]",
+                        "  {spin}  session {} · [{}]{paint_note}",
                         self.session_id, self.category
                     ),
                     2 => format!(
@@ -1181,69 +1189,100 @@ struct Theme {
     background: Color,
 }
 
-fn theme(index: usize) -> Theme {
-    const THEMES: [Theme; 5] = [
-        Theme {
-            name: "dark",
-            text: Color::White,
-            muted: Color::DarkGrey,
-            accent: Color::Cyan,
-            status: Color::Yellow,
-            background: Color::Black,
+/// Every selectable palette. `Ctrl+T`, `/theme`, and `[ui] theme` in
+/// config.toml all index this one list, so a theme cannot exist in one place
+/// and be missing from another.
+const THEMES: &[Theme] = &[
+    Theme {
+        name: "dark",
+        text: Color::White,
+        muted: Color::DarkGrey,
+        accent: Color::Cyan,
+        status: Color::Yellow,
+        background: Color::Black,
+    },
+    Theme {
+        name: "light",
+        text: Color::Black,
+        muted: Color::DarkGrey,
+        accent: Color::Blue,
+        status: Color::DarkYellow,
+        background: Color::White,
+    },
+    Theme {
+        name: "solarized",
+        text: Color::Grey,
+        muted: Color::DarkCyan,
+        accent: Color::Cyan,
+        status: Color::DarkYellow,
+        background: Color::Rgb { r: 0, g: 43, b: 54 },
+    },
+    Theme {
+        name: "dracula",
+        text: Color::White,
+        muted: Color::DarkMagenta,
+        accent: Color::Magenta,
+        status: Color::Cyan,
+        background: Color::Rgb {
+            r: 40,
+            g: 42,
+            b: 54,
         },
-        Theme {
-            name: "light",
-            text: Color::Black,
-            muted: Color::DarkGrey,
-            accent: Color::Blue,
-            status: Color::DarkYellow,
-            background: Color::White,
+    },
+    Theme {
+        name: "nord",
+        text: Color::Grey,
+        muted: Color::DarkBlue,
+        accent: Color::Blue,
+        status: Color::Cyan,
+        background: Color::Rgb {
+            r: 46,
+            g: 52,
+            b: 64,
         },
-        Theme {
-            name: "solarized",
-            text: Color::Grey,
-            muted: Color::DarkCyan,
-            accent: Color::Cyan,
-            status: Color::DarkYellow,
-            background: Color::Rgb { r: 0, g: 43, b: 54 },
-        },
-        Theme {
-            name: "dracula",
-            text: Color::White,
-            muted: Color::DarkMagenta,
-            accent: Color::Magenta,
-            status: Color::Cyan,
-            background: Color::Rgb {
-                r: 40,
-                g: 42,
-                b: 54,
-            },
-        },
-        Theme {
-            name: "nord",
-            text: Color::Grey,
-            muted: Color::DarkBlue,
-            accent: Color::Blue,
-            status: Color::Cyan,
-            background: Color::Rgb {
-                r: 46,
-                g: 52,
-                b: 64,
-            },
-        },
-    ];
-    THEMES[index % THEMES.len()]
+    },
+];
+
+fn theme(index: usize) -> &'static Theme {
+    // The index is a live cursor (Ctrl+T cycles it), so it wraps rather than
+    // panicking when a palette is removed.
+    &THEMES[index % THEMES.len()]
 }
 
+/// Config spelling to palette index. `"wrose-dark"` is the historical name of
+/// the default; unknown names fall back to it instead of erroring.
 fn theme_index(name: &str) -> usize {
-    match name.to_ascii_lowercase().as_str() {
-        "wrose-dark" | "dark" => 0,
-        "light" => 1,
-        "solarized" => 2,
-        "dracula" => 3,
-        "nord" => 4,
-        _ => 0,
+    theme_position(name).unwrap_or(0)
+}
+
+/// Like [`theme_index`] but reports whether the name is real, so `/theme
+/// bogus` can say so instead of silently going dark.
+fn theme_position(name: &str) -> Option<usize> {
+    let name = name.trim().to_ascii_lowercase();
+    THEMES
+        .iter()
+        .position(|theme| theme.name == name || (theme.name == "dark" && name == "wrose-dark"))
+}
+
+/// Startup timing for `/debug`: where the first frame landed against the
+/// splash budget, or why there is no number to show.
+fn first_paint_line() -> String {
+    match splash::first_paint_ms() {
+        Some(ms) => format!(
+            "{ms}ms (budget {}ms, {})",
+            splash::FIRST_PAINT_BUDGET_MS,
+            if splash::within_budget() {
+                "ok"
+            } else {
+                "over"
+            }
+        ),
+        None => "not painted (headless)".into(),
     }
+}
+
+fn theme_names() -> Vec<&'static str> {
+    THEMES.iter().map(|theme| theme.name).collect()
 }
 
 fn join_panes(left: &str, right: &str, left_width: usize, right_width: usize) -> String {
@@ -1290,7 +1329,7 @@ fn compact_number(value: u64) -> String {
     }
 }
 
-fn input_syntax_color(input: &str, colors: Theme) -> Color {
+fn input_syntax_color(input: &str, colors: &Theme) -> Color {
     let lower = input.trim_start().to_ascii_lowercase();
     if lower.starts_with("python") || lower.contains("```python") {
         Color::Green
@@ -1556,12 +1595,12 @@ pub async fn run(
     mut agent: Agent,
     initial_session: Option<Session>,
     store: crate::store::Store,
+    // Entered (and the splash painted) back in main, before the expensive
+    // startup work; holding it here is what keeps the terminal ours.
+    guard: TerminalGuard,
 ) -> Result<()> {
-    let profile = TerminalProfile::detect(
-        agent.config.alternate_screen,
-        agent.config.mouse_capture.as_deref(),
-    );
-    let _terminal = TerminalGuard::enter(profile)?;
+    let profile = guard.profile();
+    let _guard = guard;
     let (event_tx, mut events) = mpsc::unbounded_channel();
     let (permission_tx, mut permissions) = mpsc::unbounded_channel();
     agent.event_tx = Some(event_tx);
@@ -1718,7 +1757,7 @@ pub async fn run(
                 ui.status = "Command palette".into();
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.theme = (ui.theme + 1) % 5;
+                ui.theme = (ui.theme + 1) % THEMES.len();
                 ui.status = format!("Theme: {}", theme(ui.theme).name);
             }
             KeyCode::Char('e')
@@ -2627,7 +2666,35 @@ async fn run_command(
                 .last_api_latency
                 .map(|d| format!("{} ms", d.as_millis()))
                 .unwrap_or_else(|| "none".into());
-            ui.push(Speaker::System, format!("Provider/model: {} / {}\nPermission: {}\nAgent: {}\nSkills: {}\nMemory facts: {}\nRepo map files: {}\nLast API latency: {}\nVersion: {} ({})", agent.config.provider, agent.config.model, ui.permission, agent.mode, agent.skills.len(), agent.memory.list()?.len(), map_size, latency, env!("CARGO_PKG_VERSION"), option_env!("WROSECODE_GIT_COMMIT").unwrap_or("unknown")));
+            ui.push(Speaker::System, format!("Provider/model: {} / {}\nPermission: {}\nAgent: {}\nSkills: {}\nMemory facts: {}\nRepo map files: {}\nLast API latency: {}\nFirst paint: {}\nVersion: {} ({})", agent.config.provider, agent.config.model, ui.permission, agent.mode, agent.skills.len(), agent.memory.list()?.len(), map_size, latency, first_paint_line(), env!("CARGO_PKG_VERSION"), option_env!("WROSECODE_GIT_COMMIT").unwrap_or("unknown")));
+        }
+        "/theme" => {
+            if args.is_empty() {
+                let labels = theme_names()
+                    .into_iter()
+                    .map(|name| format!("{name}  (palette)"))
+                    .collect();
+                if let Some(index) = picker(ui, "Themes", labels)? {
+                    ui.theme = index;
+                    ui.status = format!("Theme: {}", theme(ui.theme).name);
+                    ui.push(Speaker::System, format!("Theme set to {}", theme(ui.theme).name));
+                }
+            } else if let Some(index) = theme_position(args) {
+                ui.theme = index;
+                ui.status = format!("Theme: {}", theme(ui.theme).name);
+                ui.push(Speaker::System, format!("Theme set to {}", theme(ui.theme).name));
+            } else {
+                // Two lines, not one: compact mode clips a transcript entry at
+                // the pane edge, and a single long line loses the tail of the
+                // theme list on a narrow terminal.
+                ui.push(
+                    Speaker::System,
+                    format!(
+                        "Unknown theme `{args}`.\nAvailable: {}",
+                        theme_names().join(", ")
+                    ),
+                );
+            }
         }
         "/verbosity" => {
             let current = ui.verbosity.clone();
@@ -3435,6 +3502,42 @@ mod tests {
         assert_eq!(theme_index("dark"), 0);
         assert_eq!(theme_index("dracula"), 3);
         assert_eq!(theme_index("something-new"), 0);
+    }
+
+    #[test]
+    fn theme_registry_is_stable_and_round_trips() {
+        assert_eq!(
+            theme_names(),
+            ["dark", "light", "solarized", "dracula", "nord"]
+        );
+        for (position, name) in theme_names().iter().enumerate() {
+            assert_eq!(theme_position(name), Some(position), "{name}");
+            assert_eq!(theme_position(name).expect("registered"), position);
+            assert_eq!(theme(position).name, *name);
+        }
+        assert_eq!(theme_position("nope"), None);
+        assert_eq!(theme(THEMES.len()).name, "dark", "the cycle wraps");
+    }
+
+    #[test]
+    fn the_wordmark_stays_quiet_until_something_has_painted() {
+        let mut ui = shell();
+        let (frame, _) = ui.compose(100, 30);
+        assert!(
+            frame[0].text.contains("session"),
+            "row 0 is the art plus the session tail: {:?}",
+            frame[0].text
+        );
+        assert!(
+            frame.iter().any(|row| row.text.contains("WROSECODE v")),
+            "the version line renders"
+        );
+        assert!(
+            !frame[0].text.contains("paint"),
+            "no timing note before a real first paint: {:?}",
+            frame[0].text
+        );
+        assert!(splash::first_paint_ms().is_none(), "no test paints");
     }
 
     #[test]

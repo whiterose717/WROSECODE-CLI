@@ -51,6 +51,23 @@ its native wheel, and Zellij forces a full repaint. `TerminalGuard::enter` only
 emits the escape sequences the profile asked for, and its `Drop` matches, so the
 terminal is always restored to exactly the state it started in.
 
+Startup order is deliberate: `main` records the boot `Instant` as its first
+action, builds the `Config`, and then — only when the run will show the TUI —
+takes the terminal with `TerminalGuard::enter` and paints the splash from
+`src/splash.rs` *before* provider setup, skill discovery, metrics, MCP
+reconnects, and session restore, so the first frame never waits on disk or
+network. `splash::paint` stamps the measured time into a `OnceLock`; the frame
+stamps it back onto the top row (`· paint 9ms`), `/debug` reports it as
+`First paint` against the 50 ms budget (`FIRST_PAINT_BUDGET_MS`, pinned by a
+unit test), and `tests/e2e_tui.rs` proves from a real PTY that the stamp lands
+in the first bytes the process writes — the splash is the first frame, and
+provider/MCP/skill init never sit in front of it.
+
+Themes are one `const THEMES` list in `src/tui.rs`: `theme(index)` wraps,
+`theme_index` keeps legacy names like `wrose-dark` resolving to dark,
+`theme_position` answers `Ctrl+T` and `/theme NAME`, and `theme_names` feeds the
+picker and the unknown-theme list, so a palette cannot drift from the registry.
+
 Metrics are a separate hot-path object shared as `Arc`: every provider response
 and tool call records into counters, per-model totals, and a fixed-bucket
 latency histogram (`HISTOGRAM_BOUNDS`). `Metrics::snapshot` exposes them for the

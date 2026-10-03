@@ -109,6 +109,7 @@ CTF skills cover recon, web, pwn, crypto, reverse engineering, forensics, stego,
 | `Ctrl+D` | Delete the character under the caret when there is text, otherwise page down |
 | `Ctrl+W` | Delete the word before the caret |
 | `Ctrl+L` | Repaint the screen and return to the bottom (it never clears the transcript; `/clear` does that) |
+| `Ctrl+T` | Cycle the color theme (same list as `/theme`) |
 | `Ctrl+Shift+C` | Copy latest output |
 | `[` / `]` | Lower or raise thinking level (0–20) |
 | `Tab` | Complete the current word (paths, slash commands, tool names) when the input is not empty; otherwise switch build and plan modes |
@@ -119,7 +120,7 @@ Shell calls have a 30 second timeout and are terminated if stuck. Panics and tur
 
 ## Advanced dashboard and persistence
 
-The terminal dashboard has four live panes: transcript, token and cost metrics, subagent tree, and tool timeline. Drag the vertical separator with the mouse. `Ctrl+T` cycles dark, light, solarized, Dracula, and Nord themes. `Ctrl+P` opens fuzzy command search; `Ctrl+F` and `Ctrl+R` open the flag and prompt pickers with the same filter-as-you-type behaviour. The renderer targets 60 frames per second while writing only changed terminal rows.
+The terminal dashboard has four live panes: transcript, token and cost metrics, subagent tree, and tool timeline. Drag the vertical separator with the mouse. `Ctrl+T` cycles dark, light, solarized, Dracula, and Nord themes; `/theme` opens a picker and `/theme NAME` applies one directly (`/theme` on an unknown name lists what exists). The shell paints its first frame — wordmark, version, and session line — before provider setup, skill discovery, MCP reconnects, and session restore, so startup never waits on the network: the measured time is stamped next to the session line (`· paint 9ms`), reported by `/debug` as `First paint`, and must stay inside a 50 ms budget. `Ctrl+P` opens fuzzy command search; `Ctrl+F` and `Ctrl+R` open the flag and prompt pickers with the same filter-as-you-type behaviour. The renderer targets 60 frames per second while writing only changed terminal rows.
 
 Sessions checkpoint to SQLite WAL every ten seconds at `~/.wrosecode/state.db`, while portable JSON session files remain available. Resume or fork work with:
 
@@ -323,7 +324,7 @@ Skills load from bundled `skills/`, project `skills/`, `~/.wrosecode/skills/`, a
 | --- | --- |
 | Agents | `/agents`, `/build`, `/plan`, `/harness`, `/skills` |
 | Providers | `/connect`, `/providers`, `/models`, `/model`, `/mcps` |
-| Session | `/new`, `/sessions`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/verbosity`, `/export`, `/help`, `/exit`, `/quit` |
+| Session | `/new`, `/sessions`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/verbosity`, `/theme`, `/export`, `/help`, `/exit`, `/quit` |
 | Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/flags`, `/writeup`, `/sandbox` |
 
 `/providers` opens a searchable provider screen with twelve built-in entries and their connection status. Enter configures or selects a provider; `a` adds, `e` edits, `d` deletes a custom provider, and `t` tests a connection. `/connect` opens the custom provider form directly. The API key field is masked. `/models` searches models across connected providers; `/model MODEL` switches the current provider's model.

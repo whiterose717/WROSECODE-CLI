@@ -62,6 +62,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Clear the transcript (conversation context is kept)",
     },
     CommandSpec {
+        name: "/theme",
+        category: "Session",
+        description: "Pick the color theme (or pass a name)",
+    },
+    CommandSpec {
         name: "/new",
         category: "Session",
         description: "Archive this session and start a new one",
@@ -246,6 +251,7 @@ mod tests {
             "/rmslop",
             "/sessions",
             "/skills",
+            "/theme",
         ] {
             assert!(lookup(name).is_some(), "missing {name}");
             assert!(help().contains(name));

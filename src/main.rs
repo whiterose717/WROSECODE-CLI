@@ -18,6 +18,7 @@ mod sandbox;
 mod session;
 mod settings;
 mod skills;
+mod splash;
 mod store;
 mod telemetry;
 mod tools;
@@ -92,6 +93,9 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Stamped before anything else so the splash can report an honest
+    // time-to-first-paint (see src/splash.rs).
+    let boot = std::time::Instant::now();
     crash::install_panic_hook(std::env::current_dir().ok());
     crash::install_signal_handlers();
     // Test hook: lets the e2e suite prove the crash path (terminal restore +
@@ -192,6 +196,22 @@ async fn main() -> Result<()> {
         smooth_scroll_lines: runtime.ui.smooth_scroll_lines.clamp(1, 20),
         sandbox: runtime.sandbox.policy(),
     });
+    // Take the terminal and paint the splash before provider setup, skill
+    // discovery, metrics, MCP servers, and session restore: those are what
+    // would otherwise sit between the user and their first frame.
+    let tui_mode = cli.prompt.is_none()
+        && !cli.headless
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
+    let guard = if tui_mode {
+        let profile =
+            tui::TerminalProfile::detect(config.alternate_screen, config.mouse_capture.as_deref());
+        let guard = tui::TerminalGuard::enter(profile)?;
+        splash::paint(profile, &boot)?;
+        Some(guard)
+    } else {
+        None
+    };
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(8)
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -339,8 +359,8 @@ async fn main() -> Result<()> {
     if cli.headless {
         anyhow::bail!("--headless requires a prompt argument or piped input");
     }
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return tui::run(agent, resumed_session, store).await;
+    if let Some(guard) = guard {
+        return tui::run(agent, resumed_session, store, guard).await;
     }
     println!("WROSECODE  /plan /build /harness NAME /memory /quit");
     let mut input = BufReader::new(tokio::io::stdin()).lines();

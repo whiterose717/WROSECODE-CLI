@@ -88,12 +88,26 @@ fn drive(binary: &str, home: &std::path::Path) -> (bool, String) {
     pty.send(b"\x15", 150); // Ctrl+U
     pty.send(b"\x0c", 250); // Ctrl+L → repaint, must not wipe the transcript
 
+    // Themes: a real name applies, an unknown one is refused with the list.
+    pty.send_text("/theme nord", 250);
+    pty.send(b"\r", 400);
+    pty.send_text("/theme bogus", 250);
+    pty.send(b"\r", 400);
+
     // Clear the transcript, then exit cleanly.
     pty.send_text("/clear", 250);
     pty.send(b"\r", 400);
     pty.send_text("/quit", 250);
     pty.send(b"\r", 600);
     pty.finish()
+}
+
+/// The splash banner stamps `first paint {n}ms` measured from `main`, which
+/// is exactly the number the startup budget is about.
+fn first_paint_ms(transcript: &str) -> Option<u128> {
+    let after = transcript.split("first paint ").nth(1)?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 #[test]
@@ -143,6 +157,32 @@ fn tui_survives_scroll_editing_and_clearing_in_a_real_terminal() {
     assert!(
         !transcript.contains("Denied"),
         "no permission prompt was raised by these commands\n{transcript}"
+    );
+    let painted = first_paint_ms(&transcript)
+        .expect("the splash must stamp a first-paint measurement\n{transcript}");
+    // The product budget is `splash::FIRST_PAINT_BUDGET_MS` (50ms), pinned by
+    // a unit test: a debug build on a loaded CI box can miss it through no
+    // fault of the ordering. What this PTY run proves instead is that the
+    // stamp is written in the first bytes of output — the splash is painted
+    // before anything else — with a wide ceiling to catch the real
+    // regression, which is letting provider/MCP/skill init run first.
+    assert!(
+        transcript
+            .find("first paint ")
+            .is_some_and(|index| index < 4_096),
+        "the splash is the first frame the shell paints\n{transcript}"
+    );
+    assert!(
+        painted <= 250,
+        "first paint {painted}ms is nowhere near the 50ms budget\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Theme set to nord"),
+        "/theme <name> applies a palette\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Unknown theme `bogus`") && transcript.contains("dracula"),
+        "/theme <unknown> lists what exists\n{transcript}"
     );
 
     std::fs::remove_dir_all(&home).ok();
