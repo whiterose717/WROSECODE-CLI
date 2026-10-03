@@ -1,0 +1,40 @@
+# Analysis container used by `shell` when [sandbox] engine = "docker".
+#
+#   docker build -f Dockerfile.sandbox -t wrosecode-sandbox:latest .
+#
+# WROSECODE bind-mounts the project directory at /workspace, so anything the
+# agent writes inside the container shows up in the project and vice versa.
+# The container is kept alive with `sleep infinity` and reused across commands,
+# which removes the ~1s cold start you would otherwise pay per call.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    binutils \
+    ca-certificates \
+    curl \
+    file \
+    gdb \
+    git \
+    jq \
+    nmap \
+    netcat-openbsd \
+    patch \
+    python3 \
+    python3-pip \
+    python3-venv \
+    ripgrep \
+    fd-find \
+    socat \
+    unzip \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /usr/bin/fdfind /usr/local/bin/fd
+
+# pwntools is the one dependency CTF work actually reaches for. Building it into
+# the image keeps `from pwn import *` working on the first command.
+RUN pip3 install --no-cache-dir --break-system-packages pwntools
+
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

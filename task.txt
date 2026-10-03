@@ -1,0 +1,170 @@
+# Build Prompt: WROSECODE — High-Speed Agentic Coding CLI in Rust
+
+Paste everything below into Claude Code (or any coding agent) in a fresh
+directory with a modern Rust toolchain (rustc ≥ 1.80, via rustup) installed.
+
+---
+
+## Prompt
+
+You are building **WROSECODE**, a Rust-native, terminal-first agentic coding
+and security-research CLI. It must be genuinely fast (sub-100ms cold start,
+concurrent tool execution, connection-pooled HTTP) and accurate (grounded
+tool use, repo-aware context, verifiable actions). Synthesize the best ideas
+from these reference projects — study their public READMEs/docs for behavior,
+but write all code from scratch in idiomatic Rust:
+
+1. **opencode** (anomalyco/opencode) — dual-agent model: a full-access `build`
+   agent and a read-only `plan` agent, switchable with one keypress; a
+   `general` subagent for complex multi-step search.
+2. **goose** (block/goose) — MCP-first tool architecture; multi-model
+   configuration (mix providers per task); same core usable as CLI or
+   desktop app.
+3. **aider** (Aider-AI/aider) — a repo map: a lightweight AST/ctags-based
+   index of the whole codebase kept cheap in tokens, used to decide which
+   files matter for a given request; automatic git commit per change with
+   generated messages; auto lint/test after edits with self-repair loop.
+4. **Open Interpreter** — a pluggable "harness" concept: the same core agent
+   can emulate different prompting/tool-call styles (minimal, SWE-agent,
+   Claude-Code-like) selectable at runtime via `/harness`; ACP
+   (Agent Client Protocol) compatibility so editors can drive it.
+5. **pi** (earendil-works/pi) — radically minimal core kept small on
+   purpose, extended via user-authored extensions/skills/prompt-templates/
+   themes, distributable as packages; a differential-rendering TUI so
+   redraws touch only changed terminal cells (this is a big part of
+   perceived speed).
+6. **OpenHands** — an Agent Server (REST API) that can run multiple
+   sandboxed conversations in parallel (Docker/VM isolation per
+   conversation), with a thin frontend; ACP agent support for
+   interoperability with other coding agents.
+7. **PentesterFlow** — permission tiers (`ask` / `auto-safe` / `yolo`);
+   Markdown "skills" as playbooks that can `fork` into a child agent so a
+   large playbook doesn't bloat the parent's context; a continuous local
+   learning system that silently writes durable facts (project-scoped and
+   personal-scoped) to disk as Markdown with frontmatter, recalled
+   automatically when relevant; coverage tracking for systematic workflows;
+   credential/secret redaction before anything is persisted.
+8. A general CLI coding-agent baseline (clai-style) — simple, fast,
+   single-binary developer ergonomics: one install script, `wrosecode` in
+   any repo, sane defaults, no required config file.
+
+### Non-negotiable requirements
+
+- **Language**: Rust, 2021 edition, async runtime via `tokio`.
+- **Speed**:
+  - Reuse one `reqwest::Client` (HTTP/connection pooling + keep-alive) for
+    the whole process lifetime.
+  - Execute independent tool calls from a single model turn **concurrently**
+    (`futures::future::join_all` or a bounded `JoinSet`), not sequentially.
+  - Maintain a cached repo map (symbol index) that is incrementally updated
+    on file-change, not rebuilt from scratch every turn.
+  - TUI redraws must be differential (only changed lines/cells), not a full
+    screen clear+redraw per frame.
+  - Release profile: `opt-level = 3`, `lto = true`, `codegen-units = 1`,
+    `strip = true`.
+- **Accuracy**:
+  - System prompt instructs the model to read a file before editing it
+    unless its exact current contents are already in context.
+  - Edits are exact-string replacements that must match **exactly once** in
+    the target file (reject and report ambiguous/ zero matches rather than
+    guessing).
+  - After any code edit, automatically run the project's lint/test command
+    (detected from `Cargo.toml`/`package.json`/etc. or configurable) and
+    feed failures back to the model for a self-repair loop (aider-style),
+    bounded to N retries.
+  - Tool results that are large are truncated with an explicit
+    `[...truncated]` marker rather than silently dropped.
+- **Providers**: unified trait `Provider` with at least an Anthropic Messages
+  API implementation (tool use, streaming), structured so OpenAI-compatible
+  and local (Ollama/LM Studio) backends can be added without touching the
+  agent loop.
+- **Tools** (minimum set): `shell`, `read_file`, `write_file`, `edit_file`,
+  `grep`/`glob`, `web_search`/`web_fetch`, `http` (for API/security testing
+  workflows), `delegate_task` (spawn a bounded sub-agent and return only its
+  summary — this is how skill-forking and the `general` subagent are
+  implemented).
+- **Skills**: Markdown playbooks with YAML frontmatter, discovered from
+  `./skills/`, `~/.wrosecode/skills/`, and any `--skills <dir>` path (later
+  paths win on name collision). Each skill may declare `fork: true` to run
+  in a child agent. Ship built-in skills for: general coding/refactor,
+  `binary-analysis` (objdump/readelf/strings/gdb workflows), `ctf-pwn`,
+  `ctf-crypto`, `ctf-web`/webvuln, and `recon`.
+- **Memory**: Markdown facts under `./.wrosecode/memory/` (project) and
+  `~/.wrosecode/memory/` (personal). `#fact text` saves to project scope,
+  `#!fact text` to personal scope. Facts are deduped and redacted for
+  obvious secret patterns before being written. The most relevant facts for
+  the current turn are injected into the system prompt automatically; the
+  full set is available via a `/memory` command.
+- **Permissions**: `--permission ask|auto-safe|yolo` (default `ask`).
+  `auto-safe` still prompts for a hard-coded destructive-command blocklist
+  (`rm -rf`, `mkfs`, `dd if=`, fork bombs, `chmod -R 777 /`, writes to block
+  devices) regardless of tier.
+- **Harness switching**: a `/harness` command (and `--harness` flag) that
+  swaps the system-prompt template and tool-call style without restarting
+  the process or losing conversation state.
+- **ACP support**: implement enough of the Agent Client Protocol to be
+  launchable as `wrosecode acp` from an ACP-compatible editor.
+- **Distribution**: a single static-ish binary per OS/arch, installed via a
+  one-line curl/iwr script (`https://<domain>/install.sh` /
+  `install.ps1`), plus a plain `cargo install` path. No required runtime
+  dependency beyond the binary itself.
+
+### Project layout to generate
+
+```
+wrosecode/
+├── Cargo.toml
+├── install.sh
+├── install.ps1
+├── skills/
+│   ├── binary-analysis/SKILL.md
+│   ├── ctf-pwn/SKILL.md
+│   ├── ctf-crypto/SKILL.md
+│   ├── webvuln/SKILL.md
+│   └── recon/SKILL.md
+└── src/
+    ├── main.rs          # CLI parsing (clap), REPL loop, one-shot mode
+    ├── config.rs         # Config, Permission tier
+    ├── agent.rs           # unbounded plan/act/observe loop and harness dispatch
+    ├── harness.rs         # harness templates + /harness switching
+    ├── provider/
+    │   ├── mod.rs         # Provider trait
+    │   ├── anthropic.rs
+    │   └── openai_compat.rs
+    ├── tools/
+    │   ├── mod.rs         # schemas + dispatch
+    │   ├── shell.rs
+    │   ├── fs.rs          # read/write/edit
+    │   ├── search.rs      # grep/glob
+    │   ├── http.rs
+    │   └── delegate.rs    # sub-agent spawning
+    ├── repo_map.rs        # AST/ctags-based incremental symbol index
+    ├── skills.rs          # discovery, keyword match, fork execution
+    ├── memory.rs          # fact store, redaction, recall
+    ├── tui.rs             # differential-render terminal UI
+    └── acp.rs             # Agent Client Protocol server mode
+```
+
+### Deliverables, in order
+
+1. `Cargo.toml` with pinned dependency versions known to build cleanly on
+   the current stable Rust toolchain (verify with `cargo build --release`
+   before moving on — do not hand back code that doesn't compile).
+2. `config.rs`, `provider/mod.rs` + `provider/anthropic.rs` (tool-use
+   request/response round trip working end-to-end against a real prompt).
+3. `tools/*` with the minimum tool set, permission-tier gating, and
+   destructive-command blocklist.
+4. `agent.rs` wired to providers + tools, with concurrent tool execution
+   and the lint/test self-repair loop.
+5. `skills.rs` + the five built-in skills + fork-to-subagent via
+   `delegate_task`.
+6. `memory.rs` with redaction and recall.
+7. `repo_map.rs` incremental index.
+8. `tui.rs` differential rendering for the REPL.
+9. `acp.rs` minimal ACP server mode.
+10. `install.sh` / `install.ps1`.
+
+After each deliverable, run `cargo build --release` (and `cargo clippy`) and
+fix warnings before proceeding to the next. Finish with a short README
+documenting install, the permission tiers, skill authoring format, and the
+memory commands.

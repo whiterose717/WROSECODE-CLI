@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "scripts": {"dev":"vite","build":"vite build"},
+  "dependencies": {"@vitejs/plugin-react":"latest","vite":"latest","react":"latest","react-dom":"latest"},
+  "devDependencies": {}
+}

@@ -1,0 +1,65 @@
+# WROSECODE project configuration.
+#
+# Every key below is optional: a missing section, a missing key, or a malformed
+# file falls back to the built-in defaults printed by `wrosecode --help`.
+# CLI flags always win over the values here.
+
+[ui]
+# dark | light | solarized | dracula | nord | wrose-dark
+theme = "wrose-dark"
+# compact | normal | verbose
+verbosity = "normal"
+alternate_screen = true
+# auto = detect terminal quirks (VS Code wheel conflict, Zellij repaint), on/off force it.
+mouse_capture = "auto"
+# Ring the terminal bell when a flag is detected.
+alert_bell = true
+# How many lines a single Up/Down press scrolls (1 = one line per press).
+smooth_scroll_lines = 1
+
+[agent]
+# 0 = answer immediately, 20 = longest reasoning budget. [ and ] adjust it live.
+thinking_level = 5
+# Upper bound for the worker pool. The agent lowers this itself for easy turns.
+max_parallel_tasks = 20
+# Wall-clock limit for a single `shell` command before it is killed.
+shell_timeout_seconds = 30
+tool_retries = 3
+fallback_provider = ""
+fallback_model = ""
+budget_usd = 0.0 # zero means unlimited
+# ask = prompt before every risky tool call, auto-safe = allow only read-only
+# commands, yolo = allow everything. Overridden by --permission.
+permission = "ask"
+
+[ctf]
+# Regex applied to every tool result and file the agent reads.
+flag_patterns = ["flag\\{.*?\\}", "CTF\\{.*?\\}", "picoCTF\\{.*?\\}", "HTB\\{.*?\\}"]
+# Copy a freshly found flag to the system clipboard.
+auto_copy = true
+# POST a found flag to a CTFd instance. Also requires CTFD_URL, CTFD_TOKEN and
+# CTFD_CHALLENGE_ID; the WROSECODE_CTFD_AUTO_SUBMIT env var overrides this.
+auto_submit = false
+
+[cache]
+# memory = per-process cache only. redis = share one cache across sessions when
+# redis_url points at a reachable server; otherwise it degrades to memory.
+backend = "memory"
+redis_url = "redis://127.0.0.1/"
+qdrant_url = "http://127.0.0.1:6333"
+
+[sandbox]
+# none   = run `shell` commands directly on the host (fastest, default).
+# docker = run them inside the container built from Dockerfile.sandbox.
+# `docker` fails loudly if the docker CLI or the image is unavailable: it never
+# silently drops down to the host.
+engine = "none"
+image = "wrosecode-sandbox:latest"
+# Keep one warm container alive between commands so there is no cold start.
+persistent = true
+name = "wrosecode-sandbox"
+network = "bridge"
+memory = "2g"
+cpus = "2.0"
+# Run `docker build -t <image> . -f Dockerfile.sandbox` when the image is missing.
+auto_build = false

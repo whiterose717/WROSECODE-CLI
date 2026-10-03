@@ -1,0 +1,233 @@
+<!doctype html>
+<html
+    lang="en"
+    class="tk-neue-haas-unica"
+>
+    <head>
+      <script type="module" src="/js/canny_sdk.js" async></script>
+
+        <meta charset="utf-8" />
+        <meta
+            http-equiv="X-UA-Compatible"
+            content="IE=edge"
+        />
+        <meta
+            name="viewport"
+            content="width=device-width,initial-scale=1.0"
+        />
+        <title>Hack The Box</title>
+        <link
+            rel="shortcut icon"
+            href="/images/HTB-favicon/favicon.ico"
+        />
+        <link
+            rel="icon"
+            type="image/png"
+            sizes="16x16"
+            href="/images/HTB-favicon/favicon-16x16.png"
+        />
+        <link
+            rel="icon"
+            type="image/png"
+            sizes="32x32"
+            href="/images/HTB-favicon/favicon-32x32.png"
+        />
+        <link
+            rel="apple-touch-icon"
+            href="/images/HTB-favicon/apple-touch-icon.png"
+        />
+        <link
+            rel="mask-icon"
+            href="/images/HTB-favicon/safari-pinned-tab.svg"
+        />
+        <link
+            rel="preload"
+            href="https://fonts.googleapis.com/css?family=Lato: 100,300,400,500,700,900"
+            as="style"
+            onload="
+                this.onload = null;
+                this.rel = 'stylesheet';
+            "
+            crossorigin="anonymous"
+        />
+        <link
+            rel="preload"
+            href="https://use.typekit.net/ryt3opf.css"
+            as="style"
+            onload="
+                this.onload = null;
+                this.rel = 'stylesheet';
+            "
+            crossorigin="anonymous"
+        />
+        <link
+            rel="preload"
+            href="https://use.typekit.net/jxn7iyx.css"
+            as="style"
+            onload="
+                this.onload = null;
+                this.rel = 'stylesheet';
+            "
+            crossorigin="anonymous"
+        />
+        <link
+            rel="preload"
+            href="https://cdn.jsdelivr.net/npm/@mdi/font@latest/css/materialdesignicons.min.css"
+            as="style"
+            onload="
+                this.onload = null;
+                this.rel = 'stylesheet';
+            "
+            crossorigin="anonymous"
+        />
+        <script
+            async
+            src="https://kit.fontawesome.com/8161086d56.js"
+            crossorigin="anonymous"
+        ></script>
+        <style>.fa-sr-only,.fa-sr-only-focusable:not(:focus),.sr-only,.sr-only-focusable:not(:focus){clip-path:inset(50%);clip:rect(1px, 1px, 1px, 1px);white-space:normal;border-width:0;width:1px;height:1px;margin:-1px;padding:0;position:absolute;overflow:hidden}.skip-to-main-content-link{z-index:899;color:#fff;opacity:0;background-color:#000;padding:1em;position:absolute;left:-9999px}.skip-to-main-content-link:focus{opacity:1;left:10px}</style>
+      <script type="module" crossorigin src="/assets/index-2Copmo_K.js"></script>
+      <link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-h5k7Whv4.js">
+      <link rel="modulepreload" crossorigin href="/assets/vue.runtime.esm-bundler-C5DgVHbT.js">
+      <link rel="modulepreload" crossorigin href="/assets/vendors-CuYV1WTf-CypNw5DS.js">
+      <link rel="modulepreload" crossorigin href="/assets/composables-BH3bkrIH-zI592ORt.js">
+      <link rel="modulepreload" crossorigin href="/assets/preload-helper-Ced2mIe2.js">
+      <link rel="modulepreload" crossorigin href="/assets/Icon-ByKpNY_q-BBHYc481.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBSquareButton-m5YRSSsb.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBLink-olCIjZ2h.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBTooltip-BwqYZQ8T.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBProgressbar-C-jE0hW0.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBSkeleton-DULKoyv5.js">
+      <link rel="modulepreload" crossorigin href="/assets/Avatar-DQXxvgP3-C19po4rQ.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBDropdown-DGTAhnu1.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBBadge-DW1eLw0Y.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBButton-CQfogYXB.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBModal-8kgLPR51.js">
+      <link rel="modulepreload" crossorigin href="/assets/Rating-jajNcIT_-D_T4E_Js.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBDivider-B8Emz5I4.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBCheckbox-Ba6xldOT.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBTextInput-o1NkfehF.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBTextArea-BS7Mv45f.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBTabs-DO9WqxWF.js">
+      <link rel="modulepreload" crossorigin href="/assets/utils-DYY8BPLM-278U-WaS.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBSelectNav-Bf65GctW.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBInputChip-aaZiytct.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBSearchInput-CIohzrvE.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBMenu-c4_vnktS.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBStatus-DR5GvESI.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBSignal-CohhtDkT.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBMultiselect-519sF5U1.js">
+      <link rel="modulepreload" crossorigin href="/assets/components-DhPTbHLX.js">
+      <link rel="modulepreload" crossorigin href="/assets/notifications-HSEWencu.js">
+      <link rel="modulepreload" crossorigin href="/assets/use-application-events-types-D1LX9SQp.js">
+      <link rel="modulepreload" crossorigin href="/assets/local-storage-b-EfyYZD.js">
+      <link rel="modulepreload" crossorigin href="/assets/async-wrap-ldcBPkcU.js">
+      <link rel="modulepreload" crossorigin href="/assets/http-client-DqoRWLxG.js">
+      <link rel="modulepreload" crossorigin href="/assets/useSocketWiretapping-BukyC7RV.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBIcon-oYsDdrky.js">
+      <link rel="modulepreload" crossorigin href="/assets/components_chunk-iOiZ9Cmz.js">
+      <link rel="modulepreload" crossorigin href="/assets/useApi-BPuI6ZR9-DK2HAVyQ.js">
+      <link rel="modulepreload" crossorigin href="/assets/generic-LNlfTII5.js">
+      <link rel="modulepreload" crossorigin href="/assets/url-helpers-DVUzt59K.js">
+      <link rel="modulepreload" crossorigin href="/assets/useAuthentication-BDgZwhGE.js">
+      <link rel="modulepreload" crossorigin href="/assets/useAbortableRequest-BYogw_oZ.js">
+      <link rel="modulepreload" crossorigin href="/assets/dom-helpers-CHvJUcbp.js">
+      <link rel="modulepreload" crossorigin href="/assets/CommonMarkdownComponent-CPjl-_pw.js">
+      <link rel="modulepreload" crossorigin href="/assets/modals-YkTwiLIf.js">
+      <link rel="modulepreload" crossorigin href="/assets/global-socket-event-names-mapper-1XUi7uVo.js">
+      <link rel="modulepreload" crossorigin href="/assets/subscription-products-plans-BhPwF_T1.js">
+      <link rel="modulepreload" crossorigin href="/assets/get-signal-resolvable-promise-CU27TI-f.js">
+      <link rel="modulepreload" crossorigin href="/assets/useSubscriptionProductsPrices-B65bT6dP.js">
+      <link rel="modulepreload" crossorigin href="/assets/file-helpers-C3J1_xY6.js">
+      <link rel="modulepreload" crossorigin href="/assets/useConnectionSettings-JOk-iUtC.js">
+      <link rel="modulepreload" crossorigin href="/assets/user-api-Dbgh_v3y.js">
+      <link rel="modulepreload" crossorigin href="/assets/trackers-R2V01Cgi.js">
+      <link rel="modulepreload" crossorigin href="/assets/tslib.es6-69ZCUguU.js">
+      <link rel="modulepreload" crossorigin href="/assets/middleware-BLxwdchH.js">
+      <link rel="modulepreload" crossorigin href="/assets/helpers-DuPbva9h.js">
+      <link rel="modulepreload" crossorigin href="/assets/callback-CQPqfNaI.js">
+      <link rel="modulepreload" crossorigin href="/assets/load-script-tAbEODZk.js">
+      <link rel="modulepreload" crossorigin href="/assets/metric-helpers-CwkiiIJ_.js">
+      <link rel="modulepreload" crossorigin href="/assets/gracefulDecodeURIComponent-H7qQwUtM.js">
+      <link rel="modulepreload" crossorigin href="/assets/trackers-DKnbEhhq.js">
+      <link rel="modulepreload" crossorigin href="/assets/route-names-fHgM4FPU.js">
+      <link rel="modulepreload" crossorigin href="/assets/useAcountSettings-DEMYYhP6.js">
+      <link rel="modulepreload" crossorigin href="/assets/common-profile-types-6FMW6haG.js">
+      <link rel="modulepreload" crossorigin href="/assets/common-api-CNTqiSYK.js">
+      <link rel="modulepreload" crossorigin href="/assets/useCategoryTags-htbgq5_o.js">
+      <link rel="modulepreload" crossorigin href="/assets/current-active-content-type-C_dVqdFt.js">
+      <link rel="modulepreload" crossorigin href="/assets/useCurrentActiveContent-Dcl0Y5b7.js">
+      <link rel="modulepreload" crossorigin href="/assets/seasonal-remote-state-values-BLJBJgf4.js">
+      <link rel="modulepreload" crossorigin href="/assets/useSideNavigation-DU32LLIk.js">
+      <link rel="modulepreload" crossorigin href="/assets/Notice-CYJr7i-K.js">
+      <link rel="modulepreload" crossorigin href="/assets/dist-yPhiSw6f.js">
+      <link rel="modulepreload" crossorigin href="/assets/date-helpers-B84wvyue.js">
+      <link rel="modulepreload" crossorigin href="/assets/useCountdown-BZLoTXw0.js">
+      <link rel="modulepreload" crossorigin href="/assets/usePwnBox-DSSrgD5-.js">
+      <link rel="modulepreload" crossorigin href="/assets/challenges-api-DNN8YHiR.js">
+      <link rel="modulepreload" crossorigin href="/assets/machines-api--stBhOys.js">
+      <link rel="modulepreload" crossorigin href="/assets/useActivity-cc3tqSOk.js">
+      <link rel="modulepreload" crossorigin href="/assets/teams-api-1tIKVpja.js">
+      <link rel="modulepreload" crossorigin href="/assets/useTeamProfile-Ba_yfOCE.js">
+      <link rel="modulepreload" crossorigin href="/assets/universities-api-B4BG0nqN.js">
+      <link rel="modulepreload" crossorigin href="/assets/university-user-roles-BWmJGUXo.js">
+      <link rel="modulepreload" crossorigin href="/assets/useUniversityProfile-CMExLKw8.js">
+      <link rel="modulepreload" crossorigin href="/assets/useRegion-LFpLf8fZ.js">
+      <link rel="modulepreload" crossorigin href="/assets/isObject-Cl9tXyMP.js">
+      <link rel="modulepreload" crossorigin href="/assets/isSymbol-BgmS03iV.js">
+      <link rel="modulepreload" crossorigin href="/assets/isArray-C0fbUoP_.js">
+      <link rel="modulepreload" crossorigin href="/assets/toString-DZp-KVMt.js">
+      <link rel="modulepreload" crossorigin href="/assets/text-helpers-BTMPO4fA.js">
+      <link rel="modulepreload" crossorigin href="/assets/debounce-IimMMGvP.js">
+      <link rel="modulepreload" crossorigin href="/assets/useRespectActions-Cv37DxCC.js">
+      <link rel="modulepreload" crossorigin href="/assets/tabs-BvdxaF-H.js">
+      <link rel="modulepreload" crossorigin href="/assets/useSeasonal-CJIBQIk7.js">
+      <link rel="modulepreload" crossorigin href="/assets/FullScreenLoader-CxW6DF7P.js">
+      <link rel="modulepreload" crossorigin href="/assets/useThreeDeeSecure-CEpnzI6I.js">
+      <link rel="modulepreload" crossorigin href="/assets/HTBAvatar-DVwk7eho.js">
+      <link rel="modulepreload" crossorigin href="/assets/NoDataInfoSection-5ba_3zvt.js">
+      <link rel="modulepreload" crossorigin href="/assets/CommonVipIcon-3cgm0xLJ.js">
+      <link rel="modulepreload" crossorigin href="/assets/HtbImage-BB5Cddlg.js">
+      <link rel="modulepreload" crossorigin href="/assets/difficulties-DvTC9sop.js">
+      <link rel="modulepreload" crossorigin href="/assets/prolab-difficulties-DlDKKHKt.js">
+      <link rel="modulepreload" crossorigin href="/assets/AvatarIconNameDetails-Bm7j1sVp.js">
+      <link rel="modulepreload" crossorigin href="/assets/format-icon-name-to-ds-icon-nOE7qtb2.js">
+      <link rel="modulepreload" crossorigin href="/assets/AvatarIconNameDetailsSkeleton-CaBsNb1M.js">
+      <link rel="modulepreload" crossorigin href="/assets/useGlobalSearch-B3bw_ksh.js">
+      <link rel="modulepreload" crossorigin href="/assets/tabs-DP879oOO.js">
+      <link rel="modulepreload" crossorigin href="/assets/prolabs-infos-CG0n8vmj.js">
+      <link rel="modulepreload" crossorigin href="/assets/CommonCopyControl-BzEwHPk3.js">
+      <link rel="modulepreload" crossorigin href="/assets/CommonExpansionItem-DiKakV2a.js">
+      <link rel="modulepreload" crossorigin href="/assets/routeHelpers-BhuVezEX.js">
+      <link rel="modulepreload" crossorigin href="/assets/_plugin-vue_export-helper-Dz9o1bd_.js">
+      <link rel="stylesheet" crossorigin href="/assets/CommonMarkdownComponent-CEO33yVv.css">
+      <link rel="stylesheet" crossorigin href="/assets/Notice-B0xe4nRe.css">
+      <link rel="stylesheet" crossorigin href="/assets/FullScreenLoader-Cv6tSMeS.css">
+      <link rel="stylesheet" crossorigin href="/assets/NoDataInfoSection-W0Stb4gJ.css">
+      <link rel="stylesheet" crossorigin href="/assets/CommonVipIcon-D3jhjuBb.css">
+      <link rel="stylesheet" crossorigin href="/assets/AvatarIconNameDetails-C4PfhFsK.css">
+      <link rel="stylesheet" crossorigin href="/assets/CommonCopyControl-D1rv_pgo.css">
+      <link rel="stylesheet" crossorigin href="/assets/CommonExpansionItem-B86K7y7u.css">
+      <link rel="stylesheet" crossorigin href="/assets/index-2l6-KnR6.css">
+      <script type="text/javascript">window.AppcuesSettings = { enableURLDetection: true };</script>
+      <script type="module" src="//fast.appcues.com/213301.js" async></script>
+    </head>
+    <body><a href="https://app.hackthebox.com/cdn-cgi/content?id=G52ZGAJR3paBosMgtbEKfey6BJmYMs43YXtci9oY6E4-1791058808.8361852-1.2.1.1-1TXiAp7ugO0QWKRjLPqoaBa0fFdJsRr1o6OUAZ2B_iD6fdclmKBhUBVGVFdhF_iZ" aria-hidden="true" rel="nofollow noopener" style="display: none !important; visibility: hidden !important"></a>
+        <a
+            href="#main-app"
+            accesskey="m"
+            class="skip-to-main-content-link"
+        >
+            Skip to main content
+        </a>
+        <noscript>
+            <strong>
+                We're sorry but htb-web-vue doesn't work properly without JavaScript enabled. Please
+                enable it to continue.
+            </strong>
+        </noscript>
+        <div id="app"></div>
+        <!-- built files will be auto injected -->
+      <script type="text/javascript" id="Cookiebot" data-cbid="c6744560-9be5-4645-9305-83ef9e0b993d" src="https://consent.cookiebot.com/uc.js" defer></script>
+    </body>
+</html>

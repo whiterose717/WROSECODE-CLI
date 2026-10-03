@@ -1,0 +1,9 @@
+{
+  "name": "@wrosecode/cli",
+  "version": "0.2.0",
+  "description": "Installer shim for the WROSECODE Rust binary",
+  "bin": {"wrosecode": "npm/wrosecode.js"},
+  "files": ["npm/wrosecode.js"],
+  "engines": {"node": ">=18"},
+  "license": "MIT"
+}

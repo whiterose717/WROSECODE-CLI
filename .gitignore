@@ -1,0 +1,59 @@
+# Build output
+/target
+
+# CTF workspace runtime output (.ctf/README.md stays tracked)
+.ctf/flags.log
+.ctf/errors.log
+.ctf/artifacts/
+.ctf/reports/
+.ctf/solvers/
+
+# Crash reports written when HOME is unset (normally ~/.wrosecode/crash)
+.wrosecode-crash/
+
+# Skill corpus: only the SKILL.md files referenced by src/skills.rs via
+# include_str! are tracked (a fresh clone must still compile). Everything
+# else in skills/ is a local reference library.
+skills/*
+!skills/binary-analysis/
+skills/binary-analysis/*
+!skills/binary-analysis/SKILL.md
+!skills/coding/
+skills/coding/*
+!skills/coding/SKILL.md
+!skills/ctf-crypto/
+skills/ctf-crypto/*
+!skills/ctf-crypto/SKILL.md
+!skills/ctf-forensics/
+skills/ctf-forensics/*
+!skills/ctf-forensics/SKILL.md
+!skills/ctf-network/
+skills/ctf-network/*
+!skills/ctf-network/SKILL.md
+!skills/ctf-osint/
+skills/ctf-osint/*
+!skills/ctf-osint/SKILL.md
+!skills/ctf-pwn/
+skills/ctf-pwn/*
+!skills/ctf-pwn/SKILL.md
+!skills/ctf-rev/
+skills/ctf-rev/*
+!skills/ctf-rev/SKILL.md
+!skills/ctf-stego/
+skills/ctf-stego/*
+!skills/ctf-stego/SKILL.md
+!skills/ctf-web/
+skills/ctf-web/*
+!skills/ctf-web/SKILL.md
+!skills/recon/
+skills/recon/*
+!skills/recon/SKILL.md
+!skills/webvuln/
+skills/webvuln/*
+!skills/webvuln/SKILL.md
+
+# Local challenge work and stray artifacts (not part of the CLI)
+challenge.zip
+challenge_analysis/
+challenge_extracted/
+emo.doc

@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WROSECODE configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "ui": {
+      "type": "object",
+      "properties": {
+        "theme": {
+          "enum": [
+            "dark",
+            "wrose-dark",
+            "light",
+            "solarized",
+            "dracula",
+            "nord"
+          ]
+        },
+        "verbosity": {
+          "enum": [
+            "compact",
+            "normal",
+            "verbose"
+          ]
+        },
+        "alternate_screen": {
+          "type": "boolean"
+        },
+        "smooth_scroll_lines": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "mouse_capture": {
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ]
+        },
+        "alert_bell": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "agent": {
+      "type": "object",
+      "properties": {
+        "thinking_level": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20
+        },
+        "max_parallel_tasks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "shell_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tool_retries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3
+        },
+        "permission": {
+          "enum": [
+            "ask",
+            "auto-safe",
+            "yolo"
+          ]
+        },
+        "fallback_provider": {
+          "type": "string"
+        },
+        "fallback_model": {
+          "type": "string"
+        },
+        "budget_usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ctf": {
+      "type": "object",
+      "properties": {
+        "flag_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "auto_copy": {
+          "type": "boolean"
+        },
+        "auto_submit": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cache": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "enum": [
+            "memory",
+            "redis"
+          ]
+        },
+        "redis_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "qdrant_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "engine": {
+          "enum": [
+            "none",
+            "docker"
+          ]
+        },
+        "image": {
+          "type": "string"
+        },
+        "persistent": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "network": {
+          "type": "string"
+        },
+        "memory": {
+          "type": "string"
+        },
+        "cpus": {
+          "type": "string"
+        },
+        "auto_build": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

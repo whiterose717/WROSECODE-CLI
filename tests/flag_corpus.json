@@ -1,0 +1,8 @@
+[
+  {"input":"noise flag{direct_case}","expected":true},
+  {"input":"4354467b6865785f636173657d","expected":true},
+  {"input":"cGljb0NURntiYXNlNjRfY2FzZX0=","expected":true},
+  {"input":"UGO{ebg13_pnfr}","expected":true},
+  {"input":"ordinary diagnostic output without a candidate","expected":false},
+  {"input":"deadbeef","expected":false}
+]
