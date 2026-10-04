@@ -30,12 +30,27 @@ struct Pty {
 
 impl Pty {
     fn start(binary: &str, home: &std::path::Path) -> Self {
-        Self::start_with(binary, home, &[])
+        Self::spawn(binary, home, None, &[])
+    }
+
+    /// Same as `start`, but the project root (the TUI's cwd) is `cwd`, so
+    /// file-writing commands such as `/coverage` stay inside the temp tree.
+    fn start_in(binary: &str, home: &std::path::Path, cwd: &std::path::Path) -> Self {
+        Self::spawn(binary, home, Some(cwd), &[])
     }
 
     /// `extra` is appended to the environment (used by the 5000-line flood
     /// test to seed the transcript without a model).
     fn start_with(binary: &str, home: &std::path::Path, extra: &[(&str, &str)]) -> Self {
+        Self::spawn(binary, home, None, extra)
+    }
+
+    fn spawn(
+        binary: &str,
+        home: &std::path::Path,
+        cwd: Option<&std::path::Path>,
+        extra: &[(&str, &str)],
+    ) -> Self {
         // A PTY allocated by `script` inherits no window size from a piped
         // stdout, which would leave the shell rendering a 0x0 frame.
         let command = format!("stty cols 100 rows 30 2>/dev/null; exec {binary}");
@@ -45,6 +60,9 @@ impl Pty {
             .env("HOME", home)
             .env("TERM", "xterm-256color")
             .env("WROSECODE_NO_MOUSE", "1");
+        if let Some(cwd) = cwd {
+            launcher.current_dir(cwd);
+        }
         for (key, value) in extra {
             launcher.env(key, value);
         }
@@ -429,6 +447,60 @@ fn pty_dashboard_focus_detail_and_close() {
     assert!(
         transcript.contains(" Esc back"),
         "the detail view paints its back hint\n{transcript}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn the_coverage_checklist_round_trips_through_the_tui() {
+    if !pty_helper() {
+        eprintln!("skipping: util-linux script(1) is not available");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("wrosecode-tui-coverage-{}", std::process::id()));
+    let work = home.join("project");
+    std::fs::create_dir_all(&work).expect("temp project");
+    let binary = env!("CARGO_BIN_EXE_wrosecode").to_string();
+
+    let mut pty = Pty::start_in(&binary, &home, &work);
+    std::thread::sleep(Duration::from_millis(1200));
+    pty.send_text("/coverage add XSS in search", 250);
+    pty.send(b"\r", 400);
+    pty.send_text("/coverage done xss", 250);
+    pty.send(b"\r", 400);
+    pty.send_text("/coverage", 250); // renders the list, then opens the picker
+    pty.send(b"\r", 400);
+    pty.send(b"\x1b", 300); // Esc closes the picker
+    pty.send_text("/quit", 250);
+    pty.send(b"\r", 600);
+    let (exited_cleanly, transcript) = pty.finish();
+
+    assert!(
+        exited_cleanly,
+        "the TUI must leave through /quit, not a panic\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("panicked at"),
+        "no panic may escape into the terminal\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Added."),
+        "adding an item reports success\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Checked off: XSS in search"),
+        "done matches by unique substring\n{transcript}"
+    );
+    assert!(
+        transcript.contains("coverage: 1 of 1 checked") && transcript.contains("[x] XSS in search"),
+        "the list renders with the checked box\n{transcript}"
+    );
+
+    let saved =
+        std::fs::read_to_string(work.join(".wrosecode").join("coverage.json")).expect("checklist");
+    assert!(
+        saved.contains("\"done\": true"),
+        "the toggle landed on disk: {saved}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
