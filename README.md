@@ -250,6 +250,33 @@ wrosecode --provider vyce --model deepseek-v4.1 \
   'solve this challenge and verify the flag'
 ```
 
+### CTF autopilot
+
+`wrosecode ctf <file|dir|url|description>` hands the target to an autonomous
+loop (headless; in the TUI it is `/ctf`, and mentioning a flag, CTF, or
+challenge offers it):
+
+```bash
+# Triage → category hypothesis → playbooks → verify, or a loud budget stop
+wrosecode ctf chal.pcap --budget 60
+wrosecode ctf chal.txt --flag-format 'SECRET\{[^}]+\}' --category forensics
+wrosecode ctf https://challenge.example --remote challenge.example:443 --parallel 2
+```
+
+Every run starts by printing the allowlist it will work inside
+(`SCOPE files … · hosts …`, `TOOLS installed/missing`, `GUESS <category>`),
+writes `ctf-notes.md` (challenge, scope, triage, assumptions, dead ends —
+dead ends are re-read by the stuck handler so nothing is retried), and loads
+the matching `skills/ctf-*` playbook. Out-of-scope writes are denied with the
+reason handed back to the model instead of executed. Flags are `✔ flag
+verified` only when the value re-derives from an artifact (or a decode chain);
+a model claim alone is `⚠ candidate, unverified`.
+
+The stop condition is never silent: hitting the budget prints
+`BUDGET EXHAUSTED (steps|tokens|seconds)` plus `Tried:` / `Learned:` /
+`Next:`, and every run leaves `writeups/<challenge>.md`. Exit codes are `0`
+verified, `2` unsolved (budget or stop), `1` error.
+
 Project playbooks load from `skills/`, `.ctf/skills/`, and `~/.wrosecode/skills/`. Delegated tasks accept stable `task_id` values and can resume completed results. Thinking levels allocate runtime concurrency as follows: 0–3 uses one worker, 4–7 uses up to three, 8–12 uses up to five, and 13–20 allows the configured swarm limit.
 
 The tool runtime includes MCP, Burp raw request import/export, optional Playwright screenshots, in-memory and Redis result caches, and an optional Qdrant writeup archive. Start the supporting services with `docker compose up -d`.
@@ -392,7 +419,7 @@ Skills load from bundled `skills/`, project `skills/`, `~/.wrosecode/skills/`, a
 | Agents | `/agents`, `/build`, `/plan`, `/harness`, `/skills` |
 | Providers | `/connect`, `/providers`, `/models`, `/model`, `/mcps` |
 | Session | `/new`, `/sessions`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/dashboard`, `/verbosity`, `/think`, `/theme`, `/export`, `/help`, `/exit`, `/quit` |
-| Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/flags`, `/writeup`, `/sandbox` |
+| Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/flags`, `/writeup`, `/ctf`, `/sandbox` |
 
 `/providers` opens a searchable provider screen with twelve built-in entries and their connection status. Enter configures or selects a provider; `a` adds, `e` edits, `d` deletes a custom provider, and `t` tests a connection. `/connect` opens the custom provider form directly. The API key field is masked. `/models` searches models across connected providers; `/model MODEL` switches the current provider's model.
 

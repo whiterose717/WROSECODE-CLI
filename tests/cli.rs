@@ -56,6 +56,31 @@ fn unknown_flags_fail_instead_of_being_swallowed() {
 }
 
 #[test]
+fn ctf_help_documents_the_autopilot_flags() {
+    // `ctf` rewrites argv to `--headless …`, so `ctf --help` is the entry's
+    // documentation surface for the five autopilot options.
+    let output = bin()
+        .args(["ctf", "--help"])
+        .output()
+        .expect("run ctf --help");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in [
+        "--flag-format",
+        "--category",
+        "--remote",
+        "--budget",
+        "--parallel",
+    ] {
+        assert!(stdout.contains(flag), "ctf --help is missing {flag}");
+    }
+}
+
+#[test]
 fn ctfd_verify_documents_exit_codes_and_retries() {
     let output = bin()
         .args(["ctfd", "verify", "--help"])

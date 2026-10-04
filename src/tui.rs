@@ -650,6 +650,8 @@ struct Ui {
     changed_files: Vec<String>,
     /// A `Checker VERIFIED` line landed during the current task.
     verified: bool,
+    /// The `/ctf` auto-offer hint has already been shown this session.
+    ctf_offered: bool,
     // ---- Phase 3: result block accounting ----
     tool_ms_total: u128,
     model_ms_total: u128,
@@ -1008,6 +1010,7 @@ impl Ui {
             flag_log: Vec::new(),
             changed_files: Vec::new(),
             verified: false,
+            ctf_offered: false,
             tool_ms_total: 0,
             model_ms_total: 0,
             turns_total: 0,
@@ -4615,6 +4618,13 @@ pub async fn run(
                 } else if let Some(fact) = line.strip_prefix("#fact ") {
                     ui.push(Speaker::System, agent.memory.save(fact, false)?);
                 } else {
+                    if !ui.ctf_offered && mentions_ctf(&line) {
+                        ui.ctf_offered = true;
+                        ui.push(
+                            Speaker::System,
+                            "Tip: /ctf <file|dir|url|description> runs the scope-guarded CTF autopilot — parallel hypotheses, verified flags, budget enforced, writeup written.",
+                        );
+                    }
                     if !run_turn_queue(&mut agent, &mut ui, &line, &mut events, &mut permissions)
                         .await?
                     {
@@ -5278,6 +5288,13 @@ async fn available_models(agent: &Agent, settings: &Settings) -> Vec<(String, St
     results.into_iter().flatten().collect()
 }
 
+/// True when a prompt looks like it wants the CTF autopilot (flag, challenge,
+/// or CTF mentioned) so the `/ctf` offer shows once per session.
+fn mentions_ctf(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("flag{") || lower.contains("ctf") || lower.contains("challenge")
+}
+
 async fn run_command(
     line: &str,
     agent: &mut Agent,
@@ -5537,6 +5554,196 @@ async fn run_command(
                 Speaker::System,
                 format!("Writeup generated: {}", path.display()),
             );
+        }
+        "/ctf" => {
+            let mut options = crate::autopilot::Options::default();
+            let mut words = args.split_whitespace().peekable();
+            while let Some(word) = words.next() {
+                match word {
+                    "--flag-format" => options.flag_format = words.next().map(str::to_string),
+                    "--category" => options.category = words.next().map(str::to_string),
+                    "--remote" => options.remote = words.next().map(str::to_string),
+                    "--budget" => match words.next() {
+                        Some(value) => options.budget = crate::autopilot::Budget::parse(value)?,
+                        None => {
+                            ui.push(
+                                Speaker::System,
+                                "--budget needs a value (steps, or steps=…,tokens=…,seconds=…)",
+                            );
+                            return Ok(());
+                        }
+                    },
+                    "--parallel" => {
+                        match words.next().and_then(|value| value.parse::<usize>().ok()) {
+                            Some(value) => options.parallel = value,
+                            None => {
+                                ui.push(Speaker::System, "--parallel needs a number");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    other if other.starts_with("--") => {
+                        ui.push(
+                            Speaker::System,
+                            format!("Unknown flag {other}. Try /ctf [target] [--flag-format F] [--category C] [--remote host:port] [--budget B] [--parallel N]"),
+                        );
+                        return Ok(());
+                    }
+                    other => options.target = other.to_string(),
+                }
+            }
+            let root = agent.config.root.clone();
+            let scope = crate::autopilot::Scope::for_target(
+                &options.target,
+                &root,
+                options.remote.as_deref(),
+            );
+            agent.tools.set_scope(Some(scope.clone()));
+            if let Some(pattern) = &options.flag_format {
+                agent.ctf = agent.ctf.clone().with_flag_format(pattern)?;
+            }
+            agent.ctf.lock_category();
+            let inventory = crate::autopilot::tool_inventory();
+            ui.push(Speaker::System, format!("SCOPE   {}", scope.describe()));
+            ui.push(Speaker::System, format!("TOOLS   {}", inventory.describe()));
+            let triage_report = crate::autopilot::triage(&root).await;
+            let category = options.category.clone().unwrap_or_else(|| {
+                crate::autopilot::guess_category(&root, &options.target, &triage_report)
+            });
+            agent.ctf.category = category.clone();
+            ui.category = category.clone();
+            ui.push(Speaker::System, format!("GUESS   {category}"));
+            crate::autopilot::init_notes(&root, &options, &scope, &triage_report)?;
+            let playbook = crate::skills::match_skill(
+                &agent.skills,
+                &format!("{} {}", options.target, triage_report),
+            )
+            .cloned();
+            let mut brief = crate::autopilot::brief(
+                &options,
+                &scope,
+                &inventory,
+                &category,
+                &triage_report,
+                playbook.as_ref(),
+            );
+            let parallel = options.parallel.max(1);
+            brief = format!(
+                "Parallelism: run at most {parallel} hypothesis subagent(s) at a time via delegate_task (hypotheses: {category}).\n{brief}"
+            );
+            let mut stuck = crate::autopilot::Stuck::default();
+            let started = std::time::Instant::now();
+            let mut steps = 0_usize;
+            let mut last_reply: Option<String> = None;
+            let mut last_candidate: Option<String> = None;
+            let mut stop_reason: Option<String> = None;
+            loop {
+                ui.status = format!("CTF autopilot · step {}", steps + 1);
+                let entries_before = ui.entries.len();
+                let messages_before = agent.messages.len();
+                if !run_turn_queue(agent, ui, &brief, events, permissions).await? {
+                    stop_reason = Some("permission denied".into());
+                    break;
+                }
+                let fresh = &ui.entries[entries_before..];
+                let reply = fresh
+                    .iter()
+                    .rev()
+                    .find(|entry| matches!(entry.speaker, Speaker::Agent))
+                    .map(|entry| entry.text.clone());
+                let cancelled = fresh.iter().any(|entry| {
+                    matches!(entry.speaker, Speaker::System)
+                        && entry.text.starts_with("Turn cancelled")
+                });
+                let Some(reply) = reply else {
+                    stop_reason = Some(if cancelled || agent.messages.len() <= messages_before {
+                        "stopped by the user".into()
+                    } else {
+                        "the last turn produced no reply".into()
+                    });
+                    break;
+                };
+                steps += 1;
+                let head: String = reply.trim().chars().take(160).collect();
+                ui.push(
+                    Speaker::System,
+                    format!(
+                        "[{steps}/{}] {}",
+                        options.budget.steps,
+                        head.replace('\n', " ")
+                    ),
+                );
+                let tokens = agent.usage.input + agent.usage.output;
+                let hits = agent.ctf.recorded_hits();
+                if let Some(verified) = crate::autopilot::verify(&agent.ctf, &hits) {
+                    ui.push(
+                        Speaker::System,
+                        format!("✔ flag verified: {} ({})", verified.flag, verified.evidence),
+                    );
+                    ui.verified = true;
+                    break;
+                }
+                if let Some(candidate) = crate::autopilot::candidate_note(&agent.ctf, &hits) {
+                    if last_candidate.as_deref() != Some(candidate.as_str()) {
+                        last_candidate = Some(candidate.clone());
+                        ui.push(Speaker::System, format!("⚠ {candidate}"));
+                    }
+                }
+                let repeats = last_reply.as_deref() == Some(reply.trim());
+                let failures = usize::from(reply.trim().is_empty()) + usize::from(repeats);
+                last_reply = Some(reply.trim().to_string());
+                if stuck.step(failures) {
+                    agent.thinking_level = agent.thinking_level.max(10);
+                    ui.thinking_level = agent.thinking_level;
+                    agent.ctf.category = crate::autopilot::CATEGORIES[stuck.hypothesis].to_string();
+                    let nudge = stuck.nudge(&agent.ctf.category);
+                    ui.push(
+                        Speaker::System,
+                        nudge.lines().next().unwrap_or_default().to_string(),
+                    );
+                    crate::autopilot::append_note(
+                        &root,
+                        &format!(
+                            "- stuck nudge @ step {steps}: hypothesis {}",
+                            crate::autopilot::CATEGORIES[stuck.hypothesis]
+                        ),
+                    );
+                    brief = format!("{nudge}\n\n{brief}");
+                }
+                if let Some(reason) = options.budget.exhausted(steps, tokens, started.elapsed()) {
+                    stop_reason = Some(format!("budget exhausted ({reason})"));
+                    break;
+                }
+                brief = format!(
+                    "Continue. {} step(s) used, {} tokens spent, budget {} steps / {} tokens / {} seconds.\n{brief}",
+                    steps,
+                    tokens,
+                    options.budget.steps,
+                    options.budget.tokens,
+                    options.budget.seconds,
+                );
+            }
+            let tokens = agent.usage.input + agent.usage.output;
+            let hits = agent.ctf.recorded_hits();
+            if let Some(reason) = stop_reason {
+                if let Some(candidate) = crate::autopilot::candidate_note(&agent.ctf, &hits) {
+                    if last_candidate.as_deref() != Some(candidate.as_str()) {
+                        ui.push(Speaker::System, format!("⚠ {candidate}"));
+                    }
+                }
+                let report = crate::autopilot::stop_report(&root, &options, steps, tokens, &reason);
+                ui.push(Speaker::System, report);
+            }
+            sync_session(session, agent, ui);
+            if session.summary == "New session" {
+                session.summary = format!("ctf {}", options.target);
+            }
+            let flags: Vec<String> = hits.iter().map(|hit| hit.flag.clone()).collect();
+            let notes = std::fs::read_to_string(crate::autopilot::notes_path(&root)).ok();
+            match crate::report::writeup_challenge(&root, session, &flags, notes.as_deref()) {
+                Ok(path) => ui.push(Speaker::System, format!("Writeup: {}", path.display())),
+                Err(error) => ui.push(Speaker::System, format!("Writeup failed: {error:#}")),
+            }
         }
         "/diff" => {
             let diff = project::diff(&agent.config.root)?;

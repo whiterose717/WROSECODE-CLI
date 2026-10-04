@@ -151,7 +151,9 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, text: &str) -> Result<String> {
-        self.ctf.category = crate::ctf::categorize(&self.config.root, text);
+        if !self.ctf.category_locked() {
+            self.ctf.category = crate::ctf::categorize(&self.config.root, text);
+        }
         if self.messages.is_empty() {
             for hit in self.ctf.scan_project() {
                 if let Some(tx) = &self.event_tx {

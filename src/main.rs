@@ -2,6 +2,7 @@ mod acp;
 mod agent;
 mod api;
 mod attach;
+mod autopilot;
 mod commands;
 mod config;
 mod crash;
@@ -99,6 +100,21 @@ struct Cli {
     /// Disable all colour output (same as setting `NO_COLOR`)
     #[arg(long)]
     no_color: bool,
+    /// CTF autopilot: flag-format regex the verifier must match
+    #[arg(long, value_name = "REGEX")]
+    flag_format: Option<String>,
+    /// CTF autopilot: category override (crypto/web/pwn/rev/forensics/…)
+    #[arg(long)]
+    category: Option<String>,
+    /// CTF autopilot: allow this remote host (host or host:port)
+    #[arg(long, value_name = "HOST[:PORT]")]
+    remote: Option<String>,
+    /// CTF autopilot: run budget — bare steps, or steps=…,tokens=…,seconds=…
+    #[arg(long, value_name = "STEPS|steps=…,tokens=…,seconds=…")]
+    budget: Option<String>,
+    /// CTF autopilot: max parallel hypothesis subagents
+    #[arg(long, default_value_t = 0)]
+    parallel: usize,
 }
 
 #[tokio::main]
@@ -155,6 +171,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let mut exec_json = false;
+    let mut ctf_mode = false;
     let cli_args: Vec<String> = if raw_args.get(1).is_some_and(|argument| argument == "exec") {
         let mut rewritten = vec!["wrosecode".to_string(), "--headless".to_string()];
         for argument in raw_args.iter().skip(2) {
@@ -164,6 +181,13 @@ async fn main() -> Result<()> {
                 rewritten.push(argument.clone());
             }
         }
+        rewritten
+    } else if raw_args.get(1).is_some_and(|argument| argument == "ctf") {
+        // Spec PHASE 5: `wrosecode ctf <file|dir|url|description>` always runs
+        // headless (the TUI path is `/ctf`), so mirror the `exec` rewrite.
+        ctf_mode = true;
+        let mut rewritten = vec!["wrosecode".to_string(), "--headless".to_string()];
+        rewritten.extend(raw_args.iter().skip(2).cloned());
         rewritten
     } else {
         raw_args.clone()
@@ -231,7 +255,11 @@ async fn main() -> Result<()> {
         thinking_level: configured_think
             .map(ThinkLevel::anchor)
             .unwrap_or_else(|| runtime.agent.thinking_level.min(20)),
-        max_parallel_tasks: runtime.agent.max_parallel_tasks.clamp(1, 20),
+        max_parallel_tasks: if cli.parallel > 0 {
+            cli.parallel.min(20)
+        } else {
+            runtime.agent.max_parallel_tasks.clamp(1, 20)
+        },
         shell_timeout_seconds: runtime.agent.shell_timeout_seconds.max(1),
         tool_retries: runtime.agent.tool_retries.clamp(1, 3),
         fallback_provider: runtime.agent.fallback_provider,
@@ -255,6 +283,7 @@ async fn main() -> Result<()> {
     // would otherwise sit between the user and their first frame.
     let tui_mode = cli.prompt.is_none()
         && !cli.headless
+        && !ctf_mode
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
     let guard = if tui_mode {
@@ -311,6 +340,50 @@ async fn main() -> Result<()> {
     for server in &settings.mcps {
         if let Ok(mcp) = tools::mcp::Mcp::connect(&server.bin, &server.args).await {
             agent.tools.mcps.push((server.name.clone(), mcp));
+        }
+    }
+    if ctf_mode {
+        // Spec PHASE 5: exit 0 verified, exit 2 budget-exhausted, exit 1
+        // (anyhow) on error.
+        let options = autopilot::Options {
+            target: cli.prompt.clone().unwrap_or_else(|| ".".into()),
+            flag_format: cli.flag_format.clone(),
+            category: cli.category.clone(),
+            remote: cli.remote.clone(),
+            budget: autopilot::Budget::parse(cli.budget.as_deref().unwrap_or_default())?,
+            parallel: cli.parallel,
+        };
+        let outcome = autopilot::run(&mut agent, &options).await?;
+        let mut session = resumed_session.unwrap_or_else(session::Session::fresh);
+        session.messages = agent.messages.clone();
+        session.provider_name = agent.config.provider.clone();
+        session.model = agent.config.model.clone();
+        session.summary = format!("ctf {}", options.target);
+        store.save_session(&session)?;
+        // Spec 5.8: every autopilot run leaves `writeups/<challenge>.md`.
+        let flags: Vec<String> = agent
+            .ctf
+            .recorded_hits()
+            .into_iter()
+            .map(|hit| hit.flag)
+            .collect();
+        let notes = std::fs::read_to_string(autopilot::notes_path(&agent.config.root)).ok();
+        let writeup =
+            report::writeup_challenge(&agent.config.root, &session, &flags, notes.as_deref())?;
+        println!("WRITEUP {}", writeup.display());
+        match outcome {
+            autopilot::Outcome::Verified { flag, evidence } => {
+                println!("FLAG    {flag}");
+                println!("EVIDENCE {evidence}");
+                return Ok(());
+            }
+            autopilot::Outcome::Unsolved { report, candidate } => {
+                if let Some(candidate) = candidate {
+                    println!("⚠ {candidate}");
+                }
+                println!("{report}");
+                std::process::exit(2);
+            }
         }
     }
     if cli.prompt.as_deref() == Some("acp") {

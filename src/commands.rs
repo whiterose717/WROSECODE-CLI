@@ -182,6 +182,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Generate a Markdown CTF writeup",
     },
     CommandSpec {
+        name: "/ctf",
+        category: "Project",
+        description: "Run the scope-guarded CTF autopilot on a challenge",
+    },
+    CommandSpec {
         name: "/export",
         category: "Session",
         description: "Export metrics as JSON and CSV",
@@ -245,6 +250,7 @@ mod tests {
             "/clear",
             "/commit",
             "/connect",
+            "/ctf",
             "/dashboard",
             "/debug",
             "/diff",
@@ -265,6 +271,7 @@ mod tests {
             "/stats",
             "/theme",
             "/think",
+            "/writeup",
         ] {
             assert!(lookup(name).is_some(), "missing {name}");
             assert!(help().contains(name));

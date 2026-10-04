@@ -23,6 +23,22 @@ plus `--summary json` prints a `TaskComplete` object, `--until`/`--until-cmd`/
 platform verdict onto shell-friendly exit codes (0/2/1). Integration tests in
 `tests/` exercise those paths against local mock HTTP servers.
 
+`src/autopilot.rs` is the CTF loop behind `wrosecode ctf …` (headless) and the
+TUI's `/ctf` arm. `run()` arms `Scope::for_target` (files + `--remote` hosts)
+into `Agent::tools`, replaces the detector's patterns with `--flag-format`,
+locks the category so a stuck rotation survives, then prints `SCOPE`/`TOOLS`/
+`GUESS`, runs `triage` (bounded `ls`/`file`/`xxd`/`strings` probes), seeds
+`ctf-notes.md`, and turns until a flag verifies or the budget stops.
+Verification is `verify(&agent.ctf, hits)`: a `file:` hit only counts when
+re-derived by the run's own detector and a `tool:` hit only when its
+transformation is not `plain`, which is what separates `✔ flag verified` from
+`candidate_note`'s `⚠ candidate, unverified`. `scope_check` runs first inside
+`tools::execute`, so an out-of-scope write bails with `out-of-scope … denied`
+handed back to the model as a tool error (headless cannot approve). The stop
+path returns `Outcome::Unsolved { report, candidate }` once — `main` prints the
+`Tried`/`Learned`/`Next` report and exits 2, and always writes
+`writeups/<challenge>.md` through `report::writeup_challenge`.
+
 The TUI builds a complete frame but the renderer compares it with the prior frame and writes changed rows only, clearing any rows a shrinking frame leaves behind. Mouse resizing changes the horizontal split without clearing the terminal.
 
 Frame layout is `Ui::compose(width, height)`, a pure function split out of

@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod burp;
 pub mod cache;
+pub mod decode;
 pub mod fs;
 pub mod http;
 pub mod mcp;
@@ -42,6 +43,10 @@ pub struct Tools {
     pub checklist: Arc<Mutex<Vec<(String, bool)>>>,
     redis_addr: Option<String>,
     pub sandbox: Arc<crate::sandbox::Sandbox>,
+    /// CTF autopilot allowlist: `Some` means every call is checked against it
+    /// (writes and network outside it need approval; in-scope mutations are
+    /// auto-approved per spec 4).
+    pub scope: Option<Arc<crate::autopilot::Scope>>,
 }
 
 impl Tools {
@@ -67,7 +72,13 @@ impl Tools {
             checklist: Arc::new(Mutex::new(Vec::new())),
             redis_addr,
             sandbox,
+            scope: None,
         }
+    }
+
+    /// Arm (or clear) the CTF autopilot scope guard.
+    pub fn set_scope(&mut self, scope: Option<crate::autopilot::Scope>) {
+        self.scope = scope.map(Arc::new);
     }
 
     pub fn schemas(&self) -> Vec<Value> {
@@ -97,6 +108,11 @@ impl Tools {
                 "glob",
                 "Find project files by glob",
                 json!({"pattern":"string"}),
+            ),
+            schema(
+                "decode",
+                "Encoding sweep: base64/32/58/85, hex, rot/Caesar, atbash, XOR, URL, gzip/zlib/bz2/xz, morse, binary, nested chains",
+                json!({"text":"string","path":"string","depth":"number"}),
             ),
             schema("web_search", "Search the web", json!({"query":"string"})),
             schema("web_fetch", "Fetch a web page", json!({"url":"string"})),
@@ -150,6 +166,7 @@ impl Tools {
 
     pub async fn execute(&self, call: &ToolCall) -> Result<String> {
         let input = &call.input;
+        self.scope_check(&call.name, input).await?;
         let input_text = input.to_string();
         let created = self
             .created_files
@@ -257,6 +274,18 @@ impl Tools {
             }
             "grep" => search::grep(&self.config.root, arg(input, "pattern")?)?,
             "glob" => search::glob(&self.config.root, arg(input, "pattern")?)?,
+            "decode" => {
+                decode::sweep(
+                    input.get("text").and_then(|value| value.as_str()),
+                    input.get("path").and_then(|value| value.as_str()),
+                    input
+                        .get("depth")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(3),
+                    &self.config.root,
+                )
+                .await?
+            }
             "web_search" => http::web_search(&self.client, arg(input, "query")?).await?,
             "web_fetch" => http::request(&self.client, "GET", arg(input, "url")?, None).await?,
             "browser_capture" => {
@@ -399,6 +428,34 @@ impl Tools {
         Some(key)
     }
 
+    /// Reject (or ask about) any call that leaves the CTF autopilot
+    /// allowlist. Headless runs have no permission channel, so an
+    /// out-of-scope action is denied with the reason instead of hanging on a
+    /// prompt nobody will answer.
+    async fn scope_check(&self, name: &str, input: &Value) -> Result<()> {
+        let Some(scope) = &self.scope else {
+            return Ok(());
+        };
+        let Some(reason) = crate::autopilot::violation(scope, &self.config.root, name, input)
+        else {
+            return Ok(());
+        };
+        let action = format!("out-of-scope {reason}");
+        if let Some(tx) = &self.permission_tx {
+            let (response, answer) = oneshot::channel();
+            tx.send(PermissionRequest {
+                action: action.clone(),
+                response,
+            })
+            .map_err(|_| anyhow::anyhow!("permission UI closed"))?;
+            if !answer.await.unwrap_or(false) {
+                bail!("{action}: denied");
+            }
+            return Ok(());
+        }
+        bail!("{action}: denied (headless run cannot approve it; widen --remote/--flag scope)");
+    }
+
     pub async fn authorize(&self, name: &str, command: Option<&str>) -> Result<()> {
         let destructive = command.is_some_and(shell::destructive);
         let mutating = matches!(
@@ -408,12 +465,17 @@ impl Tools {
         if self.plan && mutating {
             bail!("plan mode is read-only");
         }
+        // Inside a CTF scope, non-destructive work runs unattended (spec 4);
+        // out-of-scope actions were already handled by `scope_check`.
         let needs_prompt = destructive
-            || match self.config.permission {
-                Permission::Ask => mutating,
-                Permission::AutoSafe => mutating && command.is_some_and(|c| !shell::read_only(c)),
-                Permission::Yolo => false,
-            };
+            || (self.scope.is_none()
+                && match self.config.permission {
+                    Permission::Ask => mutating,
+                    Permission::AutoSafe => {
+                        mutating && command.is_some_and(|c| !shell::read_only(c))
+                    }
+                    Permission::Yolo => false,
+                });
         if needs_prompt {
             let action = format!(
                 "{name}{}",

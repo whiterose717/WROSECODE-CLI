@@ -28,6 +28,9 @@ pub struct CtfEngine {
     auto_submit: bool,
     alert_bell: bool,
     pub category: String,
+    /// Once locked (CTF autopilot), `turn()` stops overwriting the category
+    /// so a stuck-rotation hypothesis survives the next prompt.
+    category_locked: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -47,6 +50,12 @@ struct DetectorConfig {
 }
 
 impl CtfEngine {
+    /// The directory this detector is watching — the verifier needs it to
+    /// replay `file:` hits against their source artifact.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn new(root: &Path) -> Self {
         let configured = std::fs::read_to_string(root.join("config.toml"))
             .ok()
@@ -86,7 +95,17 @@ impl CtfEngine {
             auto_submit,
             alert_bell: true,
             category: categorize(root, ""),
+            category_locked: false,
         }
+    }
+
+    /// Freeze the current category hypothesis against `turn()`'s re-guess.
+    pub fn lock_category(&mut self) {
+        self.category_locked = true;
+    }
+
+    pub fn category_locked(&self) -> bool {
+        self.category_locked
     }
 
     /// Override `[ui] alert_bell` from the resolved runtime configuration.
@@ -96,12 +115,21 @@ impl CtfEngine {
         self
     }
 
-    pub fn scan(&self, source: &str, text: &str) -> Result<Vec<FlagHit>> {
+    /// Replace the configured flag patterns with one user-supplied regex
+    /// (`wrosecode ctf --flag-format '…'`).
+    pub fn with_flag_format(mut self, pattern: &str) -> Result<Self> {
+        let compiled = Regex::new(pattern)
+            .map_err(|error| anyhow::anyhow!("invalid --flag-format regex: {error}"))?;
+        self.patterns = Arc::new(vec![compiled]);
+        Ok(self)
+    }
+
+    /// Every match in `text`, without deduplicating, logging, copying, or
+    /// notifying. The autopilot uses this to *re-derive* a candidate flag
+    /// from its recorded source — the replay that separates a verified flag
+    /// from a model claim.
+    pub fn detect(&self, source: &str, text: &str) -> Vec<FlagHit> {
         let mut hits = Vec::new();
-        let mut seen = self
-            .seen
-            .lock()
-            .map_err(|_| anyhow::anyhow!("flag detector lock poisoned"))?;
         let mut variants = vec![("plain".to_string(), text.to_string(), 1.0_f32)];
         variants.push(("rot13".into(), rot13(text), 0.85));
         for token in text.split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '`')) {
@@ -123,24 +151,34 @@ impl CtfEngine {
         for (transformation, candidate, confidence) in variants {
             for pattern in self.patterns.iter() {
                 for found in pattern.find_iter(&candidate) {
-                    let flag = found.as_str().to_string();
-                    if !seen.insert(flag.clone()) {
-                        continue;
-                    }
-                    let hit = FlagHit {
-                        flag: flag.clone(),
+                    hits.push(FlagHit {
+                        flag: found.as_str().to_string(),
                         source: source.to_string(),
                         transformation: transformation.clone(),
                         confidence,
-                    };
-                    self.log_flag(&hit)?;
-                    if self.auto_copy {
-                        let _ = copy_to_clipboard(&flag);
-                    }
-                    notify_flag(&flag, self.alert_bell);
-                    hits.push(hit);
+                    });
                 }
             }
+        }
+        hits
+    }
+
+    pub fn scan(&self, source: &str, text: &str) -> Result<Vec<FlagHit>> {
+        let mut seen = self
+            .seen
+            .lock()
+            .map_err(|_| anyhow::anyhow!("flag detector lock poisoned"))?;
+        let mut hits = Vec::new();
+        for hit in self.detect(source, text) {
+            if !seen.insert(hit.flag.clone()) {
+                continue;
+            }
+            self.log_flag(&hit)?;
+            if self.auto_copy {
+                let _ = copy_to_clipboard(&hit.flag);
+            }
+            notify_flag(&hit.flag, self.alert_bell);
+            hits.push(hit);
         }
         Ok(hits)
     }
@@ -151,9 +189,13 @@ impl CtfEngine {
             .follow_links(false)
             .into_iter()
             .filter_entry(|entry| {
+                // Skip our own scratch files: `ctf-notes.md` carries the
+                // `flag{…}` format placeholder and `writeups/` repeats flags
+                // we already recorded — scanning either would "verify" a
+                // flag from the autopilot's own notes.
                 !matches!(
                     entry.file_name().to_str(),
-                    Some(".git" | "target" | "node_modules" | ".ctf")
+                    Some(".git" | "target" | "node_modules" | ".ctf" | "ctf-notes.md" | "writeups")
                 )
             })
             .filter_map(std::result::Result::ok)
@@ -275,6 +317,28 @@ impl CtfEngine {
                         .contains(&query.to_ascii_lowercase())
             })
             .map(str::to_string)
+            .collect()
+    }
+
+    /// Every flag ever recorded for this challenge, parsed back out of
+    /// `.ctf/flags.log` as [`FlagHit`]s so the autopilot can verify them
+    /// against their sources.
+    pub fn recorded_hits(&self) -> Vec<FlagHit> {
+        std::fs::read_to_string(self.root.join(".ctf/flags.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                let [_timestamp, source, transformation, flag, confidence] = fields[..] else {
+                    return None;
+                };
+                Some(FlagHit {
+                    flag: flag.to_string(),
+                    source: source.to_string(),
+                    transformation: transformation.to_string(),
+                    confidence: confidence.parse().unwrap_or(1.0),
+                })
+            })
             .collect()
     }
 }
