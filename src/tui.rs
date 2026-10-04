@@ -5859,6 +5859,32 @@ async fn run_command(
                 }
             }
         }
+        "/undo" => match crate::snapshot::undo(&agent.config.root) {
+            Ok(message) => {
+                agent.tools.clear_reads()?;
+                ui.push(Speaker::System, message);
+            }
+            Err(error) => {
+                let (undo, redo) = crate::snapshot::counts(&agent.config.root);
+                ui.push(
+                    Speaker::System,
+                    format!("{error} ({undo} undo / {redo} redo on the stack)"),
+                );
+            }
+        },
+        "/redo" => match crate::snapshot::redo(&agent.config.root) {
+            Ok(message) => {
+                agent.tools.clear_reads()?;
+                ui.push(Speaker::System, message);
+            }
+            Err(error) => {
+                let (undo, redo) = crate::snapshot::counts(&agent.config.root);
+                ui.push(
+                    Speaker::System,
+                    format!("{error} ({undo} undo / {redo} redo on the stack)"),
+                );
+            }
+        },
         "/new" => {
             save_session(session, agent, ui, &session_dir)?;
             *session = Session::fresh();

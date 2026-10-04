@@ -20,6 +20,7 @@ mod sandbox;
 mod session;
 mod settings;
 mod skills;
+mod snapshot;
 mod splash;
 mod store;
 mod telemetry;

@@ -25,7 +25,7 @@ it a poor fit.
 | `build` / `plan` agents | Adopted | `/build`, `/plan` in the agent registry; plan is read-only by policy. |
 | `@`-style subagents | Adopted | `delegate_task` with stable `task_id`, resume, per-child provider/model. |
 | Markdown agents/commands with frontmatter | Not implemented | **TODO** `.wrosecode/agents/*.md`, `.wrosecode/commands/*.md`. |
-| `/undo` `/redo` on git snapshots | Not implemented | **TODO** — `/commit` exists but nothing snapshots before edits. |
+| `/undo` `/redo` on snapshots | Adopted | `src/snapshot.rs` snapshots the exact paths a mutating batch touches under `.wrosecode/snapshots/undo/<id>/` *before* the edit, `/undo` restores it (deleting files the edit created) after keeping the replaced tree on the redo stack, `/redo` reverses that, a new edit clears the redo stack, and a turn that mutates nothing discards its own snapshot. Deliberately file-level rather than git commits: auto-committing a developer's working tree (or `reset --hard`) would sweep unrelated changes into our history, and snapshots work outside a git repo. Read-before-edit tracking and the read cache are invalidated on restore. |
 | LSP diagnostics after edits | Not implemented | **TODO** — needs an LSP client; no dependency budget for one now, so feedback would have to come from `cargo check`/lint runs instead. |
 | Client/server split | Adopted | `attach.rs` (live.json → `/v1/status` → offline) and `--web`. |
 | Session list/share/export | Adopted | `/sessions`, `--export-session`, `--import-session`. |

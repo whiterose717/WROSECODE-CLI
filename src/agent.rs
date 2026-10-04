@@ -550,6 +550,34 @@ impl Agent {
             let task_results = self.task_results.clone();
             let metrics = self.metrics.clone();
             let store = self.store.clone();
+            // Snapshot every file this batch is about to touch, so `/undo`
+            // can restore the pre-edit state (`src/snapshot.rs`).
+            let mut snapshot_paths: Vec<std::path::PathBuf> = Vec::new();
+            for call in &calls {
+                let touched: Vec<String> = match call.name.as_str() {
+                    "write_file" | "edit_file" => call.input["path"]
+                        .as_str()
+                        .map(|path| vec![path.to_string()])
+                        .unwrap_or_default(),
+                    "apply_patch" => call.input["patch"]
+                        .as_str()
+                        .map(crate::tools::patch::paths)
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                for path in touched {
+                    if let Ok(resolved) = crate::tools::fs::resolve(&self.config.root, &path) {
+                        if !snapshot_paths.contains(&resolved) {
+                            snapshot_paths.push(resolved);
+                        }
+                    }
+                }
+            }
+            let snapshot = if snapshot_paths.is_empty() || self.tools.plan {
+                None
+            } else {
+                crate::snapshot::capture(&self.config.root, &snapshot_paths)
+            };
             let results = join_all(calls.iter().map(|call| {
                 let provider = provider.clone();
                 let config = config.clone();
@@ -706,6 +734,13 @@ impl Agent {
                     .filter_map(|(call, _)| call.input["patch"].as_str())
                     .flat_map(crate::tools::patch::paths),
             );
+            if snapshot.is_some() {
+                if edited_paths.is_empty() {
+                    crate::snapshot::discard_latest(&self.config.root);
+                } else {
+                    crate::snapshot::commit(&self.config.root);
+                }
+            }
             for (call, (_, result, elapsed_ms)) in calls.iter().zip(results.iter()) {
                 self.metrics.record_tool(result.is_ok());
                 if let Ok(output) = result {

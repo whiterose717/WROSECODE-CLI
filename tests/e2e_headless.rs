@@ -342,3 +342,60 @@ fn apply_patch_adds_a_file_and_the_model_sees_the_result() {
         requests.last().unwrap().body
     );
 }
+
+#[test]
+fn editing_turn_captures_an_undo_snapshot_of_the_pre_edit_file() {
+    let server = spawn(vec![
+        tool_call("read_file", r#"{"path":"app.txt"}"#),
+        tool_call(
+            "edit_file",
+            r#"{"path":"app.txt","old":"before","new":"after"}"#,
+        ),
+        completion("EDITED"),
+    ]);
+    let sandbox = Sandbox::new("snapshot", &server.url(""));
+    sandbox.file("app.txt", "before\n");
+
+    let output = headless(
+        &sandbox,
+        "change before to after",
+        &["--permission", "auto-safe"],
+    );
+    assert_task_complete(&output, "EDITED");
+    assert_eq!(
+        std::fs::read_to_string(sandbox.root.join("app.txt")).unwrap(),
+        "after\n"
+    );
+
+    let manifest = std::fs::read_to_string(
+        sandbox
+            .root
+            .join(".wrosecode/snapshots/undo/000001/manifest.txt"),
+    )
+    .expect("undo snapshot was not captured");
+    assert!(manifest.contains("+app.txt"), "{manifest}");
+    let stored = std::fs::read_to_string(
+        sandbox
+            .root
+            .join(".wrosecode/snapshots/undo/000001/files/app.txt"),
+    )
+    .unwrap();
+    assert_eq!(stored, "before\n");
+}
+
+#[test]
+fn a_turn_that_changes_nothing_leaves_no_snapshot() {
+    let server = spawn(vec![completion("NO-EDITS")]);
+    let sandbox = Sandbox::new("nosnapshot", &server.url(""));
+
+    let output = headless(&sandbox, "just answer", &["--permission", "auto-safe"]);
+    assert_task_complete(&output, "NO-EDITS");
+
+    assert!(
+        !sandbox
+            .root
+            .join(".wrosecode/snapshots/undo/000001")
+            .exists(),
+        "a read-only turn must not create an undo snapshot"
+    );
+}

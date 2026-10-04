@@ -60,7 +60,11 @@ everything not marked is implemented and covered by tests.
 - Lint/test auto-loop: `check_command` (`.wrosecode/project.toml`) runs after
   every successful `write_file`/`edit_file`/`apply_patch`, and a failed check
   triggers a repair pass.
-- **TODO** `/undo` + `/redo` on git snapshots, explicit `/add` + `/drop` context.
+- `/undo` + `/redo`: file-level snapshots under `.wrosecode/snapshots/` taken
+  before each mutating batch (`src/snapshot.rs`); the replaced tree moves to
+  the redo stack so `/redo` can reverse an `/undo`, a new edit invalidates the
+  redo stack, and a turn that changed nothing discards its own snapshot.
+- **TODO** explicit `/add` + `/drop` context.
 
 ## Agents and subagents
 
@@ -80,7 +84,7 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: Codex submission/event protocol, auto-compaction; opencode markdown agents/commands, `/undo` `/redo`, LSP
+items there: Codex submission/event protocol, auto-compaction; opencode markdown agents/commands, LSP
 feedback, session tree; goose recipes + HTTP MCP + planner/worker models;
 aider repo-map ranking, auto-commit loop, `/add` `/drop`, two-model mode,
 edit formats; open-interpreter multi-language runner and opt-in OS tools;

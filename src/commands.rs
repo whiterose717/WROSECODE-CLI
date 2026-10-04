@@ -167,6 +167,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Review agent-created scratch files for deletion",
     },
     CommandSpec {
+        name: "/undo",
+        category: "Project",
+        description: "Restore the files changed by the last edit turn",
+    },
+    CommandSpec {
+        name: "/redo",
+        category: "Project",
+        description: "Re-apply the restore done by /undo",
+    },
+    CommandSpec {
         name: "/flags",
         category: "Project",
         description: "Search detected flag history",
@@ -270,7 +280,9 @@ mod tests {
             "/skills",
             "/stats",
             "/theme",
+            "/redo",
             "/think",
+            "/undo",
             "/writeup",
         ] {
             assert!(lookup(name).is_some(), "missing {name}");

@@ -561,6 +561,20 @@ impl Tools {
         Ok(())
     }
 
+    /// Forget every read-before-edit claim and the read cache: `/undo` just
+    /// restored different bytes, so those files must be read again.
+    pub fn clear_reads(&self) -> Result<()> {
+        self.read_files
+            .lock()
+            .map_err(|_| anyhow::anyhow!("read tracking lock poisoned"))?
+            .clear();
+        self.result_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("result cache lock poisoned"))?
+            .clear();
+        Ok(())
+    }
+
     fn forget_read(&self, path: &str) -> Result<()> {
         self.read_files
             .lock()
