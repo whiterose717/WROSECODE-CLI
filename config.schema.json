@@ -201,6 +201,15 @@
         }
       },
       "additionalProperties": false
+    },
+    "tools": {
+      "type": "object",
+      "properties": {
+        "computer": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

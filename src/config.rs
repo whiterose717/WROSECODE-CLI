@@ -52,6 +52,10 @@ pub struct Config {
     pub sandbox: crate::sandbox::SandboxPolicy,
     /// Language-server feedback after edits (`[lsp]` in config.toml).
     pub lsp: crate::lsp::LspSettings,
+    /// open-interpreter parity: expose the opt-in `computer` tool (OS
+    /// control). Set by `[tools] computer = true` or `--computer`; its
+    /// schema is only advertised to the model when this is on.
+    pub computer_tools: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -66,6 +70,8 @@ pub struct RuntimeConfig {
     pub sandbox: SandboxRuntimeConfig,
     #[serde(default)]
     pub lsp: LspRuntimeConfig,
+    #[serde(default)]
+    pub tools: ToolsRuntimeConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -91,6 +97,18 @@ impl Default for UiRuntimeConfig {
             smooth_scroll_lines: 1,
         }
     }
+}
+
+/// `[tools]` in config.toml — opt-in tool surfaces. Everything here ships
+/// off so a fresh install never offers capability the user did not ask for.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ToolsRuntimeConfig {
+    /// open-interpreter parity: register the `computer` tool (screenshot /
+    /// click / type / key / scroll on this machine's display, through the
+    /// grim-family and xdotool backends). `--computer` turns the same
+    /// switch on from the CLI.
+    pub computer: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -270,6 +288,7 @@ impl RuntimeConfig {
                 cache: CacheRuntimeConfig::default(),
                 sandbox: SandboxRuntimeConfig::default(),
                 lsp: LspRuntimeConfig::default(),
+                tools: ToolsRuntimeConfig::default(),
             })
     }
 }
@@ -316,6 +335,7 @@ mod tests {
         assert_eq!(runtime.agent.permission, Permission::Ask);
         assert_eq!(runtime.cache.backend, "memory");
         assert_eq!(runtime.sandbox.engine, "none");
+        assert!(!runtime.tools.computer, "OS control ships off");
     }
 
     #[test]
@@ -410,6 +430,10 @@ mod tests {
 
         assert!(runtime.lsp.enabled);
         assert_eq!(runtime.lsp.wait_ms, 1200);
+        assert!(
+            !runtime.tools.computer,
+            "the shipped file keeps OS control opt-in"
+        );
         let settings = runtime.lsp.into_settings();
         assert!(settings.enabled, "the shipped file keeps diagnostics on");
         assert_eq!(settings.wait_ms, 1200);
@@ -478,6 +502,14 @@ mod tests {
         assert!(!runtime.agent.auto_commit, "the gate turns it off");
         // A wrong type is an error, not a silent default.
         assert!(toml::from_str::<RuntimeConfig>("[agent]\nauto_commit = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn computer_tools_ship_off_and_can_be_enabled() {
+        assert!(!parse("[ui]\n").tools.computer, "absent key stays off");
+        assert!(parse("[tools]\ncomputer = true\n").tools.computer);
+        // A wrong type is an error, not a silent default.
+        assert!(toml::from_str::<RuntimeConfig>("[tools]\ncomputer = \"yes\"\n").is_err());
     }
 
     #[test]

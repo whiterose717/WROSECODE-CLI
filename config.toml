@@ -91,3 +91,11 @@ wait_ms = 1200
 # — reading a file warms its server up before the first edit.
 # [lsp.commands]
 # rs = ["rust-analyzer", "--log-file", "rust-analyzer.log"]
+
+[tools]
+# open-interpreter parity: expose the `computer` tool (screenshot, click,
+# type, key, scroll) through grim / gnome-screenshot / scrot / import for
+# the screen and xdotool for input. Ships off: turn it on here or with
+# --computer. Gated like every other mutating tool: `ask` prompts for
+# each call, `auto-safe` and `yolo` run, plan mode refuses it.
+computer = false

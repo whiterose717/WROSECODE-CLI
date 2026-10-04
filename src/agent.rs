@@ -1656,6 +1656,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            computer_tools: false,
         });
         let provider = MockProvider::new();
         let client = reqwest::Client::new();

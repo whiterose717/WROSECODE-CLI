@@ -808,3 +808,77 @@ fn fork_at_a_message_keeps_only_the_prefix_of_the_context() {
         "a truncated-away message leaked into the fork: {forked}"
     );
 }
+
+#[test]
+fn computer_tools_stay_hidden_until_opted_in() {
+    let server = spawn(vec![
+        tool_call("computer", "{\"action\":\"click\",\"x\":10,\"y\":20}"),
+        completion("DONE-NO-COMPUTER"),
+    ]);
+    let sandbox = Sandbox::new("computer-off", &server.url(""));
+
+    let output = headless(&sandbox, "click somewhere", &[]);
+    assert_task_complete(&output, "DONE-NO-COMPUTER");
+
+    let requests = server.requests();
+    let first = &requests[0];
+    assert!(
+        !first.body.contains("Control this machine's desktop"),
+        "the computer schema must not be advertised without the opt-in: {}",
+        first.body
+    );
+    let last = requests.last().expect("at least one request");
+    assert!(
+        last.body.contains("computer tools are off"),
+        "the refusal must reach the model: {}",
+        last.body
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn computer_tools_run_once_opted_in() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = spawn(vec![
+        tool_call("computer", "{\"action\":\"click\",\"x\":7,\"y\":9}"),
+        completion("DONE-COMPUTER"),
+    ]);
+    let mut sandbox = Sandbox::new("computer-on", &server.url(""));
+
+    // A stand-in xdotool that records the argv it was given, one per line.
+    let bin = sandbox.root.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let backend = bin.join("xdotool");
+    std::fs::write(
+        &backend,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > argv.txt\necho clicked\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    sandbox.env("PATH", &path);
+
+    let output = headless(
+        &sandbox,
+        "click the thing",
+        &["--computer", "--permission", "auto-safe"],
+    );
+    assert_task_complete(&output, "DONE-COMPUTER");
+
+    let argv = std::fs::read_to_string(sandbox.root.join("argv.txt"))
+        .expect("the recorded argv file was written");
+    assert_eq!(argv, "mousemove\n--sync\n7\n9\nclick\n1\n");
+
+    let requests = server.requests();
+    let last = requests.last().expect("at least one request");
+    assert!(
+        last.body.contains("clicked"),
+        "the tool output must round-trip to the model: {}",
+        last.body
+    );
+}

@@ -349,6 +349,19 @@ and `docker exec`s into it, so there is no per-call cold start.
 `auto_build = true` runs `docker build -f Dockerfile.sandbox -t <image> .` the
 first time the image is missing, then falls back to `docker pull`.
 
+### Desktop control (opt-in)
+
+The `computer` tool drives this machine's desktop with `screenshot`, `click`,
+`type`, `key`, and `scroll`, but it ships disabled — until you opt in, the
+schema is not even advertised to the model. Enable it for one run with
+`--computer`, or permanently with `[tools] computer = true` in `config.toml`.
+Screenshots probe `grim`, `gnome-screenshot`, `scrot`, `import`, and
+`screencapture` in that order; input actions go through `xdotool`. Every call
+is launched as a literal argument vector (never through a shell string),
+screenshot paths are confined to the project root, and approval follows the
+normal mutating-tool policy: `ask` prompts for each call, `auto-safe` and
+`yolo` run it, and plan mode refuses it.
+
 ## Run the agent in a container
 
 Build the image that carries `wrosecode` itself plus the challenge toolchain:
@@ -382,6 +395,7 @@ built-in defaults rather than failing to start. CLI flags always win.
 | `[cache]` | `memory` or `redis`, plus Redis and Qdrant URLs. |
 | `[sandbox]` | Where `shell` calls run (`none` or `docker`) and the container settings. |
 | `[lsp]` | Language-server diagnostics appended to file edits (`enabled`, `wait_ms`, per-language `commands`). |
+| `[tools]` | Opt-in extra tool surfaces: `computer` enables desktop control (off by default; the `--computer` flag turns it on for one run). |
 
 `cargo test` parses the shipped `config.toml` and asserts every key lands where
 it should, so a section cannot silently stop being read again.

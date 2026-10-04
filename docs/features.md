@@ -21,7 +21,9 @@ everything not marked is implemented and covered by tests.
   chains), `http`, `web_search`, `web_fetch`, `browser_capture`,
   `burp_import`/`burp_export`, `archive_writeup`, `search_writeups`,
   `update_plan`, `delegate_task` (parallel child agents with stable `task_id`,
-  resume, provider/model routing).
+  resume, provider/model routing), and `computer` (opt-in desktop control:
+  `screenshot`/`click`/`type`/`key`/`scroll` via grim-family backends and
+  xdotool, enabled by `--computer` or `[tools] computer = true`).
 - MCP: both transports the spec defines. stdio servers (a binary plus
   arguments) and streamable-HTTP endpoints (a `url` plus optional request
   headers) configured in `~/.wrosecode/mcps.toml` / `/mcps add`. The HTTP
@@ -153,6 +155,6 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: open-interpreter opt-in OS tools; plus the deliberate
+items there: the deliberate
 non-adopts (scheduled recipes, aider two-model mode and per-model edit
 formats, client-side MCP requests) noted per project.

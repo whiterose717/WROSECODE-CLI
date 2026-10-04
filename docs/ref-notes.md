@@ -58,7 +58,7 @@ it a poor fit.
 | Run code in multiple languages | Adopted | `shell` runs python/bash/node/… through the same sandbox and approval path. |
 | Profiles | Adopted | Harness styles + settings profiles. |
 | `-y` auto-run | Adopted | `--permission yolo`. |
-| OS/computer-control tools behind a flag | Not applicable | Only `browser_capture` ships, and it is opt-in via the tool list; a general OS-control surface has no safe approval story here yet. |
+| OS/computer-control tools behind a flag | Adopted | The `computer` tool ships disabled; `--computer` (or `[tools] computer = true`) advertises the schema. `screenshot`/`click`/`type`/`key`/`scroll` through grim-family screen backends and xdotool, always as literal argv (no shell), refused in plan mode and prompted in `ask` like other mutating tools. |
 
 ## pi-mono
 

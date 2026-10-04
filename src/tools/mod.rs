@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod burp;
 pub mod cache;
+pub mod computer;
 pub mod decode;
 pub mod fs;
 pub mod http;
@@ -166,8 +167,23 @@ impl Tools {
             json!({"name":"update_plan","description":"Replace the visible plan checklist; items are {text, done} objects",
                 "input_schema":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"done":{"type":"boolean"}},"required":["text"]}}},"required":["items"]}}),
             json!({"name":"coverage","description":"Engagement coverage checklist (persisted in .wrosecode/coverage.json): list what has been tested, add an item, or mark one done/undone. Check items off as you verify them so skipped areas stay visible across sessions.",
-                "input_schema":{"type":"object","properties":{"action":{"type":"string","enum":["list","add","done","undone"],"description":"list, add, done, or undone"},"item":{"type":"string","description":"the checklist item (for add/done/undone; substring match works)"}},"required":["action"]}}),
+                "input_schema":{"type":"object","properties":{"action":{"type":"string","enum":["list","add","done","undone"],"description":"list, add, done, or undone"},"item":{"type":"string","description":"the checklist item (for add/done; substring match works)"}},"required":["action"]}}),
         ];
+        // open-interpreter parity: OS control is opt-in, so its schema is
+        // only ever advertised when the user asked for it.
+        if self.config.computer_tools {
+            schemas.push(json!({"name":"computer","description":"Control this machine's desktop (opt-in OS tool): screenshot the display, click, type, or press keys via xdotool/grim-family backends. Every call needs approval like `shell` does.",
+                "input_schema":{"type":"object","properties":{
+                    "action":{"type":"string","enum":["screenshot","click","type","key","scroll"],"description":"what to do"},
+                    "path":{"type":"string","description":"screenshot only: output PNG (default .wrosecode/computer/shot-<time>.png, inside the project)"},
+                    "x":{"type":"number","description":"click only: X coordinate (0..=10000)"},
+                    "y":{"type":"number","description":"click only: Y coordinate (0..=10000)"},
+                    "button":{"type":"string","description":"click only: left|middle|right or 1..=5 (default left)"},
+                    "text":{"type":"string","description":"type only: the literal text to type (sent as one argument, never a shell string)"},
+                    "keys":{"type":"string","description":"key only: keysym or combo, e.g. Return, ctrl+c"},
+                    "amount":{"type":"number","description":"scroll only: positive scrolls up, negative down, |amount| capped at 50 (default 1)"}
+                },"required":["action"]}}));
+        }
         for (server, mcp) in &self.mcps {
             schemas.extend(mcp.schemas.iter().map(|schema| {
                 let mut schema = schema.clone();
@@ -338,6 +354,23 @@ impl Tools {
                 .await?
             }
             "burp_import" => burp::import(&self.config.root, arg(input, "path")?)?,
+            "computer" => {
+                if !self.config.computer_tools {
+                    bail!(
+                        "computer tools are off; set [tools] computer = true in config.toml \
+                         or pass --computer"
+                    );
+                }
+                let action = computer::action_of(input)?;
+                self.authorize(&call.name, None).await?;
+                computer::perform(
+                    &self.config.root,
+                    input,
+                    action,
+                    self.config.shell_timeout_seconds,
+                )
+                .await?
+            }
             "burp_export" => {
                 self.authorize(&call.name, None).await?;
                 burp::export(
@@ -593,6 +626,7 @@ impl Tools {
                 | "mcp"
                 | "browser_capture"
                 | "burp_export"
+                | "computer"
         ) || command.is_some_and(|c| !shell::read_only(c));
         if self.plan && mutating {
             bail!("plan mode is read-only");
@@ -789,6 +823,7 @@ mod tests {
             smooth_scroll_lines: 1,
             sandbox: crate::sandbox::SandboxPolicy::default(),
             lsp: settings.clone(),
+            computer_tools: false,
         };
         let tools = Tools::new(Arc::new(active_config), reqwest::Client::new());
 
@@ -883,6 +918,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            computer_tools: false,
         }
     }
 
@@ -924,6 +960,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            computer_tools: false,
         });
         let tools = Tools::new(config, reqwest::Client::new());
         let edit = ToolCall {
@@ -993,6 +1030,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            computer_tools: false,
         });
         let tools = Tools::new(config, reqwest::Client::new());
         let patch = ToolCall {
@@ -1066,6 +1104,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            computer_tools: false,
         });
         let tools = Tools::new(config, reqwest::Client::new());
         let call = |action: &str, item: Option<&str>| ToolCall {

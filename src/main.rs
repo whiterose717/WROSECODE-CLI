@@ -125,6 +125,10 @@ struct Cli {
     /// Fork --session at message N instead of its end (implies --fork)
     #[arg(long, value_name = "N", requires = "session")]
     fork_at: Option<usize>,
+    /// Enable the opt-in `computer` tool (screenshot / click / type / key /
+    /// scroll on this machine's display); same as `[tools] computer = true`
+    #[arg(long)]
+    computer: bool,
     #[arg(long)]
     export_session: Option<PathBuf>,
     #[arg(long)]
@@ -364,6 +368,7 @@ async fn main() -> Result<()> {
         smooth_scroll_lines: runtime.ui.smooth_scroll_lines.clamp(1, 20),
         sandbox: runtime.sandbox.policy(),
         lsp: runtime.lsp.into_settings(),
+        computer_tools: cli.computer || runtime.tools.computer,
     });
     // Take the terminal and paint the splash before provider setup, skill
     // discovery, metrics, MCP servers, and session restore: those are what
