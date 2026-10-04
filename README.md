@@ -236,6 +236,12 @@ While a picker is open, typing fuzzy-filters the list (`pdng` finds
 `flag{padding...}`), `↑`/`↓` move, `Enter` copies the selected flag, and `Esc`
 closes. `Ctrl+R` does the same for prompt history.
 
+Long engagements also need to remember what has *not* been tried yet: `/coverage`
+opens a persistent checklist in `.wrosecode/coverage.json` — add scope items,
+tick them off as they are verified, and the `coverage` tool lets the agent
+update the same list while it works. The file survives sessions, so skipped
+areas stay visible instead of quietly falling out of the engagement.
+
 ```bash
 # CTFd operations
 wrosecode ctfd list
@@ -483,7 +489,7 @@ wrosecode recipe run audit --set target=attackme.local
 | Agents | `/agents`, `/build`, `/plan`, `/harness`, `/skills` |
 | Providers | `/connect`, `/providers`, `/models`, `/model`, `/mcps`, `/mcp` |
 | Session | `/new`, `/sessions`, `/resume`, `/fork`, `/tree`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/dashboard`, `/verbosity`, `/think`, `/theme`, `/compact`, `/export`, `/help`, `/exit`, `/quit` |
-| Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/undo`, `/redo`, `/add`, `/drop`, `/recipe`, `/flags`, `/writeup`, `/ctf`, `/sandbox` |
+| Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/undo`, `/redo`, `/add`, `/drop`, `/recipe`, `/coverage`, `/flags`, `/writeup`, `/ctf`, `/sandbox` |
 
 `/providers` opens a searchable provider screen with twelve built-in entries and their connection status. Enter configures or selects a provider; `a` adds, `e` edits, `d` deletes a custom provider, and `t` tests a connection. `/connect` opens the custom provider form directly. The API key field is masked. `/models` searches models across connected providers; `/model MODEL` switches the current provider's model.
 

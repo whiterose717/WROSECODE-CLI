@@ -5,6 +5,7 @@ mod attach;
 mod autopilot;
 mod commands;
 mod config;
+mod coverage;
 mod crash;
 mod ctf;
 mod ctfd;

@@ -90,7 +90,7 @@ it a poor fit.
 | Permission tiers | Adopted | `ask / auto-safe / yolo`. |
 | Persistent memory | Adopted | Project + personal markdown/jsonl, `/memory`, redaction on save. |
 | Skill-fork for heavy playbooks | Adopted | `skills/ctf-*` playbooks plus `delegate_task` forks with their own context. |
-| Coverage-tracking checklists | Not implemented | **TODO** — `/plan` tracks steps but there is no persisted coverage checklist. |
+| Coverage-tracking checklists | Adopted | `.wrosecode/coverage.json` holds the durable checklist (separate from `/plan`, which stays transient). The `coverage` tool — `list`/`add`/`done`/`undone` with exact-then-unique-substring matching — lets the model check items off mid-run, and `/coverage` renders the list, appends items from the command line, or opens a picker loop that toggles entries on Enter until Esc; both paths write the same file. |
 | Scope allowlists | Adopted | `Scope::for_target`, printed at start, enforced in `tools::execute` before dispatch. |
 
 ## clai (`pentoshi007/clai`)

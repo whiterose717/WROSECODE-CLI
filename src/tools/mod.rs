@@ -156,6 +156,8 @@ impl Tools {
                 "input_schema":{"type":"object","properties":{"task":{"type":"string"},"task_id":{"type":"string"},"resume":{"type":"boolean"},"provider":{"type":"string"},"model":{"type":"string"}}}}),
             json!({"name":"update_plan","description":"Replace the visible plan checklist; items are {text, done} objects",
                 "input_schema":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"done":{"type":"boolean"}},"required":["text"]}}},"required":["items"]}}),
+            json!({"name":"coverage","description":"Engagement coverage checklist (persisted in .wrosecode/coverage.json): list what has been tested, add an item, or mark one done/undone. Check items off as you verify them so skipped areas stay visible across sessions.",
+                "input_schema":{"type":"object","properties":{"action":{"type":"string","enum":["list","add","done","undone"],"description":"list, add, done, or undone"},"item":{"type":"string","description":"the checklist item (for add/done/undone; substring match works)"}},"required":["action"]}}),
         ];
         for (server, mcp) in &self.mcps {
             schemas.extend(mcp.schemas.iter().map(|schema| {
@@ -384,6 +386,44 @@ impl Tools {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("checklist lock poisoned"))? = plan;
                 format!("Plan updated: {done} of {total} steps done")
+            }
+            "coverage" => {
+                let action = input["action"].as_str().ok_or_else(|| {
+                    anyhow::anyhow!("action must be one of: list, add, done, undone")
+                })?;
+                let mut coverage = crate::coverage::Coverage::load(&self.config.root)?;
+                let item = input["item"].as_str().unwrap_or_default();
+                match action {
+                    "list" => coverage.render(),
+                    "add" => {
+                        if item.trim().is_empty() {
+                            bail!("coverage add needs an item");
+                        }
+                        if coverage.add(item) {
+                            coverage.save(&self.config.root)?;
+                            format!("Added. {}", coverage.render())
+                        } else {
+                            format!("Already tracked. {}", coverage.render())
+                        }
+                    }
+                    "done" | "undone" => {
+                        if item.trim().is_empty() {
+                            bail!("coverage {action} needs an item");
+                        }
+                        let index = coverage.find(item)?;
+                        let checked = action == "done";
+                        let text = coverage.set_done(index, checked).text.clone();
+                        coverage.save(&self.config.root)?;
+                        format!(
+                            "{}: {text}\n{}",
+                            if checked { "Checked off" } else { "Reopened" },
+                            coverage.render()
+                        )
+                    }
+                    other => {
+                        bail!("unknown coverage action {other:?} (use list, add, done, undone)")
+                    }
+                }
             }
             "delegate_task" => bail!("delegate_task is handled by the agent"),
             _ if call.name.starts_with("mcp__") => {
@@ -761,6 +801,81 @@ mod tests {
         let mut plan_mode = Tools::new(tools.config.clone(), reqwest::Client::new());
         plan_mode.plan = true;
         assert!(plan_mode.execute(&patch).await.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_coverage_tool_persists_the_checklist_it_maintains() {
+        let dir =
+            std::env::temp_dir().join(format!("wrosecode-coverage-tool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Arc::new(Config {
+            root: dir.clone(),
+            permission: Permission::Yolo,
+            model: "test".into(),
+            provider: "test".into(),
+            harness: "minimal".into(),
+            repair_retries: 0,
+            check_command: None,
+            skill_dirs: Vec::new(),
+            think: crate::think::ThinkLevel::Medium,
+            thinking_level: 5,
+            max_parallel_tasks: 20,
+            shell_timeout_seconds: 30,
+            tool_retries: 3,
+            fallback_provider: String::new(),
+            fallback_model: String::new(),
+            redis_url: None,
+            budget_usd: 0.0,
+            qdrant_url: None,
+            ui_theme: "dark".into(),
+            verbosity: "normal".into(),
+            alternate_screen: true,
+            mouse_capture: Some("auto".into()),
+            alert_bell: true,
+            smooth_scroll_lines: 1,
+            sandbox: crate::sandbox::SandboxPolicy::default(),
+        });
+        let tools = Tools::new(config, reqwest::Client::new());
+        let call = |action: &str, item: Option<&str>| ToolCall {
+            id: action.into(),
+            name: "coverage".into(),
+            input: match item {
+                Some(item) => json!({"action": action, "item": item}),
+                None => json!({"action": action}),
+            },
+        };
+
+        let empty = tools.execute(&call("list", None)).await.unwrap();
+        assert!(empty.contains("No coverage items yet"), "{empty}");
+
+        let added = tools
+            .execute(&call("add", Some("auth bypass on /login")))
+            .await
+            .unwrap();
+        assert!(added.contains("Added."), "{added}");
+        assert!(
+            dir.join(".wrosecode/coverage.json").exists(),
+            "checklist was never written"
+        );
+
+        let checked = tools.execute(&call("done", Some("bypass"))).await.unwrap();
+        assert!(checked.contains("Checked off"), "{checked}");
+
+        let listed = tools.execute(&call("list", None)).await.unwrap();
+        assert!(
+            listed.contains("1 of 1 checked") && listed.contains("[x] auth bypass on /login"),
+            "{listed}"
+        );
+
+        let duplicate = tools
+            .execute(&call("add", Some("auth bypass on /login")))
+            .await
+            .unwrap();
+        assert!(duplicate.contains("Already tracked"), "{duplicate}");
+
+        assert!(tools.execute(&call("nope", None)).await.is_err());
+        assert!(tools.execute(&call("done", Some("nothing"))).await.is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

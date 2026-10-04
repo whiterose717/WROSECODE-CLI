@@ -39,6 +39,11 @@ everything not marked is implemented and covered by tests.
   `--import-session`, `/fork [name]` and `--session ID --fork` to branch off
   a saved conversation, and `/tree` to render the fork forest with the active
   session marked.
+- Engagement coverage checklists (PentesterFlow): `.wrosecode/coverage.json`
+  holds what has and has not been tested; the `coverage` tool (`list`, `add`,
+  `done`, `undone`, unique-substring matching) lets the agent tick items off
+  during a run, and `/coverage` shows the list, adds items, or opens an
+  interactive picker to toggle them — persisted across sessions.
 - Metrics: counters, per-model totals, latency histogram, `metrics.json`/csv.
 - Repo map (`src/repo_map.rs`): per-file symbols (syn for Rust, regex for
   other languages), mtime-cached, ranked by query relevance blended with a

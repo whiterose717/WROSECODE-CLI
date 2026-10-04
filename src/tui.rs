@@ -6143,6 +6143,53 @@ async fn run_command(
                 ui.push(Speaker::System, lines.join("\n"));
             }
         }
+        "/coverage" => {
+            let root = agent.config.root.clone();
+            let mut coverage = crate::coverage::Coverage::load(&root)?;
+            if let Some(text) = args.strip_prefix("add ") {
+                if coverage.add(text) {
+                    coverage.save(&root)?;
+                    ui.push(Speaker::System, format!("Added. {}", coverage.render()));
+                } else {
+                    ui.push(
+                        Speaker::System,
+                        format!("Already tracked. {}", coverage.render()),
+                    );
+                }
+            } else if let Some(text) = args.strip_prefix("done ") {
+                let index = coverage.find(text)?;
+                let item = coverage.set_done(index, true).clone();
+                coverage.save(&root)?;
+                ui.push(Speaker::System, format!("Checked off: {}", item.text));
+            } else if let Some(text) = args.strip_prefix("undone ") {
+                let index = coverage.find(text)?;
+                let item = coverage.set_done(index, false).clone();
+                coverage.save(&root)?;
+                ui.push(Speaker::System, format!("Reopened: {}", item.text));
+            } else if coverage.items.is_empty() {
+                ui.push(Speaker::System, coverage.render());
+                ui.push(
+                    Speaker::System,
+                    "Add items with /coverage add <item>".to_string(),
+                );
+            } else {
+                // Toggle items until the picker is dismissed; state lands in
+                // .wrosecode/coverage.json either way.
+                loop {
+                    ui.push(Speaker::System, coverage.render());
+                    let Some(index) = picker(
+                        ui,
+                        "Coverage (enter toggles, esc closes)",
+                        coverage.labels(),
+                    )?
+                    else {
+                        break;
+                    };
+                    coverage.toggle(index);
+                    coverage.save(&root)?;
+                }
+            }
+        }
         "/skills" => {
             let mut skills: Vec<_> = agent.skills.values().cloned().collect();
             skills.sort_by(|a, b| a.name.cmp(&b.name));

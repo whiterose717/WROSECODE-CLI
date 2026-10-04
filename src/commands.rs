@@ -245,6 +245,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Run a saved multi-step recipe (/recipe [name])",
     },
     CommandSpec {
+        name: "/coverage",
+        category: "Project",
+        description: "Engagement coverage checklist (/coverage add|done|undone <item>)",
+    },
+    CommandSpec {
         name: "/flags",
         category: "Project",
         description: "Search detected flag history",
@@ -357,6 +362,7 @@ mod tests {
             "/compact",
             "/commit",
             "/connect",
+            "/coverage",
             "/ctf",
             "/dashboard",
             "/debug",
