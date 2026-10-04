@@ -202,6 +202,47 @@ selected file its `git diff`), `Ctrl+C` / `Ctrl+K` send SIGINT / SIGKILL to the
 selected process, and `Esc` / `Ctrl+D` returns to the shell. `/stats` prints
 the same eight panels as plain text.
 
+Captured at 110×36 straight from a real run:
+
+```
+ DASHBOARD · BUILD/anthropic/claude-sonnet-5/misc · ready
+ ▌PROCESSES ───────────────────────────────────────────│  TOKENS & COST ──────────────────────────────────────
+▌ no tracked processes                                 │  in 0 · out 0 · reason 0
+                                                       │  cache 0% · read 0 · write 0
+                                                       │  tok ·
+                                                       │  cost n/a · saved ~0 tok
+                                                       │
+                                                       │
+                                                       │
+                                                       │
+                                                       │
+                                                       │  FILES ──────────────────────────────────────────────
+                                                       │  +0 -0 · 0 changed
+                                                       │
+  THINKING ────────────────────────────────────────────│
+  level 5/20 medium · FAST · ready · idle              │
+  thinking 0.0s · acting 0.0s · waiting 6.9s           │
+  turns 0 · last turn ·                                │
+  last turn 0.0s · reasoning 0 tok                     │
+  TIMELINE ────────────────────────────────────────────│
+  model 0.0s · tools 0.0s · wait 6.9s · wall 6s        │
+  parallel ×0 · steps 0 · fails 0                      │  CTF ────────────────────────────────────────────────
+  tok ·                                                │  [misc] · tools 0 (0 failed)
+  recent: —                                            │  coverage: 0 files · 0 searches · 0 shells
+  PLAN ────────────────────────────────────────────────│  flags 0
+  no plan yet (update_plan)                            │  checker: unverified
+                                                       │
+                                                       │
+                                                       │
+                                                       │  BUDGET ─────────────────────────────────────────────
+                                                       │  ░░░░░░░░░░ $? / n/a (unlimited)
+                                                       │  steps 0 (no cap)
+                                                       │  wall 6s · flags 0
+                                                       │  errors 0 · status ready
+                                                       │
+ ←→ panel · ↑↓/jk select · Enter detail · Ctrl+C/K signal · Esc/Ctrl+D close
+```
+
 Transcript rows are cells rather than raw lines: each tool shows a one-line
 header with its elapsed time and a preview of the first three and last two
 output lines, failed cells auto-expand with their exit code, nested subagent
