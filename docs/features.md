@@ -69,8 +69,6 @@ everything not marked is implemented and covered by tests.
   before each mutating batch (`src/snapshot.rs`); the replaced tree moves to
   the redo stack so `/redo` can reverse an `/undo`, a new edit invalidates the
   redo stack, and a turn that changed nothing discards its own snapshot.
-- **TODO** explicit `/add` + `/drop` context.
-
 ## Agents and subagents
 
 - `/plan` and `/build` agents, `@`-less subagent routing via `delegate_task`.
@@ -100,13 +98,21 @@ everything not marked is implemented and covered by tests.
   (YAML list or comma-separated string) triggers on a whole-word keyword hit
   in the prompt even when its name never appears, so a short knowledge
   snippet loads itself; the keyword gate scores below the skill's own name.
-- **TODO** recipes (`wrosecode recipe run`), scheduled/recurring work.
+- Recipes (goose): YAML or Markdown workflow files with parameters and
+  ordered prompt/command steps, discovered from `.wrosecode/recipes/` and
+  `~/.wrosecode/recipes/`, run with `wrosecode recipe list` /
+  `wrosecode recipe run <name> [--set KEY=VALUE …]` or the TUI's `/recipe`.
+  Prompt steps stream through a normal turn (tools, permissions, steering),
+  command steps run the author's own shell, `{{prev}}`/`{{steps}}` hand later
+  steps the bounded output of earlier ones, and `--goal`/`--until`/
+  `--summary json`/`--events` behave exactly as they do for a prompt run.
 
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
 items there: opencode LSP
-feedback, session tree; goose recipes + HTTP MCP + planner/worker models;
-aider auto-commit loop, two-model mode, edit formats; open-interpreter multi-language runner and opt-in OS tools;
-pi-mono packages + session branching; OpenHands condenser + microagents;
-PentesterFlow coverage checklists.
+feedback, session tree; goose HTTP MCP + planner/worker models;
+aider auto-commit loop; open-interpreter opt-in OS tools;
+pi-mono packages + session branching;
+PentesterFlow coverage checklists, plus the deliberate non-adopts (scheduled
+recipes, aider two-model mode and per-model edit formats) noted per project.

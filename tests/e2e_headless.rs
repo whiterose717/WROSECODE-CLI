@@ -589,3 +589,122 @@ fn a_user_command_prompt_expands_before_the_turn() {
     );
     assert!(!body.contains("$ARGUMENTS"), "placeholder leaked: {body}");
 }
+
+/// The `recipe` subcommand goes through the same argv rewrite as `exec`.
+fn recipe_argv(sandbox: &Sandbox, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wrosecode"));
+    command
+        .current_dir(&sandbox.root)
+        .env("HOME", &sandbox.home)
+        .env("WROSECODE_MOCK_API_KEY", "test-key")
+        .env_remove("WROSECODE_OPENAI_API_KEY")
+        .arg("recipe")
+        .args(args);
+    for (key, value) in &sandbox.envs {
+        command.env(key, value);
+    }
+    command.output().expect("run wrosecode recipe")
+}
+
+fn audit_recipe() -> String {
+    r#"
+name: audit
+description: Two-step audit
+version: "1"
+params:
+  target:
+    description: host to audit
+steps:
+  - prompt: "Recon {{target}} and list open ports."
+  - command: "echo ports-open-for-{{target}}"
+  - prompt: "Given {{prev}}, write the one-line verdict."
+"#
+    .to_string()
+}
+
+#[test]
+fn a_recipe_runs_each_step_in_order_with_parameters() {
+    let server = spawn(vec![completion("FIRST-OK"), completion("LAST-OK")]);
+    let sandbox = Sandbox::new("recipe", &server.url(""));
+    std::fs::create_dir_all(sandbox.root.join(".wrosecode/recipes")).unwrap();
+    sandbox.file(".wrosecode/recipes/audit.yaml", &audit_recipe());
+
+    let output = recipe_argv(
+        &sandbox,
+        &[
+            "run",
+            "audit",
+            "--set",
+            "target=attackme.local",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+            "--summary",
+            "json",
+            "--max-wall-time",
+            "60",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("\"type\":\"TaskComplete\""),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("LAST-OK"), "stdout: {stdout}");
+
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "each prompt step should call the model once: {}",
+        requests.len()
+    );
+    assert!(
+        requests[0].body.contains("Recon attackme.local"),
+        "the --set parameter never reached step 1: {}",
+        requests[0].body
+    );
+    assert!(
+        !requests[0].body.contains("{{target}}"),
+        "placeholder leaked into step 1: {}",
+        requests[0].body
+    );
+    assert!(
+        requests[1].body.contains("ports-open-for-attackme.local"),
+        "the command step's output never reached step 3 via {{prev}}: {}",
+        requests[1].body
+    );
+    assert!(
+        requests[1].body.contains("exit=0"),
+        "the command step's exit status is missing from {{prev}}: {}",
+        requests[1].body
+    );
+}
+
+#[test]
+fn recipe_list_prints_discoverable_recipes() {
+    let server = spawn(Vec::new());
+    let sandbox = Sandbox::new("recipe-list", &server.url(""));
+    std::fs::create_dir_all(sandbox.root.join(".wrosecode/recipes")).unwrap();
+    sandbox.file(".wrosecode/recipes/audit.yaml", &audit_recipe());
+
+    let output = recipe_argv(
+        &sandbox,
+        &["list", "--provider", "mock", "--model", "mock-model"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("audit"), "stdout: {stdout}");
+    assert!(stdout.contains("Two-step audit"), "stdout: {stdout}");
+    assert!(server.count() == 0, "recipe list should not call the model");
+}

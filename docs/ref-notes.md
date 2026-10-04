@@ -35,7 +35,7 @@ it a poor fit.
 | Item | Status | Note |
 | --- | --- | --- |
 | MCP as a first-class extension | Partial | stdio servers via `providers.toml`. **TODO** HTTP/SSE transports. |
-| Recipes | Not implemented | **TODO** YAML/MD workflows with parameters + `wrosecode recipe run`. |
+| Recipes | Adopted | `src/recipe.rs`: YAML (or Markdown with frontmatter) files in `.wrosecode/recipes/` and `~/.wrosecode/recipes/` carrying `params` (names, or a map of `description`/`default`/`required`) and ordered `prompt:`/`command:` steps. `wrosecode recipe list`, `wrosecode recipe run <name> --set KEY=VALUE …`, and the TUI's `/recipe` (picker, then a question per required parameter) all resolve defaults, reject unknown keys, substitute `{{key}}`, and pass `{{prev}}`/`{{steps}}` (12k bounded) between steps. Prompt steps are ordinary turns; command steps run the author's own shell through `run_with_timeout`. `--summary json`, `--events`, `--goal`/`--until` share the prompt path's `print_outcome`. `tests/e2e_headless.rs::a_recipe_runs_each_step_in_order_with_parameters`. |
 | Subagents | Adopted | `delegate_task`. |
 | Scheduled/recurring recipes | Not implemented | Not applicable — a long-lived scheduler conflicts with the one-shot/TTY entry points; revisit only with a daemon mode. |
 | Multi-model config (planner vs worker) | Partial | Per-child model routing exists; a global planner/worker split does not. |
@@ -45,7 +45,7 @@ it a poor fit.
 | Item | Status | Note |
 | --- | --- | --- |
 | Repo map ranked by relevance | Adopted | `repo_map.rs` extracts symbols (syn for Rust, regex elsewhere), mtime-caches them, and ranks files by query relevance blended with a damped PageRank (0.85, 15 rounds) over the cross-file "file A mentions file B's symbols" graph. Output is capped at a 1024-token budget so a large repo cannot crowd the system prompt. |
-| Git auto-commit + `/undo` | Partial | `/commit` proposes messages and confirms; auto-commit and `/undo` are missing. |
+| Git auto-commit + `/undo` | Partial | `/commit` proposes messages and confirms; auto-commit is deliberately left to the user (the snapshot-based `/undo` `/redo` under opencode covers editing mistakes without sweeping a working tree into git history). |
 | Lint/test auto-loop after edits | Adopted | `config.check_command()` (`.wrosecode/project.toml`, written by `/init`) runs after every successful `write_file`/`edit_file`/`apply_patch` in `agent.rs`, feeding failures back as a repair turn. |
 | `/add` `/drop` explicit context | Adopted | `/add <path>` pins an existing project file and injects its contents into every system prompt (6k chars per file, 24k total, truncated with a marker); `/drop <path|all>` unpins; listing is `/add` with no argument. Pins live on the agent, survive session save/resume, and the headless entry point takes the repeatable `--add PATH` flag. Skill-fork and delegate children start with an empty pin list. |
 | Architect/editor two-model mode | Not implemented | Not applicable — `delegate_task` already lets a caller name a cheaper model per child; a global two-model toggle adds a second configuration axis for the same effect. |

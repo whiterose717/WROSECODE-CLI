@@ -447,6 +447,33 @@ Always quote the file and line you are criticising.
 
 `wrosecode --agent reviewer 'review the diff'` activates one for a run; in the TUI it is listed in `/agents`. Its body is injected into every system prompt, `mode:` picks `build`, `plan`, or `general`, and `thinking:` sets the level. `/build`, `/plan`, or `/agents` on a built-in drops the custom agent.
 
+## Recipes
+
+A recipe is a saved multi-step workflow: a YAML (or Markdown) file with parameters and an ordered list of prompt and command steps, in the spirit of goose's recipes. `.wrosecode/recipes/` holds the project's recipes, `~/.wrosecode/recipes/` the personal ones, and the project file wins a name clash.
+
+```yaml
+name: audit
+description: Two-step audit
+version: "1"
+params:
+  target:
+    description: host to audit
+    default: localhost
+steps:
+  - prompt: "Recon {{target}} and list open ports."
+  - command: "echo ports-open-for-{{target}}"
+  - prompt: "Given {{prev}}, write the one-line verdict."
+```
+
+`params` may also be a plain list of required names. `{{key}}` placeholders take the resolved parameter values (defaults fill in, an unknown key is an error), `{{prev}}` is the previous step's output, and `{{steps}}` is the accumulated history — bounded, oldest output dropped first. A Markdown recipe uses frontmatter for `name`/`description`/`params` and its body as a single prompt step.
+
+```bash
+wrosecode recipe list
+wrosecode recipe run audit --set target=attackme.local
+```
+
+`recipe run` behaves like any other headless run: it prints the answer, honours `--summary json`, `--goal`, `--until`, `--until-cmd`, `--events`, and exits `2` when the verification flags say the answer was wrong. Prompt steps run as ordinary turns — full tool use, permissions, and steering apply — while command steps are the recipe author's own shell commands, run with the project's shell timeout. In the TUI, `/recipe` opens a picker, asks for each parameter the recipe does not default, and streams every step; `/recipe NAME` skips the picker.
+
 ## Slash commands
 
 `/help` shows the full command list, generated from the same registry as the palette.
@@ -456,7 +483,7 @@ Always quote the file and line you are criticising.
 | Agents | `/agents`, `/build`, `/plan`, `/harness`, `/skills` |
 | Providers | `/connect`, `/providers`, `/models`, `/model`, `/mcps` |
 | Session | `/new`, `/sessions`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/dashboard`, `/verbosity`, `/think`, `/theme`, `/compact`, `/export`, `/help`, `/exit`, `/quit` |
-| Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/undo`, `/redo`, `/add`, `/drop`, `/flags`, `/writeup`, `/ctf`, `/sandbox` |
+| Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/undo`, `/redo`, `/add`, `/drop`, `/recipe`, `/flags`, `/writeup`, `/ctf`, `/sandbox` |
 
 `/providers` opens a searchable provider screen with twelve built-in entries and their connection status. Enter configures or selects a provider; `a` adds, `e` edits, `d` deletes a custom provider, and `t` tests a connection. `/connect` opens the custom provider form directly. The API key field is masked. `/models` searches models across connected providers; `/model MODEL` switches the current provider's model.
 

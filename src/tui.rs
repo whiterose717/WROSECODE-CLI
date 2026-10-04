@@ -5975,6 +5975,106 @@ async fn run_command(
                 }
             }
         }
+        "/recipe" => {
+            let mut recipes = crate::recipe::discover(&agent.config.root)?;
+            if recipes.is_empty() {
+                ui.push(
+                    Speaker::System,
+                    "No recipes found (create .wrosecode/recipes/<name>.yaml or .md)".to_string(),
+                );
+            } else {
+                let picked = if args.is_empty() {
+                    let labels = recipes
+                        .iter()
+                        .map(|plan| format!("{}  {}", plan.name, plan.description))
+                        .collect::<Vec<_>>();
+                    picker(ui, "Recipes", labels)?.map(|index| recipes.remove(index))
+                } else {
+                    Some(crate::recipe::find(&agent.config.root, args)?)
+                };
+                let Some(plan) = picked else {
+                    return Ok(());
+                };
+                // Ask for the parameters that have no default, then let
+                // `resolve` fill the rest in.
+                let mut values = std::collections::BTreeMap::new();
+                for name in plan.required_params() {
+                    let label = match plan.params.iter().find(|(key, _)| *key == name) {
+                        Some((_, def)) if !def.description.is_empty() => {
+                            format!("{name} ({})", def.description)
+                        }
+                        _ => name.clone(),
+                    };
+                    match ask_line(ui, &label, "")? {
+                        Some(answer) if !answer.trim().is_empty() => {
+                            values.insert(name, answer);
+                        }
+                        _ => {
+                            ui.push(Speaker::System, "Recipe cancelled".to_string());
+                            return Ok(());
+                        }
+                    }
+                }
+                let values = crate::recipe::resolve(&plan, &values)?;
+                ui.push(
+                    Speaker::System,
+                    format!("Running recipe {} ({})", plan.name, plan.origin.display()),
+                );
+                let mut prev = String::new();
+                let mut steps_context = String::new();
+                for (position, step) in plan.steps.iter().enumerate() {
+                    let mut vars = values.clone();
+                    vars.insert("prev".to_string(), prev.clone());
+                    vars.insert("steps".to_string(), steps_context.clone());
+                    match step {
+                        crate::recipe::Step::Prompt { prompt } => {
+                            let text = crate::recipe::substitute(prompt, &vars);
+                            if !run_turn_queue(agent, ui, &text, events, permissions).await? {
+                                ui.push(Speaker::System, "Recipe stopped".to_string());
+                                return Ok(());
+                            }
+                            prev = ui
+                                .entries
+                                .iter()
+                                .rev()
+                                .find(|entry| matches!(entry.speaker, Speaker::Agent))
+                                .map(|entry| entry.text.clone())
+                                .unwrap_or_default();
+                            crate::recipe::push_step_context(
+                                &mut steps_context,
+                                "prompt",
+                                position + 1,
+                                &prev,
+                            );
+                        }
+                        crate::recipe::Step::Command { command } => {
+                            let text = crate::recipe::substitute(command, &vars);
+                            ui.push(Speaker::Tool, format!("$ {text}"));
+                            let output = match crate::tools::shell::run_with_timeout(
+                                &text,
+                                &agent.config.root,
+                                agent.config.shell_timeout_seconds,
+                            )
+                            .await
+                            {
+                                Ok(output) => output,
+                                Err(error) => format!("{error:#}"),
+                            };
+                            ui.push(Speaker::Tool, output.clone());
+                            prev = output.clone();
+                            crate::recipe::push_step_context(
+                                &mut steps_context,
+                                "command",
+                                position + 1,
+                                &output,
+                            );
+                        }
+                    }
+                }
+                save_session(session, agent, ui, &session_dir)?;
+                ui.push(Speaker::System, format!("Recipe {} finished", plan.name));
+            }
+        }
         "/new" => {
             save_session(session, agent, ui, &session_dir)?;
             *session = Session::fresh();

@@ -220,6 +220,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Unpin a file, or /drop all to clear the pinned list",
     },
     CommandSpec {
+        name: "/recipe",
+        category: "Project",
+        description: "Run a saved multi-step recipe (/recipe [name])",
+    },
+    CommandSpec {
         name: "/flags",
         category: "Project",
         description: "Search detected flag history",
@@ -353,6 +358,7 @@ mod tests {
             "/skills",
             "/stats",
             "/theme",
+            "/recipe",
             "/redo",
             "/think",
             "/undo",

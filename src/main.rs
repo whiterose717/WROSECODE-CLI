@@ -16,6 +16,7 @@ mod metrics;
 mod project;
 mod provider;
 mod provider_cli;
+mod recipe;
 mod repo_map;
 mod report;
 mod sandbox;
@@ -93,6 +94,15 @@ struct Cli {
     /// context). Repeatable; the same thing the `/add` command does live.
     #[arg(long = "add", value_name = "PATH")]
     add: Vec<String>,
+    /// Internal: run the named recipe (front-end for `wrosecode recipe run`)
+    #[arg(long, hide = true, value_name = "NAME")]
+    recipe: Option<String>,
+    /// Internal: recipe parameter as KEY=VALUE (repeatable)
+    #[arg(long = "recipe-set", hide = true, value_name = "KEY=VALUE")]
+    recipe_set: Vec<String>,
+    /// Internal: list discoverable recipes (front-end for `recipe list`)
+    #[arg(long, hide = true)]
+    recipe_list: bool,
     #[arg(long)]
     summary: Option<String>,
     #[arg(long)]
@@ -203,6 +213,49 @@ async fn main() -> Result<()> {
         let mut rewritten = vec!["wrosecode".to_string(), "--headless".to_string()];
         rewritten.extend(raw_args.iter().skip(2).cloned());
         rewritten
+    } else if raw_args.get(1).is_some_and(|argument| argument == "recipe") {
+        // `wrosecode recipe list` and `wrosecode recipe run <name> [--set
+        // KEY=VALUE …]` rewrite into hidden flags, the same way `exec` does.
+        match raw_args.get(2).map(String::as_str) {
+            Some("list") => {
+                // Global flags (`--provider`, `--model`, …) ride along.
+                let mut rewritten = vec!["wrosecode".to_string(), "--recipe-list".to_string()];
+                rewritten.extend(raw_args.iter().skip(3).cloned());
+                rewritten
+            }
+            Some("run") => {
+                let mut rewritten = vec!["wrosecode".to_string(), "--headless".to_string()];
+                let mut arguments = raw_args.iter().skip(3).peekable();
+                let mut want_name = true;
+                while let Some(argument) = arguments.next() {
+                    if want_name {
+                        rewritten.push("--recipe".to_string());
+                        rewritten.push(argument.clone());
+                        want_name = false;
+                    } else if argument == "--set" {
+                        if let Some(value) = arguments.next() {
+                            rewritten.push("--recipe-set".to_string());
+                            rewritten.push(value.clone());
+                        }
+                    } else if !argument.starts_with('-') && argument.contains('=') {
+                        rewritten.push("--recipe-set".to_string());
+                        rewritten.push(argument.clone());
+                    } else {
+                        rewritten.push(argument.clone());
+                    }
+                }
+                if want_name {
+                    eprintln!("usage: wrosecode recipe run <name> [--set KEY=VALUE …]");
+                    std::process::exit(1);
+                }
+                rewritten
+            }
+            _ => {
+                eprintln!("usage: wrosecode recipe list");
+                eprintln!("       wrosecode recipe run <name> [--set KEY=VALUE …]");
+                std::process::exit(1);
+            }
+        }
     } else {
         raw_args.clone()
     };
@@ -298,6 +351,8 @@ async fn main() -> Result<()> {
     let tui_mode = cli.prompt.is_none()
         && !cli.headless
         && !ctf_mode
+        && cli.recipe.is_none()
+        && !cli.recipe_list
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
     let guard = if tui_mode {
@@ -382,6 +437,73 @@ async fn main() -> Result<()> {
         }
     }
     let mut event_sink = attach_events(&mut agent, cli.events.as_deref())?;
+    if cli.recipe_list {
+        let recipes = recipe::discover(&agent.config.root)?;
+        if recipes.is_empty() {
+            println!("no recipes found (looked in .wrosecode/recipes/ and ~/.wrosecode/recipes/)");
+        }
+        for plan in recipes {
+            let version = if plan.version.is_empty() {
+                "-"
+            } else {
+                plan.version.as_str()
+            };
+            println!("{:<24} {:<8} {}", plan.name, version, plan.description);
+        }
+        return Ok(());
+    }
+    if let Some(name) = cli.recipe.as_deref() {
+        let plan = recipe::find(&agent.config.root, name)?;
+        let values = recipe::resolve(&plan, &recipe::parse_sets(&cli.recipe_set)?)?;
+        write_event(
+            &event_sink,
+            &events::start_frame(&format!("recipe {}", plan.name), "recipe"),
+        );
+        let quiet = cli.quiet;
+        let response = recipe::run(&mut agent, &plan, &values, |line| {
+            if !quiet {
+                eprintln!("• {line}");
+            }
+        })
+        .await?;
+        let verified = check_goal(
+            &agent,
+            cli.goal.as_ref(),
+            cli.until.as_ref(),
+            cli.until_cmd.as_ref(),
+            &response,
+        )
+        .await?;
+        if let Some(stream) = &mut event_sink {
+            stream.quiesce(&mut agent).await;
+        }
+        write_event(
+            &event_sink,
+            &events::result_frame(&response, verified, &agent.usage, agent.model_turns),
+        );
+        print_outcome(
+            &agent,
+            &response,
+            verified,
+            cli.quiet,
+            cli.no_summary,
+            cli.summary.as_deref() == Some("json"),
+        );
+        let mut session = resumed_session.unwrap_or_else(session::Session::fresh);
+        session.messages = agent.messages.clone();
+        session.provider_name = agent.config.provider.clone();
+        session.model = agent.config.model.clone();
+        session.summary = format!("recipe {}", plan.name);
+        session
+            .transcript
+            .push(("YOU".into(), format!("recipe {}", plan.name)));
+        session.transcript.push(("WROSE".into(), response.clone()));
+        store.save_session(&session)?;
+        if !verified && (cli.until.is_some() || cli.until_cmd.is_some() || cli.goal.is_some()) {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     if ctf_mode {
         // Spec PHASE 5: exit 0 verified, exit 2 budget-exhausted, exit 1
         // (anyhow) on error.
@@ -478,19 +600,14 @@ async fn main() -> Result<()> {
             (agent, response)
         };
         agent = raced_agent;
-        let mut verified = cli.goal.as_ref().is_none_or(|goal| response.contains(goal));
-        if let Some(pattern) = &cli.until {
-            verified = regex::Regex::new(pattern)?.is_match(&response);
-        }
-        if let Some(command) = &cli.until_cmd {
-            verified = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&agent.config.root)
-                .status()
-                .await?
-                .success();
-        }
+        let verified = check_goal(
+            &agent,
+            cli.goal.as_ref(),
+            cli.until.as_ref(),
+            cli.until_cmd.as_ref(),
+            &response,
+        )
+        .await?;
         if let Some(stream) = &mut event_sink {
             stream.quiesce(&mut agent).await;
         }
@@ -498,7 +615,6 @@ async fn main() -> Result<()> {
             &event_sink,
             &events::result_frame(&response, verified, &agent.usage, agent.model_turns),
         );
-        let json_summary = cli.summary.as_deref() == Some("json");
         if exec_json {
             // Spec 3.2: `exec --json` emits the dashboard snapshot, with the
             // answer and verification folded in.
@@ -510,55 +626,15 @@ async fn main() -> Result<()> {
             value["answer"] = serde_json::Value::String(response.clone());
             value["verified"] = serde_json::Value::Bool(verified);
             println!("{}", serde_json::to_string_pretty(&value)?);
-        } else if !cli.quiet && !json_summary {
-            println!("{response}");
-        }
-        if json_summary && !exec_json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "type": "TaskComplete",
-                    "status": if verified { "verified" } else { "unverified" },
-                    "answer": &response,
-                    "usage": agent.usage,
-                    "model_turns": agent.model_turns,
-                    "tool_cache_hits": agent.tools.cache_stats().0,
-                    "elapsed_ms": agent.started_at.elapsed().as_millis(),
-                })
+        } else {
+            print_outcome(
+                &agent,
+                &response,
+                verified,
+                cli.quiet,
+                cli.no_summary,
+                cli.summary.as_deref() == Some("json"),
             );
-        } else if !cli.no_summary && !exec_json {
-            let (cache_hits, saved_bytes) = agent.tools.cache_stats();
-            eprintln!("────────────────────────────────────────────────────────────");
-            eprintln!(
-                " RESULT   {}",
-                if verified {
-                    "✔ Solved & verified"
-                } else {
-                    "⚠ Finished unverified"
-                }
-            );
-            eprintln!(" Time     {:.1}s", agent.started_at.elapsed().as_secs_f64());
-            eprintln!(
-                " Steps    {} model turns · {} cached tool calls",
-                agent.model_turns, cache_hits
-            );
-            eprintln!(
-                " Tokens   {} in · {} out · {} reasoning{}",
-                agent.usage.input,
-                agent.usage.output,
-                agent.usage.reasoning,
-                if agent.usage.estimated {
-                    " · estimated"
-                } else {
-                    ""
-                }
-            );
-            eprintln!(
-                " Cache    {} read · {} written",
-                agent.usage.cache_read, agent.usage.cache_write
-            );
-            eprintln!(" Saved    ~{} tokens via result cache", saved_bytes / 4);
-            eprintln!("────────────────────────────────────────────────────────────");
         }
         if !verified && (cli.until.is_some() || cli.until_cmd.is_some() || cli.goal.is_some()) {
             std::process::exit(2);
@@ -693,6 +769,94 @@ impl EventStream {
 /// Attach the framed submission stream (`--events PATH`): live `Progress`
 /// events are framed and appended as they happen, while the `start` and
 /// `result` frames come from the caller. Returns `None` without the flag.
+/// The answer itself (`--summary json` gets one `TaskComplete` line, plain
+/// runs get the answer plus the RESULT block) — shared by the prompt and
+/// `recipe run` branches so both emit the same framed output.
+fn print_outcome(
+    agent: &Agent,
+    response: &str,
+    verified: bool,
+    quiet: bool,
+    no_summary: bool,
+    json_summary: bool,
+) {
+    if !quiet && !json_summary {
+        println!("{response}");
+    }
+    if json_summary {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "TaskComplete",
+                "status": if verified { "verified" } else { "unverified" },
+                "answer": response,
+                "usage": agent.usage,
+                "model_turns": agent.model_turns,
+                "tool_cache_hits": agent.tools.cache_stats().0,
+                "elapsed_ms": agent.started_at.elapsed().as_millis(),
+            })
+        );
+    } else if !no_summary {
+        let (cache_hits, saved_bytes) = agent.tools.cache_stats();
+        eprintln!("────────────────────────────────────────────────────────────");
+        eprintln!(
+            " RESULT   {}",
+            if verified {
+                "✔ Solved & verified"
+            } else {
+                "⚠ Finished unverified"
+            }
+        );
+        eprintln!(" Time     {:.1}s", agent.started_at.elapsed().as_secs_f64());
+        eprintln!(
+            " Steps    {} model turns · {} cached tool calls",
+            agent.model_turns, cache_hits
+        );
+        eprintln!(
+            " Tokens   {} in · {} out · {} reasoning{}",
+            agent.usage.input,
+            agent.usage.output,
+            agent.usage.reasoning,
+            if agent.usage.estimated {
+                " · estimated"
+            } else {
+                ""
+            }
+        );
+        eprintln!(
+            " Cache    {} read · {} written",
+            agent.usage.cache_read, agent.usage.cache_write
+        );
+        eprintln!(" Saved    ~{} tokens via result cache", saved_bytes / 4);
+        eprintln!("────────────────────────────────────────────────────────────");
+    }
+}
+
+/// `--goal`, `--until`, and `--until-cmd` over a model answer — the same
+/// verdict the prompt branch, `exec`, and `recipe run` all report.
+async fn check_goal(
+    agent: &Agent,
+    goal: Option<&String>,
+    until: Option<&String>,
+    until_cmd: Option<&String>,
+    response: &str,
+) -> Result<bool> {
+    let mut verified = goal.is_none_or(|goal| response.contains(goal));
+    if let Some(pattern) = until {
+        verified = regex::Regex::new(pattern)?.is_match(response);
+    }
+    if let Some(command) = until_cmd {
+        verified = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&agent.config.root)
+            .status()
+            .await?
+            .success();
+    }
+    Ok(verified)
+}
+
 fn attach_events(agent: &mut Agent, path: Option<&Path>) -> Result<Option<EventStream>> {
     let Some(path) = path else {
         return Ok(None);
