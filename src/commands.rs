@@ -57,7 +57,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/skills",
         category: "Skills",
-        description: "List and activate a skill",
+        description: "List and activate a skill; install/uninstall/list packages",
     },
     CommandSpec {
         name: "/connect",

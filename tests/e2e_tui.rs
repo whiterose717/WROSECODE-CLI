@@ -504,3 +504,72 @@ fn the_coverage_checklist_round_trips_through_the_tui() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+#[test]
+fn skill_packages_round_trip_through_the_tui() {
+    if !pty_helper() {
+        eprintln!("skipping: util-linux script(1) is not available");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("wrosecode-tui-pkg-{}", std::process::id()));
+    let work = home.join("project");
+    std::fs::create_dir_all(work.join("pack")).expect("temp package");
+    std::fs::write(
+        work.join("pack/SKILL.md"),
+        "---\nname: pty-pack\ndescription: pack for pty\n---\nPTY-PACK-BODY\n",
+    )
+    .expect("skill file");
+    let binary = env!("CARGO_BIN_EXE_wrosecode").to_string();
+
+    let mut pty = Pty::start_in(&binary, &home, &work);
+    std::thread::sleep(Duration::from_millis(1200));
+    let source = work.join("pack");
+    pty.send_text(&format!("/skills install {}", source.display()), 250);
+    pty.send(b"\r", 600);
+    pty.send_text("/skills", 250); // picker shows the installed skill
+    pty.send(b"\r", 400);
+    pty.send(b"\x1b", 300); // Esc closes the picker
+    pty.send_text("/skills list", 250);
+    pty.send(b"\r", 400);
+    pty.send_text("/skills uninstall pack", 250);
+    pty.send(b"\r", 400);
+    pty.send_text("/quit", 250);
+    pty.send(b"\r", 600);
+    let (exited_cleanly, transcript) = pty.finish();
+
+    assert!(
+        exited_cleanly,
+        "the TUI must leave through /quit, not a panic\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("panicked at"),
+        "no panic may escape into the terminal\n{transcript}"
+    );
+    assert!(
+        transcript.contains("pty-pack"),
+        "the install reports the skill names\n{transcript}"
+    );
+    assert!(
+        transcript.contains("pty-pack  inline"),
+        "the picker lists the freshly installed skill\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Installed packages:"),
+        "/skills list renders the manifest\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Uninstalled pack (pty-pack)"),
+        "uninstall reports the package and its skills\n{transcript}"
+    );
+    assert!(
+        !home.join(".wrosecode/skills/pack").exists(),
+        "the installed copy is gone after uninstall"
+    );
+    let manifest =
+        std::fs::read_to_string(home.join(".wrosecode/packages.json")).unwrap_or_default();
+    assert!(
+        !manifest.contains("pty-pack"),
+        "the manifest entry is gone after uninstall"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

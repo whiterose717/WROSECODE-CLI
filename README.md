@@ -423,7 +423,7 @@ keywords: [kubernetes, kubectl]
 Instructions for the agent.
 ```
 
-Skills load from bundled `skills/`, project `skills/`, `~/.wrosecode/skills/`, and `--skills DIR`, with later paths overriding names. `keywords:` (a YAML list or a comma-separated string) makes a skill fire on its own: a short knowledge snippet loads as soon as one of those whole words appears in the prompt, without the skill name being mentioned — the keyword gate sits below the name match, so a prompt naming the skill still wins. Use `#fact text` for project memory and `#!fact text` for personal memory. `/memory` lists saved facts. Matching facts are recalled automatically. Obvious secret patterns are redacted on save.
+Skills load from bundled `skills/`, project `skills/`, `~/.wrosecode/skills/`, and `--skills DIR`, with later paths overriding names. Skill packages install from a git URL or a directory — `/skills install <url#ref | path>`, or `--install-skill` headless — into `~/.wrosecode/skills/`, versioned in `~/.wrosecode/packages.json`; `/skills list` and `/skills uninstall <pkg>` manage them. `keywords:` (a YAML list or a comma-separated string) makes a skill fire on its own: a short knowledge snippet loads as soon as one of those whole words appears in the prompt, without the skill name being mentioned — the keyword gate sits below the name match, so a prompt naming the skill still wins. Use `#fact text` for project memory and `#!fact text` for personal memory. `/memory` lists saved facts. Matching facts are recalled automatically. Obvious secret patterns are redacted on save.
 
 `/harness minimal|swe|claude` switches prompt style without clearing history. `wrosecode acp` starts a basic ACP stdio agent.
 

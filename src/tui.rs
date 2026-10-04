@@ -6,9 +6,10 @@ use crate::splash::{self, LOGO};
 use crate::think::ThinkLevel;
 use crate::tools::PermissionRequest;
 use crate::{
-    commands, project, provider,
+    commands, package, project, provider,
     session::Session,
     settings::{McpServerDef, ProviderProfile, Settings},
+    skills,
 };
 use anyhow::Result;
 use crossterm::cursor;
@@ -6201,6 +6202,72 @@ async fn run_command(
                     };
                     coverage.toggle(index);
                     coverage.save(&root)?;
+                }
+            }
+        }
+        "/skills" if args == "list" || args.starts_with("list ") => {
+            let packages = package::list(&skills::default_skills_dir());
+            if packages.is_empty() {
+                ui.push(Speaker::System, "No skill packages installed.");
+            } else {
+                let rows = packages
+                    .iter()
+                    .map(|(name, pkg)| {
+                        let files = if pkg.files == 1 {
+                            "1 file".to_string()
+                        } else {
+                            format!("{} files", pkg.files)
+                        };
+                        format!(
+                            "{}  {}  {}  {} skill(s)\n      from {}",
+                            name,
+                            pkg.version,
+                            files,
+                            pkg.skills.len(),
+                            pkg.source
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ui.push(Speaker::System, format!("Installed packages:\n{rows}"));
+            }
+        }
+        "/skills" if args.starts_with("install ") => {
+            let source = args["install ".len()..].trim();
+            if source.is_empty() {
+                ui.push(
+                    Speaker::System,
+                    "Usage: /skills install <git-url[#ref] | path>",
+                );
+            } else {
+                match package::install(&skills::default_skills_dir(), source).await {
+                    Ok(names) => {
+                        agent.skills =
+                            skills::discover(&agent.config.root, &agent.config.skill_dirs)?;
+                        ui.push(
+                            Speaker::System,
+                            format!("Installed {source}: {}", names.join(", ")),
+                        );
+                    }
+                    Err(error) => ui.push(Speaker::System, format!("Install failed: {error:#}")),
+                }
+            }
+        }
+        "/skills" if args.starts_with("uninstall ") => {
+            let name = args["uninstall ".len()..].trim();
+            if name.is_empty() {
+                ui.push(Speaker::System, "Usage: /skills uninstall <package>");
+            } else {
+                match package::uninstall(&skills::default_skills_dir(), name) {
+                    Ok(entry) => {
+                        agent.skills =
+                            skills::discover(&agent.config.root, &agent.config.skill_dirs)?;
+                        ui.push(
+                            Speaker::System,
+                            format!("Uninstalled {name} ({})", entry.skills.join(", ")),
+                        );
+                    }
+                    Err(error) => ui.push(Speaker::System, format!("{error:#}")),
                 }
             }
         }

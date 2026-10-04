@@ -64,7 +64,7 @@ it a poor fit.
 
 | Item | Status | Note |
 | --- | --- | --- |
-| Extension/skill/package system | Partial | Skills load from `skills/`, `.ctf/skills/`, `~/.wrosecode/skills/`. **TODO** install from git/path with versions and sandboxing. |
+| Extension/skill/package system | Adopted | Skills load from `skills/`, `.ctf/skills/`, `~/.wrosecode/skills/`. Packages install with `/skills install <git-url[#ref] | path>` (headless: repeatable `--install-skill`) into `~/.wrosecode/skills/<pkg>/`, version recorded in `~/.wrosecode/packages.json` — git `--short=12` commit (shallow at `#ref`, full clone + checkout when the ref is a raw sha) or an FNV-1a content hash for directory sources. `/skills list` shows the manifest, `/skills uninstall <pkg>` removes it, reinstall replaces the copy. The install is the sandbox: ≤64 files, ≤512KiB each, ≤2MiB total, two directory levels (everything discovery can see), symlinks never followed or copied, every `SKILL.md` must read as UTF-8 and parse before the package is accepted, and nothing from a package is ever executed — only its markdown enters prompts, exactly like a hand-written skill. `src/package.rs`. |
 | RPC/JSON mode | Adopted | `exec --json`, `--summary json`, `--web`. |
 | Session tree / branching | Partial | `/fork [name]` and `--session ID --fork` branch a session (recording `parent`), `/tree` renders the forest from the JSON files with the active session marked, and headless runs now write those files too so every branch is listed. Forks happen at the current end of the conversation; branching back to an arbitrary earlier message is still missing. |
 | Steering-message queue | Adopted | Queued input while a turn runs, `Ctrl+C` cancels the turn only. |

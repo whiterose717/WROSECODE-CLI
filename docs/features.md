@@ -69,6 +69,12 @@ everything not marked is implemented and covered by tests.
   into every system prompt (6k chars per file, 24k total), `/drop` unpins,
   `--add PATH` does it from a headless run; the list is saved with the
   session.
+- Skill packages (pi-mono): `/skills install <git-url[#ref] | path>` (or
+  headless `--install-skill`) copies a package into `~/.wrosecode/skills/`
+  under hard ceilings — ≤64 files, ≤512KiB each, ≤2MiB total, two directory
+  levels, no symlinks, every `SKILL.md` must parse — records its version
+  (git short commit or content hash) in `~/.wrosecode/packages.json`;
+  `/skills list` and `/skills uninstall <pkg>` manage them.
 - Auto-commit (aider): after an edit turn whose checks pass, exactly the
   paths the agent touched are committed with a model-written subject derived
   from the staged diff (`[agent] auto_commit`, default on; `/commit` for
@@ -145,7 +151,7 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: open-interpreter opt-in OS tools; pi-mono packages install +
-fork at an arbitrary message; plus the deliberate non-adopts (scheduled recipes,
+items there: open-interpreter opt-in OS tools; pi-mono fork at an
+arbitrary message; plus the deliberate non-adopts (scheduled recipes,
 aider two-model mode and per-model edit formats, client-side MCP requests)
 noted per project.

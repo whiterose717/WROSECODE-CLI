@@ -15,6 +15,7 @@ mod lsp;
 mod markdown;
 mod memory;
 mod metrics;
+mod package;
 mod project;
 mod provider;
 mod provider_cli;
@@ -67,6 +68,10 @@ struct Cli {
     check_command: Option<String>,
     #[arg(long = "skills")]
     skill_dirs: Vec<PathBuf>,
+    /// Install a skill package before the run: a git URL (`url#ref` pins a
+    /// branch/tag/commit) or a local directory. Repeatable.
+    #[arg(long = "install-skill", value_name = "SOURCE")]
+    install_skill: Vec<String>,
     #[arg(long)]
     mcp_bin: Option<String>,
     #[arg(long = "mcp-arg")]
@@ -394,6 +399,14 @@ async fn main() -> Result<()> {
     } else {
         provider::create(&config.provider, &config.model, client.clone())?
     };
+    for source in &cli.install_skill {
+        let names = package::install(&skills::default_skills_dir(), source)
+            .await
+            .with_context(|| format!("--install-skill {source}"))?;
+        if !cli.quiet {
+            eprintln!("installed {} skill(s): {}", names.len(), names.join(", "));
+        }
+    }
     let mut agent = Agent::new(config, provider, client)?;
     let resumed_session = if let Some(id) = &cli.session {
         let loaded = store

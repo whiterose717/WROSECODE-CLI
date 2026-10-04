@@ -24,14 +24,20 @@ struct Frontmatter {
     keywords: Option<serde_yaml::Value>,
 }
 
-pub fn discover(root: &Path, extra: &[PathBuf]) -> Result<HashMap<String, Skill>> {
-    let home = std::env::var_os("HOME")
+/// `~/.wrosecode/skills` — where hand-placed skills and installed packages
+/// both live, and what `crate::package` writes into.
+pub fn default_skills_dir() -> PathBuf {
+    std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .join(".wrosecode/skills")
+}
+
+pub fn discover(root: &Path, extra: &[PathBuf]) -> Result<HashMap<String, Skill>> {
     let mut dirs = vec![
         root.join("skills"),
         root.join(".ctf/skills"),
-        home.join(".wrosecode/skills"),
+        default_skills_dir(),
     ];
     dirs.extend_from_slice(extra);
     let mut found = HashMap::new();
@@ -88,7 +94,7 @@ pub fn discover(root: &Path, extra: &[PathBuf]) -> Result<HashMap<String, Skill>
     Ok(found)
 }
 
-fn parse_skill(raw: &str, fallback: &str) -> Result<Skill> {
+pub(crate) fn parse_skill(raw: &str, fallback: &str) -> Result<Skill> {
     let (meta, body) = if let Some(rest) = raw.strip_prefix("---\n") {
         if let Some((yaml, body)) = rest.split_once("\n---\n") {
             (serde_yaml::from_str::<Frontmatter>(yaml)?, body.to_string())
