@@ -377,7 +377,7 @@ built-in defaults rather than failing to start. CLI flags always win.
 | Section | Purpose |
 | --- | --- |
 | `[ui]` | Theme, verbosity, alternate screen, `mouse_capture`, `alert_bell`, scroll step. |
-| `[agent]` | Thinking mode (`think`), legacy level (`thinking_level`), worker ceiling, shell timeout, retries, permission tier, budget. |
+| `[agent]` | Thinking mode (`think`), legacy level (`thinking_level`), worker ceiling, shell timeout, retries, permission tier, budget, planner model for `plan` mode (`planner = "provider/model"`). |
 | `[ctf]` | Flag regexes, clipboard copy, CTFd auto-submit. |
 | `[cache]` | `memory` or `redis`, plus Redis and Qdrant URLs. |
 | `[sandbox]` | Where `shell` calls run (`none` or `docker`) and the container settings. |

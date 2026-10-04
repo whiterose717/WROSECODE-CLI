@@ -81,6 +81,13 @@ pub struct Agent {
     pub pinned: Vec<String>,
 }
 
+/// Whether this turn runs on the configured planner model: the goose
+/// planner/worker split applies to the read-only `plan` mode and only
+/// when `[agent] planner` named a model.
+fn plan_phase_uses_planner(mode: &str, config: &Config) -> bool {
+    mode == "plan" && !config.planner_model.is_empty() && !config.planner_provider.is_empty()
+}
+
 impl Agent {
     pub fn set_mode(&mut self, mode: &str) -> Result<()> {
         if !matches!(mode, "build" | "plan" | "general") {
@@ -546,6 +553,20 @@ impl Agent {
         let mut last_text = String::new();
         let mut repairs = 0;
         let mut used_tools_this_turn = false;
+        // The goose planner/worker split: in the read-only `plan` mode a
+        // separately configured planner model does the thinking; every
+        // other mode runs the worker (the main provider). Built once per
+        // run, so settings are read a single time per user turn.
+        let planner = if plan_phase_uses_planner(&self.mode, &self.config) {
+            crate::provider::create(
+                &self.config.planner_provider,
+                &self.config.planner_model,
+                self.tools.client.clone(),
+            )
+            .ok()
+        } else {
+            None
+        };
         loop {
             let map = {
                 let mut guard = self
@@ -610,7 +631,7 @@ impl Agent {
             }
             let started = Instant::now();
             let schemas = self.tools.schemas();
-            let mut selected_provider = self.provider.clone();
+            let mut selected_provider = planner.clone().unwrap_or_else(|| self.provider.clone());
             let mut response = None;
             let mut last_error = None;
             for attempt in 0..3 {
@@ -1362,6 +1383,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_planner_model_runs_only_the_plan_mode() {
+        let dir = std::env::temp_dir().join(format!("wrose-planner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let (mut agent, _mock) = agent_with_mock(&dir);
+        agent.config = Arc::new(Config {
+            planner_provider: "mock".into(),
+            planner_model: "plan-model".into(),
+            ..(*agent.config).clone()
+        });
+        assert!(plan_phase_uses_planner("plan", &agent.config));
+        assert!(!plan_phase_uses_planner("build", &agent.config));
+        assert!(!plan_phase_uses_planner("general", &agent.config));
+
+        let worker_only = Config {
+            planner_provider: String::new(),
+            planner_model: String::new(),
+            ..(*agent.config).clone()
+        };
+        assert!(!plan_phase_uses_planner("plan", &worker_only));
+        // Half a split never switches: create() needs both halves.
+        let half = Config {
+            planner_provider: String::new(),
+            planner_model: "plan-model".into(),
+            ..(*agent.config).clone()
+        };
+        assert!(!plan_phase_uses_planner("plan", &half));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_still_answers_on_the_worker_when_the_planner_profile_is_missing() {
+        let dir = std::env::temp_dir().join(format!("wrose-planner-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let (mut agent, mock) = agent_with_mock(&dir);
+        agent.config = Arc::new(Config {
+            // No such profile: provider::create fails and the run must
+            // fall back to the worker rather than erroring out.
+            planner_provider: "wrose-ghost-planner".into(),
+            planner_model: "ghost-model".into(),
+            ..(*agent.config).clone()
+        });
+        agent.set_mode("plan").expect("plan mode");
+        let reply = agent.turn("say hello").await.expect("plan turn");
+        assert!(!reply.is_empty());
+        assert_eq!(mock.requests().len(), 1, "the worker answered the turn");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn agent_with_mock(root: &Path) -> (Agent, Arc<MockProvider>) {
         let config = Arc::new(Config {
             root: root.to_path_buf(),
@@ -1379,6 +1451,8 @@ mod tests {
             tool_retries: 1,
             fallback_provider: String::new(),
             fallback_model: String::new(),
+            planner_provider: String::new(),
+            planner_model: String::new(),
             redis_url: None,
             budget_usd: 0.0,
             qdrant_url: None,

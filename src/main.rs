@@ -311,6 +311,12 @@ async fn main() -> Result<()> {
         .or(runtime.agent.think);
     let think = configured_think
         .unwrap_or_else(|| ThinkLevel::from_level(runtime.agent.thinking_level.min(20)));
+    // goose's planner/worker split: [agent] planner = "provider/model"
+    // (or a bare model, keeping the worker's provider).
+    let (planner_provider, planner_model) = runtime
+        .agent
+        .planner_split(&cli.provider)
+        .unwrap_or_else(|| (String::new(), String::new()));
     let config = Arc::new(Config {
         root,
         permission: cli.permission.unwrap_or(runtime.agent.permission),
@@ -333,6 +339,8 @@ async fn main() -> Result<()> {
         tool_retries: runtime.agent.tool_retries.clamp(1, 3),
         fallback_provider: runtime.agent.fallback_provider,
         fallback_model: runtime.agent.fallback_model,
+        planner_provider,
+        planner_model,
         redis_url: runtime
             .cache
             .redis_url

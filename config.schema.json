@@ -90,6 +90,10 @@
         "fallback_model": {
           "type": "string"
         },
+        "planner": {
+          "type": ["string", "null"],
+          "description": "Planner model for the read-only plan mode, as \"provider/model\" or a bare model on the main provider."
+        },
         "budget_usd": {
           "type": "number",
           "minimum": 0

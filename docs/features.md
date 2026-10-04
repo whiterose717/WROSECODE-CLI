@@ -123,6 +123,12 @@ everything not marked is implemented and covered by tests.
   (YAML list or comma-separated string) triggers on a whole-word keyword hit
   in the prompt even when its name never appears, so a short knowledge
   snippet loads itself; the keyword gate scores below the skill's own name.
+- Planner/worker split (goose): `[agent] planner = "provider/model"` (or a
+  bare model on the main provider) names the model that runs the read-only
+  `plan` mode — `/plan`, the Tab toggle, and `plan`-mode subagents think on
+  it — while `build`/`general` keep the worker model. Built once per run,
+  falls back to the worker when the planner profile is missing, shown in
+  `/models`, `/plan`, and the status bar.
 - Recipes (goose): YAML or Markdown workflow files with parameters and
   ordered prompt/command steps, discovered from `.wrosecode/recipes/` and
   `~/.wrosecode/recipes/`, run with `wrosecode recipe list` /
@@ -135,7 +141,7 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: goose planner/worker model split; aider git auto-commit;
+items there: aider git auto-commit;
 open-interpreter opt-in OS tools; pi-mono packages install + fork at an
 arbitrary message; plus the deliberate non-adopts (scheduled recipes,
 aider two-model mode and per-model edit formats, client-side MCP requests)

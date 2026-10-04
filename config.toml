@@ -32,6 +32,10 @@ shell_timeout_seconds = 30
 tool_retries = 3
 fallback_provider = ""
 fallback_model = ""
+# goose-style planner/worker split: the model that runs the read-only plan
+# mode, as "provider/model" or a bare model on the main provider. Empty (or
+# commented out) keeps one model for every mode.
+# planner = "anthropic/claude-haiku"
 budget_usd = 0.0 # zero means unlimited
 # ask = prompt before every risky tool call, auto-safe = allow only read-only
 # commands, yolo = allow everything. Overridden by --permission.

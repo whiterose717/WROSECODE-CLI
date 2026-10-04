@@ -31,6 +31,11 @@ pub struct Config {
     pub tool_retries: usize,
     pub fallback_provider: String,
     pub fallback_model: String,
+    /// The goose planner/worker split: `planner_provider`/`planner_model`
+    /// name the model that runs the read-only `plan` mode. Empty = the
+    /// worker (main provider) runs every mode.
+    pub planner_provider: String,
+    pub planner_model: String,
     pub redis_url: Option<String>,
     pub budget_usd: f64,
     pub qdrant_url: Option<String>,
@@ -117,6 +122,9 @@ pub struct AgentRuntimeConfig {
     pub tool_retries: usize,
     pub fallback_provider: String,
     pub fallback_model: String,
+    /// `planner = "provider/model"` (or just `"model"` for the main
+    /// provider) in `[agent]`: the model that thinks in `plan` mode.
+    pub planner: Option<String>,
     pub budget_usd: f64,
     pub permission: Permission,
 }
@@ -131,8 +139,29 @@ impl Default for AgentRuntimeConfig {
             tool_retries: 3,
             fallback_provider: String::new(),
             fallback_model: String::new(),
+            planner: None,
             budget_usd: 0.0,
             permission: Permission::Ask,
+        }
+    }
+}
+
+impl AgentRuntimeConfig {
+    /// Split `[agent] planner` into `(provider, model)`. A bare model name
+    /// keeps `main_provider` (the provider the worker runs on); a
+    /// `provider/model` pair overrides it; anything malformed disables the
+    /// split so a typo falls back to the worker instead of failing startup.
+    pub fn planner_split(&self, main_provider: &str) -> Option<(String, String)> {
+        let spec = self.planner.as_deref()?.trim();
+        if spec.is_empty() {
+            return None;
+        }
+        match spec.split_once('/') {
+            Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+                Some((provider.trim().to_string(), model.trim().to_string()))
+            }
+            Some(_) => None,
+            None => Some((main_provider.to_string(), spec.to_string())),
         }
     }
 }
@@ -282,6 +311,51 @@ mod tests {
     }
 
     #[test]
+    fn planner_split_reads_pairs_bare_models_and_rejects_junk() {
+        let pair = AgentRuntimeConfig {
+            planner: Some("anthropic/claude-haiku".into()),
+            ..AgentRuntimeConfig::default()
+        };
+        assert_eq!(
+            pair.planner_split("openai").unwrap(),
+            ("anthropic".into(), "claude-haiku".into())
+        );
+        // A model name may itself contain slashes: only the first one
+        // separates the provider.
+        let nested = AgentRuntimeConfig {
+            planner: Some("openai/org/model-x".into()),
+            ..AgentRuntimeConfig::default()
+        };
+        assert_eq!(
+            nested.planner_split("anthropic").unwrap(),
+            ("openai".into(), "org/model-x".into())
+        );
+        // A bare model keeps the worker's provider.
+        let bare = AgentRuntimeConfig {
+            planner: Some("  gpt-5-codex ".into()),
+            ..AgentRuntimeConfig::default()
+        };
+        assert_eq!(
+            bare.planner_split("openai").unwrap(),
+            ("openai".into(), "gpt-5-codex".into())
+        );
+        // Malformed and absent specs disable the split instead of failing
+        // startup — a typo falls back to the worker.
+        for junk in [
+            Some("anthropic/".into()),
+            Some("/m".into()),
+            Some("".into()),
+            None,
+        ] {
+            let config = AgentRuntimeConfig {
+                planner: junk,
+                ..AgentRuntimeConfig::default()
+            };
+            assert!(config.planner_split("openai").is_none());
+        }
+    }
+
+    #[test]
     fn every_shipped_section_is_honoured() {
         let source = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml"),
@@ -301,6 +375,10 @@ mod tests {
         assert_eq!(runtime.agent.tool_retries, 3);
         assert_eq!(runtime.agent.permission, Permission::Ask);
         assert_eq!(runtime.agent.budget_usd, 0.0);
+        // The planner/worker split ships commented out: one model per mode
+        // until the user names a planner.
+        assert_eq!(runtime.agent.planner, None);
+        assert!(runtime.agent.planner_split("openai").is_none());
 
         assert_eq!(runtime.cache.backend, "memory");
         assert!(runtime.cache.redis_url.is_some());

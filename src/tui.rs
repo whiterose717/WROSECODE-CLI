@@ -4551,7 +4551,11 @@ pub async fn run(
                 };
                 agent.set_mode(next)?;
                 ui.mode = next.to_ascii_uppercase();
-                ui.status = format!("{} mode", ui.mode);
+                ui.status = if next == "plan" && !agent.config.planner_model.is_empty() {
+                    format!("PLAN mode — planner {}", agent.config.planner_model)
+                } else {
+                    format!("{} mode", ui.mode)
+                };
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 ui.insert('\n');
@@ -5360,7 +5364,17 @@ async fn run_command(
             let mode = name.trim_start_matches('/');
             agent.set_mode(mode)?;
             ui.mode = mode.to_ascii_uppercase();
-            ui.push(Speaker::System, format!("{mode} agent active"));
+            if mode == "plan" && !agent.config.planner_model.is_empty() {
+                ui.push(
+                    Speaker::System,
+                    format!(
+                        "plan agent active — planner {}/{}",
+                        agent.config.planner_provider, agent.config.planner_model
+                    ),
+                );
+            } else {
+                ui.push(Speaker::System, format!("{mode} agent active"));
+            }
         }
         "/agents" => {
             let modes = ["build", "plan", "general"];
@@ -6232,6 +6246,18 @@ async fn run_command(
             }
         }
         "/models" => {
+            if !agent.config.planner_model.is_empty() {
+                ui.push(
+                    Speaker::System,
+                    format!(
+                        "planner (plan mode): {}/{} — worker: {}/{}",
+                        agent.config.planner_provider,
+                        agent.config.planner_model,
+                        agent.config.provider,
+                        agent.config.model
+                    ),
+                );
+            }
             let models = available_models(agent, settings).await;
             let labels = models
                 .iter()
