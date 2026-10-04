@@ -571,18 +571,33 @@ mod tests {
     #[tokio::test]
     async fn a_background_daemon_does_not_hold_the_result_open() {
         let dir = tmp();
-        let started = Instant::now();
-        // The daemon inherits the stdout pipe; a plain `reader.await` would
-        // block until it exits instead of returning the command's output.
-        let text = run_with_timeout("(sleep 6 &) ; echo ok", &dir, 30)
-            .await
-            .unwrap();
+        // The daemon inherits the stdout pipe and stays alive until a
+        // `release` file appears (bounded at 300s so a regression still
+        // finishes). A reader that awaited EOF would not return until the
+        // daemon exits; the bounded reader returns while the daemon is
+        // still running. Liveness — not wall-clock time — is the assertion,
+        // so a stalled or overloaded host cannot flake it.
+        let command =
+            "(i=0; while [ ! -e release ] && [ $i -lt 300 ]; do sleep 1; i=$((i+1)); done & echo pid=$!) ; echo ok";
+        let text = run_with_timeout(command, &dir, 30).await.unwrap();
         assert!(text.contains("ok"));
+        let pid: u32 = text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("pid="))
+            .and_then(|raw| raw.trim().parse().ok())
+            .expect("the daemon echoes its pid");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
         assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "reader awaited the daemon's pipe for {:?}",
-            started.elapsed()
+            alive,
+            "the reader held the result open until the daemon (pid {pid}) exited"
         );
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

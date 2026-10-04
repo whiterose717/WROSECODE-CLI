@@ -66,6 +66,18 @@ impl Renderer {
 
     fn draw(&mut self, rows: &[Row], input_cursor: (u16, u16), size: (u16, u16)) -> io::Result<()> {
         let mut out = io::stdout().lock();
+        self.draw_to(&mut out, rows, input_cursor, size)
+    }
+
+    /// The frame writer, split out so tests can capture the bytes a resize
+    /// or a diff actually emits without touching the real terminal.
+    fn draw_to(
+        &mut self,
+        out: &mut impl Write,
+        rows: &[Row],
+        input_cursor: (u16, u16),
+        size: (u16, u16),
+    ) -> io::Result<()> {
         if self.size != size || self.full_redraw {
             queue!(out, Clear(ClearType::All))?;
             self.previous.clear();
@@ -8135,6 +8147,15 @@ mod tests {
         assert!(text.contains("answer: the flag is flag{ok}"), "{text}");
         assert!(text.contains("proof: none"), "{text}");
         assert!(text.contains("steps "), "{text}");
+        // The acceptance shape: time split, steps, tokens, cache hit %,
+        // cost, and the saved-cache readout all live in one block.
+        assert!(
+            text.contains("time ") && text.contains("(model ") && text.contains("· wait "),
+            "{text}"
+        );
+        assert!(text.contains("% cache"), "{text}");
+        assert!(text.contains("cost "), "{text}");
+        assert!(text.contains("saved ~"), "{text}");
 
         let mut ui = shell();
         ui.task_begin();
@@ -8148,6 +8169,120 @@ mod tests {
         ui.push_result_block();
         let text = &ui.entries.last().expect("a result block was pushed").text;
         assert!(text.contains("── RESULT ─ ⚠ unverified"), "{text}");
+    }
+
+    /// The dashboard's Ctrl+K path: a selected tracked process is really
+    /// signalled, and the status line reports it. `sleep` is spawned as a
+    /// plain child (not a group leader), so this also walks the plain-pid
+    /// fallback in `shell::signal`.
+    #[test]
+    fn dashboard_kill_signals_the_selected_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep must be on PATH");
+        let pid = child.id();
+        let mut ui = shell();
+        ui.dashboard = true;
+        ui.dash_focus = 0;
+        ui.dash_sel = 0;
+        ui.dash_procs = vec![crate::tools::shell::ProcSnapshot {
+            pid,
+            command: "sleep 30".into(),
+            cwd: std::env::temp_dir().display().to_string(),
+            started: std::time::Instant::now(),
+            running: true,
+            exit_code: None,
+            timed_out: false,
+            cpu_pct: None,
+            rss_kb: None,
+            tail: String::new(),
+        }];
+        ui.dash_signal(true);
+        assert_eq!(
+            ui.status,
+            format!("SIGTERM sent to pid {pid}"),
+            "the kill is reported"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the selected process survived the dashboard kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // With nothing selected the dashboard reports instead of guessing.
+        let mut ui = shell();
+        ui.dashboard = true;
+        ui.dash_procs = Vec::new();
+        ui.dash_signal(true);
+        assert_eq!(ui.status, "No process selected");
+    }
+
+    /// The rendering budget from the speed pass: building a frame on top of
+    /// a 10k-line transcript — cache invalidated every round, so the timed
+    /// work is the wrap rebuild plus the viewport compose — stays inside its
+    /// budget in release runs (dev runs only print the number).
+    #[test]
+    fn composing_a_10k_line_transcript_stays_within_budget() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 10_000);
+        crate::benchmarks::budget("compose 10k-line transcript", 100, 5, || {
+            ui.transcript_key = None;
+            let (frame, _) = ui.compose(120, 40);
+            assert_eq!(frame.len(), 40, "one row per screen line");
+        });
+    }
+
+    /// Resize redraws correctly: a size change repaints from a clean slate
+    /// (full clear, tail rows wiped), while a byte-identical frame at the
+    /// same size emits nothing at all — no flicker, no jumping.
+    #[test]
+    fn a_resize_repaints_every_row_and_a_stable_frame_emits_nothing() {
+        let mut renderer = Renderer::new();
+        let rows: Vec<Row> = (0..8)
+            .map(|index| Row::new(format!("row {index}"), Color::Reset))
+            .collect();
+
+        let mut first = Vec::new();
+        renderer
+            .draw_to(&mut first, &rows, (0, 0), (20, 8))
+            .expect("first frame");
+        assert!(
+            String::from_utf8_lossy(&first).contains("\u{1b}[2J"),
+            "the first frame clears the screen"
+        );
+
+        let mut stable = Vec::new();
+        renderer
+            .draw_to(&mut stable, &rows, (0, 0), (20, 8))
+            .expect("same frame");
+        assert!(
+            stable.len() < 64,
+            "an unchanged frame at an unchanged size emits only the cursor tail: {stable:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&stable).contains("\u{1b}[K"),
+            "no row of a stable frame is rewritten"
+        );
+
+        let mut resized = Vec::new();
+        renderer
+            .draw_to(&mut resized, &rows[..5], (0, 0), (30, 5))
+            .expect("resized frame");
+        let bytes = String::from_utf8_lossy(&resized);
+        assert!(
+            bytes.contains("\u{1b}[2J"),
+            "a size change starts from a clean slate: {bytes:?}"
+        );
+        assert!(
+            bytes.matches("\u{1b}[2K").count() >= 5,
+            "every row of the new frame is erased before it is painted: {bytes:?}"
+        );
     }
 
     #[test]

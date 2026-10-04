@@ -9,8 +9,9 @@
 use std::time::Instant;
 
 /// Run `work` `rounds` times, keep the fastest sample, print it, and — in
-/// release mode — fail when it exceeds the budget.
-fn budget(label: &str, limit_ms: u128, rounds: u32, mut work: impl FnMut()) {
+/// release mode — fail when it exceeds the budget. `pub(crate)` so the TUI
+/// tests can pin the compose/render path with the same gate.
+pub(crate) fn budget(label: &str, limit_ms: u128, rounds: u32, mut work: impl FnMut()) {
     let mut best = u128::MAX;
     for _ in 0..rounds {
         let started = Instant::now();

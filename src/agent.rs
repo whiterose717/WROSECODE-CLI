@@ -1537,16 +1537,26 @@ mod tests {
     }
 
     /// A provider that plays back a fixed script of responses, then keeps
-    /// answering with a plain "done" once the script runs out.
+    /// answering with a plain "done" once the script runs out. Every call
+    /// parks for a moment while counted, so tests can prove two callers
+    /// were in flight at once.
     struct ScriptedProvider {
         script: Mutex<std::collections::VecDeque<Response>>,
+        inflight: std::sync::atomic::AtomicUsize,
+        peak_inflight: std::sync::atomic::AtomicUsize,
     }
 
     impl ScriptedProvider {
         fn new(script: Vec<Response>) -> Arc<Self> {
             Arc::new(Self {
                 script: Mutex::new(script.into_iter().collect()),
+                inflight: std::sync::atomic::AtomicUsize::new(0),
+                peak_inflight: std::sync::atomic::AtomicUsize::new(0),
             })
+        }
+
+        fn peak(&self) -> usize {
+            self.peak_inflight.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1561,7 +1571,12 @@ mod tests {
             _progress: Option<&mpsc::UnboundedSender<Progress>>,
             _think: ThinkLevel,
         ) -> anyhow::Result<Response> {
+            use std::sync::atomic::Ordering;
+            let active = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_inflight.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             let next = self.script.lock().expect("script lock").pop_front();
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
             Ok(next.unwrap_or(Response {
                 content: vec![Content::Text("done".into())],
                 usage: Usage::default(),
@@ -1683,6 +1698,46 @@ mod tests {
         assert!(
             status.contains("note.txt"),
             "edit left for /commit: {status}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two `delegate_task` calls issued in one batch must actually overlap:
+    /// both children run through the same provider, and the peak-inflight
+    /// counter proves they were inside a chat call at the same time — the
+    /// parallel-subagent bar the CTF mode promises.
+    #[tokio::test]
+    async fn delegate_children_execute_concurrently() {
+        let dir = std::env::temp_dir().join(format!("wrose-delegate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let (mut agent, _mock) = agent_with_mock(&dir);
+        let provider = ScriptedProvider::new(vec![Response {
+            content: vec![
+                Content::Call(ToolCall {
+                    id: "call-1".into(),
+                    name: "delegate_task".into(),
+                    input: serde_json::json!({"task": "summarize part a", "task_id": "part-a"}),
+                }),
+                Content::Call(ToolCall {
+                    id: "call-2".into(),
+                    name: "delegate_task".into(),
+                    input: serde_json::json!({"task": "summarize part b", "task_id": "part-b"}),
+                }),
+            ],
+            usage: Usage::default(),
+        }]);
+        agent.provider = provider.clone() as Arc<dyn Provider>;
+
+        let reply = agent
+            .turn("run both delegations in parallel")
+            .await
+            .expect("turn");
+        assert!(!reply.is_empty(), "the turn still answers");
+        assert!(
+            provider.peak() >= 2,
+            "the two delegate children must overlap (peak inflight {})",
+            provider.peak()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

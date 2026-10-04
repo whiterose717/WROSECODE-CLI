@@ -186,7 +186,9 @@ fn drive(binary: &str, home: &std::path::Path) -> (bool, String) {
 }
 
 /// Boot with a transcript far taller than the viewport, scroll to the top,
-/// push more lines while detached, then jump back to the bottom.
+/// push more lines while detached, then jump back to the bottom. A wheel
+/// segment follows: notches detach and re-engage follow the same way Home
+/// and End do.
 fn drive_flood(binary: &str, home: &std::path::Path) -> (bool, String) {
     let mut pty = Pty::start_with(binary, home, &[("WROSECODE_E2E_LINES", "5000")]);
     std::thread::sleep(Duration::from_millis(1200));
@@ -194,6 +196,20 @@ fn drive_flood(binary: &str, home: &std::path::Path) -> (bool, String) {
     pty.send_text("/theme bogus", 250); // pushes lines while detached
     pty.send(b"\r", 500);
     pty.send(b"\x1b[F", 350); // End → re-engage auto-follow
+                              // Wheel up (SGR button 64): three notches stop follow at scroll=3 …
+    for _ in 0..3 {
+        pty.send(b"\x1b[<64;10;10M", 120);
+    }
+    pty.send_text("/theme bogus", 250); // … so this push re-drops the marker
+    pty.send(b"\r", 500);
+    // Wheel down (button 65). The push above anchored the viewport a few
+    // lines higher, so saturating past the anchor — 20 notches is far more
+    // than scroll can be — is what actually re-engages follow at the bottom.
+    for _ in 0..20 {
+        pty.send(b"\x1b[<65;10;10M", 60);
+    }
+    pty.send_text("/theme nord", 250); // … and this push must not re-drop it
+    pty.send(b"\r", 500);
     pty.send_text("/quit", 250);
     pty.send(b"\r", 600);
     pty.finish()
@@ -345,6 +361,16 @@ fn pty_scrolls_up_counts_new_lines_and_reengages_follow() {
     assert!(
         transcript.contains("↓ 5 new lines  (End to jump)"),
         "output pushed while detached feeds the indicator\n{transcript}"
+    );
+    // The wheel segment in `drive_flood` re-detached (marker reappeared for
+    // the second push) and wheel-down back to the bottom re-engaged follow.
+    assert!(
+        transcript.matches("new lines").count() >= 2,
+        "wheel-up detaches follow: the marker reappears for the second push\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Theme set to nord"),
+        "the post-wheel push landed (wheel-down re-engaged follow)\n{transcript}"
     );
     // The renderer rewrites a whole row when it changes, so the LAST header
     // we ever see is the one after End: it must carry no marker.
