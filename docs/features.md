@@ -96,8 +96,11 @@ everything not marked is implemented and covered by tests.
   message capped at 6k characters, the history is replaced by the summary plus
   an acknowledgement, summarizer usage lands in the dashboard, and a failed
   summary leaves the history untouched. `/compact` forces a pass.
-- **TODO** microagents (keyword-triggered knowledge snippets), recipes
-  (`wrosecode recipe run`), scheduled/recurring work.
+- Microagents (OpenHands): a skill whose frontmatter carries `keywords:`
+  (YAML list or comma-separated string) triggers on a whole-word keyword hit
+  in the prompt even when its name never appears, so a short knowledge
+  snippet loads itself; the keyword gate scores below the skill's own name.
+- **TODO** recipes (`wrosecode recipe run`), scheduled/recurring work.
 
 ## Reference-project gap list
 

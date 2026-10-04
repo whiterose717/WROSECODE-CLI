@@ -78,7 +78,7 @@ it a poor fit.
 | Containerised runtime | Adopted | `[sandbox] engine = "docker"`, persistent container, `/workspace` bind mount. |
 | Stuck detector | Adopted | Empty/repeated replies raise thinking, rotate the category hypothesis, force a fresh context (CTF autopilot). |
 | Context condenser | Adopted | The same mechanism as Codex auto-compaction (`Agent::compact` + `/compact`); the trigger here is transcript size rather than token-depth percentage, and the stuck detector still handles repeated-reply depth separately. |
-| Keyword-triggered microagents | Not implemented | **TODO** — `skills::match_skill` picks the closest skill per prompt but has no keyword gating. |
+| Keyword-triggered microagents | Adopted | Skill frontmatter takes `keywords:` (YAML list or comma-separated string, lowercased and deduplicated at parse time). `skills::match_skill` scores an explicit whole-word keyword hit at 60 + name-word hits — above fuzzy name matching, below the skill's own name — and picks the highest score, so a short snippet injects itself the moment one of its words is mentioned. |
 | Delegation to child agents | Adopted | `delegate_task`. |
 | Headless browser tool | Adopted | `browser_capture`. |
 | Agent-server mode | Adopted | `--web` REST + `/v1/chat`. |
