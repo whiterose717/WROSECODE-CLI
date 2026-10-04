@@ -27,6 +27,9 @@ const MIN_COMPACT_MESSAGES: usize = 6;
 /// Per-message cap on what the summarizer is shown, so one huge tool result
 /// cannot crowd out the rest of the history.
 const SUMMARY_INPUT_CAP: usize = 6_000;
+/// The newest user request is copied through compaction verbatim (capped here
+/// so one giant prompt cannot dominate the summary's wrapper).
+const PINNED_REQUEST_CAP: usize = 8_000;
 
 pub struct Agent {
     pub config: Arc<Config>,
@@ -390,6 +393,18 @@ impl Agent {
         }
         let before = transcript_chars(&self.messages);
         let count = self.messages.len();
+        // Pin the newest request in flight: whatever the summarizer drops, the
+        // user's actual ask rides along verbatim (clai's state-preserving
+        // compaction).
+        let pinned = self.messages.iter().rev().find_map(|message| {
+            if message.role != "user" {
+                return None;
+            }
+            message.content.iter().find_map(|content| match content {
+                Content::Text(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+                _ => None,
+            })
+        });
         let history = summarise_input(&self.messages);
         let response = self
             .provider
@@ -402,15 +417,23 @@ impl Agent {
             bail!("the summarizer returned an empty summary");
         }
         let summary: String = summary.chars().take(32_000).collect();
+        let mut wrapped = format!(
+            "This conversation was compacted to fit the context window \
+             ({reason}: {before} characters, {count} messages). What follows \
+             summarizes everything so far — treat it as the full history and \
+             continue from it.\n\n{summary}"
+        );
+        if let Some(pinned) = pinned {
+            let pinned: String = pinned.chars().take(PINNED_REQUEST_CAP).collect();
+            wrapped.push_str(&format!(
+                "\n\nThe request in flight when the history was cut, kept \
+                 verbatim through compaction:\n{pinned}"
+            ));
+        }
         self.messages = vec![
             Message {
                 role: "user".into(),
-                content: vec![Content::Text(format!(
-                    "This conversation was compacted to fit the context window \
-                     ({reason}: {before} characters, {count} messages). What follows \
-                     summarizes everything so far — treat it as the full history and \
-                     continue from it.\n\n{summary}"
-                ))],
+                content: vec![Content::Text(wrapped)],
             },
             Message {
                 role: "assistant".into(),
@@ -1453,6 +1476,29 @@ mod tests {
         assert_eq!(agent.usage.input, 5, "summarizer usage is accounted");
         assert_eq!(agent.usage.output, 7);
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_newest_request_survives_compaction_verbatim() {
+        let root =
+            std::env::temp_dir().join(format!("wrosecode-compact-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut agent, _provider) = agent_with_mock(&root);
+        seed(&mut agent);
+        agent.compact("test").await.expect("compact");
+
+        // The summarizer (a fixed stub here) never mentions SEED-MARKER-2, yet
+        // the newest request must ride through the cut on its own.
+        let after = joined(&agent.messages);
+        assert!(
+            after.contains("SEED-MARKER-2: rewrite the parser, keep the CLI stable"),
+            "latest request was lost in compaction: {after}"
+        );
+        assert!(
+            !after.contains("SEED-MARKER-0") && !after.contains("SEED-MARKER-1"),
+            "older turns leaked through: {after}"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -95,17 +95,13 @@ it a poor fit.
 
 ## clai (`pentoshi007/clai`)
 
-Inspected 2026-10-04 (README + tree). Adopted:
+Inspected 2026-10-04 (README + tree).
 
-1. **State-preserving compaction** — when `/compact` and auto-compaction land,
-   keep the latest user request verbatim plus a work envelope (touched files,
-   subagents, background jobs) instead of a lossy summary.
-2. **Destructive-pattern blocking** — a `block` tier that refuses `rm -rf /`,
-   fork bombs, and exfiltration-shaped commands regardless of the approval
-   mode, layered on top of the existing ask/auto-safe/yolo tiers.
-3. **One-shot natural language → shell** — a `--dry-run` style preview of the
-   command the model would run, so a quick question does not need an approval
-   round trip.
+| Item | Status | Note |
+| --- | --- | --- |
+| State-preserving compaction | Adopted | `/compact` and auto-compaction pin the newest user request verbatim into the wrapper after the summary — it rides through the cut no matter what the summarizer drops — while `COMPACT_SYSTEM` is told to keep goals, constraints, touched files and decisions (a prompt-driven work envelope rather than a mechanically assembled one). |
+| Destructive-pattern blocking | Adopted | `shell::destructive()` matches `rm -rf`/`rm -fr`, `mkfs`, `dd if=`, fork bombs (`:(){`), `chmod -r 777 /` and raw writes to block devices, and `tools::execute` raises it above every approval mode: it prompts even in `yolo`, has no auto-approve path, and a run without a terminal is refused, so it never executes unattended. |
+| One-shot natural language → shell | Not implemented | There is no one-shot mode and no `--dry-run` preview: `--prompt` runs the full agent loop, and `--plan` is the read-only substitute for "just show me what you would do". |
 
 Deliberately skipped: provider/key sprawl and OAuth sign-in flows (we keep
 `providers.toml` + env/keyring keys), persistent PTY REPL sessions, and the
