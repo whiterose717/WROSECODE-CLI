@@ -8,6 +8,7 @@ mod config;
 mod crash;
 mod ctf;
 mod ctfd;
+mod events;
 mod harness;
 mod memory;
 mod metrics;
@@ -34,7 +35,7 @@ use clap::Parser;
 use config::{Config, Permission};
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use think::ThinkLevel;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -80,6 +81,10 @@ struct Cli {
     max_wall_time: u64,
     #[arg(long)]
     no_summary: bool,
+    /// Write a framed NDJSON submission stream (start/step/text/result) to
+    /// PATH, or `-` for stdout
+    #[arg(long, value_name = "PATH")]
+    events: Option<PathBuf>,
     #[arg(long)]
     summary: Option<String>,
     #[arg(long)]
@@ -343,6 +348,7 @@ async fn main() -> Result<()> {
             agent.tools.mcps.push((server.name.clone(), mcp));
         }
     }
+    let mut event_sink = attach_events(&mut agent, cli.events.as_deref())?;
     if ctf_mode {
         // Spec PHASE 5: exit 0 verified, exit 2 budget-exhausted, exit 1
         // (anyhow) on error.
@@ -354,6 +360,10 @@ async fn main() -> Result<()> {
             budget: autopilot::Budget::parse(cli.budget.as_deref().unwrap_or_default())?,
             parallel: cli.parallel,
         };
+        write_event(
+            &event_sink,
+            &events::start_frame(&format!("ctf {}", options.target), "ctf"),
+        );
         let outcome = autopilot::run(&mut agent, &options).await?;
         let mut session = resumed_session.unwrap_or_else(session::Session::fresh);
         session.messages = agent.messages.clone();
@@ -372,6 +382,17 @@ async fn main() -> Result<()> {
         let writeup =
             report::writeup_challenge(&agent.config.root, &session, &flags, notes.as_deref())?;
         println!("WRITEUP {}", writeup.display());
+        if let Some(stream) = &mut event_sink {
+            stream.quiesce(&mut agent).await;
+        }
+        let (verified, answer) = match &outcome {
+            autopilot::Outcome::Verified { flag, .. } => (true, flag.clone()),
+            autopilot::Outcome::Unsolved { report, .. } => (false, report.clone()),
+        };
+        write_event(
+            &event_sink,
+            &events::result_frame(&answer, verified, &agent.usage, agent.model_turns),
+        );
         match outcome {
             autopilot::Outcome::Verified { flag, evidence } => {
                 println!("FLAG    {flag}");
@@ -394,6 +415,17 @@ async fn main() -> Result<()> {
         return api::serve(agent, store, &cli.listen).await;
     }
     if let Some(prompt) = cli.prompt {
+        write_event(
+            &event_sink,
+            &events::start_frame(
+                &prompt,
+                resumed_session
+                    .as_ref()
+                    .map(|session| session.name.clone())
+                    .unwrap_or_else(|| "new".into())
+                    .as_str(),
+            ),
+        );
         let (raced_agent, response) = if !cli.race.is_empty() {
             race_models(agent, &settings, &prompt, &cli.race).await?
         } else {
@@ -423,6 +455,13 @@ async fn main() -> Result<()> {
                 .await?
                 .success();
         }
+        if let Some(stream) = &mut event_sink {
+            stream.quiesce(&mut agent).await;
+        }
+        write_event(
+            &event_sink,
+            &events::result_frame(&response, verified, &agent.usage, agent.model_turns),
+        );
         let json_summary = cli.summary.as_deref() == Some("json");
         if exec_json {
             // Spec 3.2: `exec --json` emits the dashboard snapshot, with the
@@ -592,4 +631,55 @@ async fn race_models(
         }
     }
     first_success.ok_or_else(|| anyhow::anyhow!("all race models failed: {}", errors.join("; ")))
+}
+
+/// Shared handle to the framed submission stream written by `--events`.
+type EventSink = std::sync::Arc<std::sync::Mutex<events::EventWriter>>;
+
+/// The live submission stream: a sink for `start`/`result` frames and the
+/// forwarder task that appends every `Progress` event as it happens.
+struct EventStream {
+    sink: EventSink,
+    forwarder: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl EventStream {
+    /// Stop forwarding and wait until every queued frame is written, so the
+    /// `result` frame always lands last.
+    async fn quiesce(&mut self, agent: &mut Agent) {
+        drop(agent.event_tx.take());
+        if let Some(forwarder) = self.forwarder.take() {
+            let _ = forwarder.await;
+        }
+    }
+}
+
+/// Attach the framed submission stream (`--events PATH`): live `Progress`
+/// events are framed and appended as they happen, while the `start` and
+/// `result` frames come from the caller. Returns `None` without the flag.
+fn attach_events(agent: &mut Agent, path: Option<&Path>) -> Result<Option<EventStream>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(events::EventWriter::open(path)?));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink = writer.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let Some(frame) = events::frame(&event) {
+                let _ = sink.lock().expect("event sink").write(&frame);
+            }
+        }
+    });
+    agent.event_tx = Some(tx);
+    Ok(Some(EventStream {
+        sink: writer,
+        forwarder: Some(forwarder),
+    }))
+}
+
+fn write_event(stream: &Option<EventStream>, frame: &serde_json::Value) {
+    if let Some(stream) = stream {
+        let _ = stream.sink.lock().expect("event sink").write(frame);
+    }
 }

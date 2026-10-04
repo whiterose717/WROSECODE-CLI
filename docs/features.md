@@ -78,6 +78,10 @@ everything not marked is implemented and covered by tests.
   only the running turn.
 - Stuck detector: empty/repeated replies raise thinking, rotate the category
   hypothesis, and force a fresh-context attempt.
+- Submission stream: `--events PATH` appends framed NDJSON (`start`, `step`,
+  `text`, `result`) while a prompt/CTF run executes, so embedding clients get
+  a live, machine-readable submission instead of the transcript; the `result`
+  frame is written only after the live queue drains.
 - Auto-compaction: the turn starts by summarizing the conversation once it
   passes `compact_at_chars` (180k characters by default, `WROSECODE_COMPACT_CHARS`
   overrides) and is at least six messages old; the summarizer sees every
@@ -90,7 +94,7 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: Codex submission/event protocol; opencode markdown agents/commands, LSP
+items there: opencode markdown agents/commands, LSP
 feedback, session tree; goose recipes + HTTP MCP + planner/worker models;
 aider repo-map ranking, auto-commit loop, `/add` `/drop`, two-model mode,
 edit formats; open-interpreter multi-language runner and opt-in OS tools;

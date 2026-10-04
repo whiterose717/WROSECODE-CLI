@@ -479,3 +479,36 @@ fn a_large_resumed_history_is_compacted_before_the_turn() {
         "history was not replaced by the summary: {turn}"
     );
 }
+
+#[test]
+fn events_flag_writes_a_framed_submission_stream() {
+    let server = spawn(vec![
+        tool_call("read_file", r#"{"path":"notes.txt"}"#),
+        completion("STREAMED-ANSWER"),
+    ]);
+    let sandbox = Sandbox::new("events", &server.url(""));
+    sandbox.file("notes.txt", "hello\n");
+
+    let output = headless(&sandbox, "read the notes", &["--events", "events.jsonl"]);
+    assert_task_complete(&output, "STREAMED-ANSWER");
+
+    let text = std::fs::read_to_string(sandbox.root.join("events.jsonl"))
+        .expect("event stream was not written");
+    let frames: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("frame must be one JSON object per line"))
+        .collect();
+    assert!(!frames.is_empty());
+    assert_eq!(frames[0]["type"], "start");
+    assert_eq!(frames[0]["prompt"], "read the notes");
+    assert!(
+        frames.iter().any(|frame| {
+            frame["type"] == "step" && frame["phase"] == "end" && frame["ok"] == true
+        }),
+        "no tool-end frame in {frames:?}"
+    );
+    let last = frames.last().expect("result frame");
+    assert_eq!(last["type"], "result");
+    assert_eq!(last["answer"], "STREAMED-ANSWER");
+    assert_eq!(last["verified"], true);
+}

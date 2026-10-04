@@ -293,6 +293,15 @@ wrosecode --headless --summary json 'analyze the supplied challenge'
 
 The web server binds to `127.0.0.1:7878` by default. See `API.md` before exposing it through a reverse proxy.
 
+`--events PATH` (or `--events -` for stdout) writes a framed NDJSON submission stream for embedding clients: a `start` frame with the session and prompt, `step` frames for tool begins/ends, thinking-level changes, plans, flag hits, and usage, `text` frames carrying streamed tokens, and a final `result` frame with the answer, verification status, usage, and model-turn count. Frames are flushed as they happen and the `result` frame is always last, so a host application can drive and render a session without parsing the transcript:
+
+```bash
+wrosecode --headless --events run.jsonl --summary json 'analyze the supplied challenge'
+jq -r 'select(.type == "text") | .delta' run.jsonl   # live answer stream
+```
+
+`src/events.rs` is the formatter; `docs/ref-notes.md` records it against Codex's submission/event protocol.
+
 ## Shell sandbox
 
 `[sandbox]` in `config.toml` decides where `shell` calls run:
