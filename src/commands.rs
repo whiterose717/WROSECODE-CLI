@@ -117,7 +117,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/fork",
         category: "Session",
-        description: "Fork this session into a new one (/fork [name])",
+        description: "Fork this session (/fork [name] or /fork <n> [name] at message n)",
+    },
+    CommandSpec {
+        name: "/history",
+        category: "Session",
+        description: "List messages with the numbers /fork <n> branches at",
     },
     CommandSpec {
         name: "/tree",
@@ -373,6 +378,7 @@ mod tests {
             "/fork",
             "/greet",
             "/help",
+            "/history",
             "/init",
             "/issues",
             "/mcps",

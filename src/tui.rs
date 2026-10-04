@@ -4974,6 +4974,14 @@ fn restore_session(
     if !session.provider_name.is_empty() && !session.model.is_empty() {
         switch_provider(agent, ui, settings, &session.provider_name, &session.model)?;
     }
+    apply_session_state(session, agent, ui);
+    Ok(())
+}
+
+/// Point the agent's context and the scrollback at a session's stored
+/// state (used by `/resume` and by a fork that rewound to an earlier
+/// message).
+fn apply_session_state(session: &Session, agent: &mut Agent, ui: &mut Ui) {
     agent.messages = session.messages.clone();
     agent.pinned = session.pinned.clone();
     ui.entries = session
@@ -4990,7 +4998,6 @@ fn restore_session(
         })
         .collect();
     ui.scroll = 0;
-    Ok(())
 }
 
 fn ask_line(ui: &mut Ui, label: &str, default: &str) -> Result<Option<String>> {
@@ -5306,6 +5313,20 @@ async fn available_models(agent: &Agent, settings: &Settings) -> Vec<(String, St
 fn mentions_ctf(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("flag{") || lower.contains("ctf") || lower.contains("challenge")
+}
+
+/// `/fork [name]` branches at the current end; `/fork <n> [name]` keeps the
+/// first `n` messages — the numbers `/history` prints. A leading token that
+/// is not a number is the fork's name.
+fn parse_fork_args(args: &str) -> (Option<usize>, String) {
+    let mut tokens = args.split_whitespace();
+    match tokens.next() {
+        Some(token) => match token.parse::<usize>() {
+            Ok(keep) => (Some(keep), tokens.collect::<Vec<_>>().join(" ")),
+            Err(_) => (None, args.to_string()),
+        },
+        None => (None, String::new()),
+    }
 }
 
 async fn run_command(
@@ -6121,31 +6142,55 @@ async fn run_command(
                 ui.push(Speaker::System, format!("Resumed {}", session.name));
             }
         }
+        "/history" => {
+            if agent.messages.is_empty() {
+                ui.push(Speaker::System, "No messages yet.".to_string());
+            } else {
+                let mut lines = crate::session::history(&agent.messages);
+                lines.push("Fork back to any message with /fork <n> [name]".to_string());
+                ui.push(Speaker::System, lines.join("\n"));
+            }
+        }
         "/fork" => {
             // Keep the current session on disk, then continue in a copy of
             // it: both sides share the history up to this point and diverge
-            // from here.
+            // from here. `/fork <n> [name]` branches from message n instead
+            // of the current end (pi-mono fork-at-message); /history lists
+            // the numbers.
             save_session(session, agent, ui, &session_dir)?;
             let parent = session.name.clone();
-            let mut forked = Session::fresh();
-            forked.parent = Some(parent.clone());
-            forked.summary = format!("Fork of {parent}");
-            forked.messages = session.messages.clone();
-            forked.transcript = session.transcript.clone();
-            forked.pinned = session.pinned.clone();
-            forked.provider_name = session.provider_name.clone();
-            forked.model = session.model.clone();
-            if !args.is_empty() {
-                if let Err(error) = forked.rename(&session_dir, args) {
+            let (keep, name) = parse_fork_args(args);
+            let partial = keep.is_some_and(|keep| keep < session.messages.len());
+            let mut forked = match session.branch(keep) {
+                Ok(forked) => forked,
+                Err(error) => {
+                    ui.push(Speaker::System, format!("{error:#}"));
+                    return Ok(());
+                }
+            };
+            if !name.is_empty() {
+                if let Err(error) = forked.rename(&session_dir, &name) {
                     ui.push(Speaker::System, format!("{error:#}"));
                     return Ok(());
                 }
             }
             *session = forked;
+            if partial {
+                // A rewound context needs a rewound scrollback: drop the
+                // row-keyed tool/timeline state, then reload the shorter
+                // transcript the fork rebuilt from its kept messages.
+                ui.clear_transcript();
+                apply_session_state(session, agent, ui);
+            }
             save_session(session, agent, ui, &session_dir)?;
             ui.push(
                 Speaker::System,
-                format!("Forked {parent} into {}", session.name),
+                match keep {
+                    Some(keep) => {
+                        format!("Forked {parent} into {} at message {keep}", session.name)
+                    }
+                    None => format!("Forked {parent} into {}", session.name),
+                },
             );
         }
         "/tree" => {
@@ -6894,6 +6939,16 @@ mod tests {
         assert_eq!(format_duration_ms(320), "320ms");
         assert_eq!(format_duration_ms(8_400), "8.4s");
         assert_eq!(format_duration_ms(125_000), "2m5s");
+    }
+
+    #[test]
+    fn fork_args_split_a_message_number_from_the_name() {
+        assert_eq!(parse_fork_args(""), (None, String::new()));
+        assert_eq!(parse_fork_args("backup"), (None, "backup".to_string()));
+        assert_eq!(parse_fork_args("4"), (Some(4), String::new()));
+        assert_eq!(parse_fork_args("4 backup"), (Some(4), "backup".to_string()));
+        // A name that merely starts with digits stays a name.
+        assert_eq!(parse_fork_args("3x"), (None, "3x".to_string()));
     }
 
     #[test]

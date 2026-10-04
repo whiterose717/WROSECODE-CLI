@@ -751,3 +751,60 @@ fn a_forked_run_records_the_session_it_forked_from() {
         "the fork never recorded its parent session"
     );
 }
+
+#[test]
+fn fork_at_a_message_keeps_only_the_prefix_of_the_context() {
+    let server = spawn(vec![completion("TRUNC-OK")]);
+    let sandbox = Sandbox::new("fork-at", &server.url(""));
+    let seed = serde_json::json!({
+        "name": "seed",
+        "created": 1,
+        "summary": "seeded history",
+        "provider_name": "mock",
+        "model": "mock-model",
+        "messages": [
+            {"role": "user", "content": [{"Text": "K1"}]},
+            {"role": "assistant", "content": [{"Text": "A1"}]},
+            {"role": "user", "content": [{"Text": "K2"}]}
+        ],
+        "transcript": [],
+    });
+    sandbox.file("seed.json", &seed.to_string());
+    let imported = headless(&sandbox, "import", &["--import-session", "seed.json"]);
+    assert!(imported.status.success(), "session import failed");
+
+    // Keep only the first message: A1 and K2 must not reach the branch.
+    let output = headless(
+        &sandbox,
+        "keep going",
+        &["--session", "seed", "--fork-at", "1"],
+    );
+    assert_task_complete(&output, "TRUNC-OK");
+
+    let dir = sandbox.home.join(".wrosecode/sessions");
+    let mut forked: Option<serde_json::Value> = None;
+    for entry in std::fs::read_dir(&dir).expect("sessions dir") {
+        let path = entry.expect("session entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read session")).unwrap();
+        if stored["parent"].as_str() == Some("seed") {
+            forked = Some(stored);
+        }
+    }
+    let forked = forked.expect("no forked session was written");
+    let messages = forked["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages.len(),
+        3,
+        "kept prefix + prompt + response: {forked}"
+    );
+    assert_eq!(messages[0]["content"][0]["Text"], "K1");
+    assert!(
+        !forked["messages"].to_string().contains("A1")
+            && !forked["messages"].to_string().contains("K2"),
+        "a truncated-away message leaked into the fork: {forked}"
+    );
+}

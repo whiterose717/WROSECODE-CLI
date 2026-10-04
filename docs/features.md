@@ -41,8 +41,10 @@ everything not marked is implemented and covered by tests.
 - Session persistence in SQLite plus the JSON files under
   `~/.wrosecode/sessions/` (both written by every run, so headless sessions
   show up in the TUI pickers), export/import via `--export-session` /
-  `--import-session`, `/fork [name]` and `--session ID --fork` to branch off
-  a saved conversation, and `/tree` to render the fork forest with the active
+  `--import-session`, `/fork [name]` or `/fork <n> [name]` (headless:
+  `--session ID --fork` / `--fork-at N`; `/history` prints the message
+  numbers) to branch off a saved conversation from its end or from any
+  earlier message, and `/tree` to render the fork forest with the active
   session marked.
 - Engagement coverage checklists (PentesterFlow): `.wrosecode/coverage.json`
   holds what has and has not been tested; the `coverage` tool (`list`, `add`,
@@ -151,7 +153,6 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: open-interpreter opt-in OS tools; pi-mono fork at an
-arbitrary message; plus the deliberate non-adopts (scheduled recipes,
-aider two-model mode and per-model edit formats, client-side MCP requests)
-noted per project.
+items there: open-interpreter opt-in OS tools; plus the deliberate
+non-adopts (scheduled recipes, aider two-model mode and per-model edit
+formats, client-side MCP requests) noted per project.

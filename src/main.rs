@@ -122,6 +122,9 @@ struct Cli {
     session: Option<String>,
     #[arg(long)]
     fork: bool,
+    /// Fork --session at message N instead of its end (implies --fork)
+    #[arg(long, value_name = "N", requires = "session")]
+    fork_at: Option<usize>,
     #[arg(long)]
     export_session: Option<PathBuf>,
     #[arg(long)]
@@ -412,19 +415,24 @@ async fn main() -> Result<()> {
         let loaded = store
             .load_session(id)?
             .with_context(|| format!("session {id} was not found"))?;
-        agent.messages = loaded.messages.clone();
-        agent.pinned = loaded.pinned.clone();
-        Some(if cli.fork {
-            let mut forked = session::Session::fresh();
-            forked.parent = Some(loaded.name.clone());
-            forked.summary = format!("Fork of {}", loaded.name);
-            forked.pinned = loaded.pinned;
-            forked.messages = loaded.messages;
-            forked.transcript = loaded.transcript;
-            forked
+        if cli.fork || cli.fork_at.is_some() {
+            // `--fork` branches at the current end; `--fork-at N` keeps the
+            // first N messages (the 1-based numbers the TUI `/history`
+            // prints) so the new session starts earlier.
+            let forked = loaded
+                .branch(cli.fork_at)
+                .with_context(|| match cli.fork_at {
+                    Some(keep) => format!("--fork-at {keep}"),
+                    None => format!("--session {id} --fork"),
+                })?;
+            agent.messages = forked.messages.clone();
+            agent.pinned = forked.pinned.clone();
+            Some(forked)
         } else {
-            loaded
-        })
+            agent.messages = loaded.messages.clone();
+            agent.pinned = loaded.pinned.clone();
+            Some(loaded)
+        }
     } else {
         None
     };
