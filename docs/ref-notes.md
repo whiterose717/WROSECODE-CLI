@@ -12,7 +12,7 @@ it a poor fit.
 | Submission/event protocol | Partial | `Progress` events plus `--summary json` / `exec --json` emit one `TaskComplete`. **TODO** a framed submission stream (start/step/result) for embedding clients. |
 | `apply_patch` | Not implemented | **TODO** — `edit_file` does exact-match replacement; a unified-diff apply tool is the missing multi-hunk path. |
 | Sandbox + approval as independent knobs | Adopted | `[sandbox] engine = none\|docker` is separate from `Permission::Ask\|AutoSafe\|Yolo`; both are read from config and overridable per run. |
-| AGENTS.md chain | Not implemented | **TODO** — project context currently comes from `WROSECODE.md` (`/init`) and `skills/`; a parent-directory `AGENTS.md` walk is missing. |
+| AGENTS.md chain | Adopted | `project::instruction_chain` walks `AGENTS.md` from the filesystem root down to the project, appends `WROSECODE.md`, caps each file at 8 KB and the chain at 32 KB, and injects it into every system prompt (`tests/e2e_headless.rs::agents_md_chain_reaches_the_system_prompt`). |
 | Auto-compaction | Not implemented | **TODO** — long sessions grow without bound; `/compact` does not exist yet. |
 | `exec --json` | Adopted | `wrosecode exec --json`, asserted in `tests/e2e_headless.rs`. |
 | `resume` | Adopted | `--session ID` (+ `--fork`), `/sessions`, `latest`. |

@@ -200,3 +200,111 @@ pub fn slop_candidates(
         .cloned()
         .collect())
 }
+
+/// Per-file cap for the instruction chain: one runaway guide cannot eat the
+/// context window on its own.
+pub const INSTRUCTION_FILE_CAP: usize = 8 * 1024;
+
+/// Total cap across every file in the chain.
+pub const CHAIN_CAP: usize = 32 * 1024;
+
+/// The Codex-style instruction chain: `AGENTS.md` from the filesystem root
+/// down to the project directory, then the project's `WROSECODE.md` (what
+/// `/init` writes). Outer guides come first so the project's own notes win
+/// by sitting closest to the agent's rules; each file is truncated at
+/// [`INSTRUCTION_FILE_CAP`] and the whole chain at [`CHAIN_CAP`].
+pub fn instruction_chain(root: &Path) -> String {
+    let mut sections = Vec::new();
+    let mut total = 0_usize;
+    let mut push = |title: String, body: String, sections: &mut Vec<String>| {
+        if body.trim().is_empty() || total >= CHAIN_CAP {
+            return;
+        }
+        let mut body = body;
+        if body.len() > INSTRUCTION_FILE_CAP {
+            let mut cut = INSTRUCTION_FILE_CAP;
+            while cut > 0 && !body.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            body.truncate(cut);
+            body.push_str("\n… (truncated)");
+        }
+        let room = CHAIN_CAP.saturating_sub(total);
+        if body.len() > room {
+            let mut cut = room;
+            let text = body.clone();
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            body = text[..cut].to_string();
+            body.push_str("\n… (truncated)");
+        }
+        total += body.len();
+        sections.push(format!("## Instructions from {title}\n{body}"));
+    };
+
+    let mut dirs: Vec<&Path> = root.ancestors().collect();
+    dirs.reverse();
+    for dir in dirs {
+        let guide = dir.join("AGENTS.md");
+        if let Ok(body) = std::fs::read_to_string(&guide) {
+            push(guide.display().to_string(), body, &mut sections);
+        }
+    }
+    let guide = root.join("WROSECODE.md");
+    if let Ok(body) = std::fs::read_to_string(&guide) {
+        push(guide.display().to_string(), body, &mut sections);
+    }
+    sections.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wrose-instructions-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn instruction_chain_orders_outer_guides_before_the_project() {
+        let outer = scratch("chain");
+        let inner = outer.join("project");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(outer.join("AGENTS.md"), "outer rules").unwrap();
+        std::fs::write(inner.join("AGENTS.md"), "project rules").unwrap();
+        std::fs::write(inner.join("WROSECODE.md"), "guide rules").unwrap();
+
+        let chain = instruction_chain(&inner);
+        let outer_at = chain.find("outer rules").expect("outer guide present");
+        let project_at = chain.find("project rules").expect("project guide present");
+        let guide_at = chain.find("guide rules").expect("WROSECODE.md present");
+        assert!(outer_at < project_at && project_at < guide_at, "{chain}");
+        assert!(
+            chain.contains(&inner.join("WROSECODE.md").display().to_string()),
+            "{chain}"
+        );
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn instruction_chain_caps_runaway_guides() {
+        let root = scratch("cap");
+        std::fs::write(root.join("AGENTS.md"), "x".repeat(INSTRUCTION_FILE_CAP * 4)).unwrap();
+        let chain = instruction_chain(&root);
+        assert!(chain.len() <= CHAIN_CAP + 64, "len {}", chain.len());
+        assert!(chain.contains("truncated"), "{chain}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn instruction_chain_without_guides_is_empty() {
+        let root = scratch("empty");
+        assert_eq!(instruction_chain(&root), "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

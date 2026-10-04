@@ -47,6 +47,10 @@ pub struct Agent {
     pub metrics: Metrics,
     pub task_results: Arc<Mutex<HashMap<String, String>>>,
     pub store: crate::store::Store,
+    /// The Codex-style instruction chain (`AGENTS.md` ancestors +
+    /// `WROSECODE.md`), read once at startup and injected into every system
+    /// prompt.
+    pub instructions: String,
 }
 
 impl Agent {
@@ -147,6 +151,7 @@ impl Agent {
             metrics: Metrics::load(&config.root),
             task_results: Arc::new(Mutex::new(HashMap::new())),
             store: crate::store::Store::open_default()?,
+            instructions: crate::project::instruction_chain(&config.root),
         })
     }
 
@@ -208,6 +213,7 @@ impl Agent {
                 started_at: Instant::now(),
                 metrics: self.metrics.clone(),
                 task_results: self.task_results.clone(),
+                instructions: self.instructions.clone(),
                 store: self.store.clone(),
             };
             let summary = child.run(&task).await?;
@@ -347,9 +353,18 @@ impl Agent {
                     }
                 })
                 .unwrap_or_default();
+            let instructions = if self.instructions.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Project instructions (AGENTS.md chain):\n{}\n",
+                    self.instructions
+                )
+            };
             let system = format!(
-                "{}\nProject: {}\nMode: {}\nCTF category: {}\nThinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
+                "{}\n{}Project: {}\nMode: {}\nCTF category: {}\nThinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
                 self.harness.prompt(),
+                instructions,
                 self.config.root.display(),
                 self.mode,
                 self.ctf.category,
@@ -647,6 +662,7 @@ impl Agent {
                                 metrics: metrics.clone(),
                                 task_results: task_results.clone(),
                                 store,
+                                instructions: crate::project::instruction_chain(&config.root),
                             };
                             let result = child.run(task).await;
                             if let Ok(summary) = &result {

@@ -27,6 +27,9 @@ everything not marked is implemented and covered by tests.
   destructive tools always prompt unless `yolo`.
 - Sandbox engine `none | docker` (`[sandbox]`), an independent knob from the
   approval policy; timeouts and output caps in `run_with_timeout`.
+- Instruction chain: `AGENTS.md` from the filesystem root down to the project
+  plus `WROSECODE.md` (`/init`) is injected into every system prompt, each file
+  capped at 8 KB and the chain at 32 KB (`project::instruction_chain`).
 - Harness prompt styles `minimal | swe | claude` (`src/harness.rs`).
 - Thinking levels `off|low|medium|high|max|auto` with per-provider control
   (`thinking.budget_tokens`, `reasoning_effort`) and a one-shot 400 fallback.
@@ -75,8 +78,7 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: Codex submission/event protocol, `apply_patch`, AGENTS.md chain,
-auto-compaction; opencode markdown agents/commands, `/undo` `/redo`, LSP
+items there: Codex submission/event protocol, `apply_patch`, auto-compaction; opencode markdown agents/commands, `/undo` `/redo`, LSP
 feedback, session tree; goose recipes + HTTP MCP + planner/worker models;
 aider repo-map ranking, auto-commit loop, `/add` `/drop`, two-model mode,
 edit formats; open-interpreter multi-language runner and opt-in OS tools;

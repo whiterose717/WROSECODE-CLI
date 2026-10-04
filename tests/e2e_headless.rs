@@ -286,3 +286,32 @@ fn exec_json_emits_the_dashboard_snapshot() {
     assert_eq!(value["provider"], "mock", "{stdout}");
     assert_eq!(value["model"], "mock-model", "{stdout}");
 }
+
+#[test]
+fn agents_md_chain_reaches_the_system_prompt() {
+    let server = spawn(vec![completion("CHAIN-OK")]);
+    let sandbox = Sandbox::new("instructions", &server.url(""));
+    sandbox.file("AGENTS.md", "always answer with the marker ALFA-91");
+    sandbox.file("WROSECODE.md", "project guide marker BRAVO-42");
+
+    let output = headless(&sandbox, "hi", &[]);
+    assert_task_complete(&output, "CHAIN-OK");
+
+    let requests = server.requests();
+    let first = &requests[0];
+    assert!(
+        first.body.contains("ALFA-91"),
+        "AGENTS.md never reached the system prompt: {}",
+        first.body
+    );
+    assert!(
+        first.body.contains("BRAVO-42"),
+        "WROSECODE.md never reached the system prompt: {}",
+        first.body
+    );
+    assert!(
+        first.body.contains("Project instructions"),
+        "chain header missing: {}",
+        first.body
+    );
+}
