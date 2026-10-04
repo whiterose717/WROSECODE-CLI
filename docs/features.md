@@ -22,7 +22,12 @@ everything not marked is implemented and covered by tests.
   `burp_import`/`burp_export`, `archive_writeup`, `search_writeups`,
   `update_plan`, `delegate_task` (parallel child agents with stable `task_id`,
   resume, provider/model routing).
-- MCP: stdio servers configured in `providers.toml`. **TODO** HTTP/SSE MCP.
+- MCP: both transports the spec defines. stdio servers (a binary plus
+  arguments) and streamable-HTTP endpoints (a `url` plus optional request
+  headers) configured in `~/.wrosecode/mcps.toml` / `/mcps add`. The HTTP
+  client posts JSON-RPC, captures the server's `Mcp-Session-Id`, and reads
+  replies that arrive as one JSON document or as an SSE `data:` stream;
+  the handshake and `tools/list`/`tools/call` are shared with stdio.
 - Permission tiers `ask / auto-safe / yolo` (`Permission` in `src/config.rs`),
   destructive tools always prompt unless `yolo`.
 - Sandbox engine `none | docker` (`[sandbox]`), an independent knob from the
@@ -130,9 +135,8 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: opencode LSP
-feedback, session tree; goose HTTP MCP + planner/worker models;
-aider auto-commit loop; open-interpreter opt-in OS tools;
-pi-mono packages + session branching;
-PentesterFlow coverage checklists, plus the deliberate non-adopts (scheduled
-recipes, aider two-model mode and per-model edit formats) noted per project.
+items there: goose planner/worker model split; aider git auto-commit;
+open-interpreter opt-in OS tools; pi-mono packages install + fork at an
+arbitrary message; plus the deliberate non-adopts (scheduled recipes,
+aider two-model mode and per-model edit formats, client-side MCP requests)
+noted per project.

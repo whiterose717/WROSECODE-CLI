@@ -6719,18 +6719,33 @@ async fn mcp_command(
         let Some(name) = ask_line(ui, "MCP server name", "")? else {
             return Ok(());
         };
-        let Some(bin) = ask_line(ui, "MCP executable", "")? else {
+        let Some(url) = ask_line(ui, "MCP endpoint URL (blank = local executable)", "")? else {
             return Ok(());
         };
-        let Some(arguments) = ask_line(ui, "MCP arguments (space separated)", "")? else {
-            return Ok(());
+        let def = if url.trim().is_empty() {
+            let Some(bin) = ask_line(ui, "MCP executable", "")? else {
+                return Ok(());
+            };
+            let Some(arguments) = ask_line(ui, "MCP arguments (space separated)", "")? else {
+                return Ok(());
+            };
+            McpServerDef {
+                name: name.clone(),
+                bin,
+                args: arguments.split_whitespace().map(str::to_owned).collect(),
+                url: None,
+                headers: std::collections::BTreeMap::new(),
+            }
+        } else {
+            McpServerDef {
+                name: name.clone(),
+                bin: String::new(),
+                args: Vec::new(),
+                url: Some(url.trim().to_string()),
+                headers: std::collections::BTreeMap::new(),
+            }
         };
-        let def = McpServerDef {
-            name: name.clone(),
-            bin,
-            args: arguments.split_whitespace().map(str::to_owned).collect(),
-        };
-        let mcp = crate::tools::mcp::Mcp::connect(&def.bin, &def.args).await?;
+        let mcp = crate::tools::mcp::Mcp::connect_def(&def).await?;
         settings.upsert_mcp(def)?;
         agent.tools.mcps.retain(|(server, _)| server != &name);
         agent.tools.mcps.push((name.clone(), mcp));
@@ -6741,8 +6756,9 @@ async fn mcp_command(
     for def in &settings.mcps {
         if let Some((_, mcp)) = agent.tools.mcps.iter().find(|(name, _)| name == &def.name) {
             lines.push(format!(
-                "{}: connected — {}",
+                "{}: connected ({}) — {}",
                 def.name,
+                def.endpoint(),
                 mcp.schemas
                     .iter()
                     .filter_map(|s| s["name"].as_str())

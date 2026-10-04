@@ -28,9 +28,26 @@ pub struct ProviderProfile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpServerDef {
     pub name: String,
+    /// The server binary for the stdio transport. Empty when `url` is set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bin: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Streamable-HTTP endpoint (the goose MCP-as-HTTP parity): when set it
+    /// wins over `bin` and every message goes out as a POST.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Extra request headers for the HTTP transport (Authorization, API
+    /// keys) — kept out of the stdio path, which never sees a network.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl McpServerDef {
+    /// How `/mcps` and friends should name this server's endpoint.
+    pub fn endpoint(&self) -> &str {
+        self.url.as_deref().unwrap_or(&self.bin)
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -597,6 +614,58 @@ pub fn redact(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mcps_accept_a_url_endpoint_or_a_binary_but_not_both() {
+        let dir = std::env::temp_dir().join(format!("wrose-mcp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mcps.toml"),
+            r#"
+[[servers]]
+name = "remote"
+url = "https://example.com/mcp"
+[servers.headers]
+Authorization = "Bearer tok"
+
+[[servers]]
+name = "local"
+bin = "mcp-server"
+args = ["--stdio"]
+"#,
+        )
+        .unwrap();
+        let settings = Settings::load_at(dir.clone()).unwrap();
+        let remote = settings.mcps.iter().find(|s| s.name == "remote").unwrap();
+        assert_eq!(remote.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(remote.endpoint(), "https://example.com/mcp");
+        assert!(remote.bin.is_empty());
+        assert_eq!(
+            remote.headers.get("Authorization").map(String::as_str),
+            Some("Bearer tok")
+        );
+        let local = settings.mcps.iter().find(|s| s.name == "local").unwrap();
+        assert!(local.url.is_none());
+        assert_eq!(local.endpoint(), "mcp-server");
+
+        // Round-trip through save_mcps: the URL form keeps bin out of the file.
+        let mut settings = settings;
+        settings
+            .upsert_mcp(McpServerDef {
+                name: "remote".into(),
+                bin: String::new(),
+                args: Vec::new(),
+                url: Some("https://example.com/v2/mcp".into()),
+                headers: BTreeMap::from([("x-api-key".into(), "k".into())]),
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(dir.join("mcps.toml")).unwrap();
+        assert!(text.contains("https://example.com/v2/mcp"), "{text}");
+        assert!(text.contains("x-api-key"), "{text}");
+        assert!(!text.contains("[[servers]]\nbin = \"\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn validation_and_format_preservation() {
         assert_eq!(

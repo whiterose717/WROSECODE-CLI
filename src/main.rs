@@ -416,7 +416,7 @@ async fn main() -> Result<()> {
         ));
     }
     for server in &settings.mcps {
-        if let Ok(mcp) = tools::mcp::Mcp::connect(&server.bin, &server.args).await {
+        if let Ok(mcp) = tools::mcp::Mcp::connect_def(server).await {
             agent.tools.mcps.push((server.name.clone(), mcp));
         }
     }

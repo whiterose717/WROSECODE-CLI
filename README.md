@@ -363,7 +363,7 @@ With an interactive terminal, `wrosecode` opens a full-screen chat UI showing th
 
 The `delegate_task` tool can select a different `provider` and `model` for a child task. Supported provider names are `anthropic`, `openai-compat`, `ollama`, and `lm-studio`.
 
-Attach an MCP stdio server for one run with `--mcp-bin PATH` and repeated `--mcp-arg ARG` flags. `/mcps add` saves additional servers in `~/.wrosecode/mcps.toml`; they reconnect at startup. Tools are exposed to the model as `mcp__SERVER__TOOL`.
+Attach an MCP stdio server for one run with `--mcp-bin PATH` and repeated `--mcp-arg ARG` flags. `/mcps add` saves additional servers in `~/.wrosecode/mcps.toml`; they reconnect at startup. The same file takes remote servers over the streamable-HTTP transport: give the entry a `url = "https://…/mcp"` instead of a `bin`, plus an optional `[servers.headers]` table for `Authorization` or API keys — `/mcps add` prompts for the URL when you prefer the TUI. The client posts JSON-RPC, keeps the server's `Mcp-Session-Id`, and accepts either a JSON body or an SSE stream for replies. Tools are exposed to the model as `mcp__SERVER__TOOL`.
 
 Release installers are `install.sh` and `install.ps1`. Set `WROSECODE_RELEASE_BASE` to the URL of your published binary assets before using them; no release host is configured in this source tree.
 
