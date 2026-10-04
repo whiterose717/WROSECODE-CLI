@@ -10,6 +10,7 @@ use std::process::{Command, Output};
 struct Sandbox {
     home: PathBuf,
     root: PathBuf,
+    envs: Vec<(String, String)>,
 }
 
 impl Sandbox {
@@ -35,7 +36,17 @@ key_ref = "env:WROSECODE_MOCK_API_KEY"
             ),
         )
         .unwrap();
-        Self { home, root }
+        Self {
+            home,
+            root,
+            envs: Vec::new(),
+        }
+    }
+
+    /// Extra environment for the run, e.g. `WROSECODE_COMPACT_CHARS`.
+    fn env(&mut self, key: &str, value: &str) -> &mut Self {
+        self.envs.push((key.into(), value.into()));
+        self
     }
 
     fn file(&self, name: &str, contents: &str) -> PathBuf {
@@ -73,6 +84,9 @@ fn headless(sandbox: &Sandbox, prompt: &str, extra: &[&str]) -> Output {
         ])
         .args(extra)
         .arg(prompt);
+    for (key, value) in &sandbox.envs {
+        command.env(key, value);
+    }
     command.output().expect("run wrosecode")
 }
 
@@ -397,5 +411,71 @@ fn a_turn_that_changes_nothing_leaves_no_snapshot() {
             .join(".wrosecode/snapshots/undo/000001")
             .exists(),
         "a read-only turn must not create an undo snapshot"
+    );
+}
+
+#[test]
+fn a_large_resumed_history_is_compacted_before_the_turn() {
+    let server = spawn(vec![
+        completion("SUMMARY-MARKER-OK"),
+        completion("ANSWER-AFTER-COMPACT"),
+    ]);
+    let mut sandbox = Sandbox::new("compact", &server.url(""));
+    sandbox.env("WROSECODE_COMPACT_CHARS", "64");
+    let messages: Vec<serde_json::Value> = (0..6)
+        .map(|index| {
+            serde_json::json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": [{
+                    "Text": if index == 0 {
+                        "SEED-MARKER-ALFA: rewrite the parser".to_string()
+                    } else {
+                        format!("turn {index} of an old conversation")
+                    }
+                }]
+            })
+        })
+        .collect();
+    let session = serde_json::json!({
+        "name": "big",
+        "created": 1,
+        "summary": "seeded history",
+        "provider_name": "mock",
+        "model": "mock-model",
+        "messages": messages,
+        "transcript": [],
+    });
+    sandbox.file("big.json", &session.to_string());
+
+    let imported = headless(&sandbox, "import", &["--import-session", "big.json"]);
+    assert!(imported.status.success(), "session import failed");
+
+    let output = headless(&sandbox, "continue the task", &["--session", "big"]);
+    assert_task_complete(&output, "ANSWER-AFTER-COMPACT");
+
+    let requests = server.requests();
+    assert!(
+        requests.len() >= 2,
+        "expected a compaction call then the turn, got {}",
+        requests.len()
+    );
+    let summarizer = &requests[0].body;
+    assert!(
+        summarizer.contains("compaction engine"),
+        "no compaction request: {summarizer}"
+    );
+    assert!(
+        summarizer.contains("SEED-MARKER-ALFA"),
+        "history never reached the summarizer: {summarizer}"
+    );
+
+    let turn = &requests[1].body;
+    assert!(
+        turn.contains("SUMMARY-MARKER-OK"),
+        "summary missing from the turn: {turn}"
+    );
+    assert!(
+        !turn.contains("SEED-MARKER-ALFA"),
+        "history was not replaced by the summary: {turn}"
     );
 }

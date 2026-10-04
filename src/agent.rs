@@ -16,6 +16,18 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
 
+/// Transcript size (characters) at which the next turn summarizes the
+/// conversation first: roughly 45k tokens of history, well inside every model
+/// we ship. `WROSECODE_COMPACT_CHARS` overrides it (smaller context windows,
+/// and the end-to-end test).
+const DEFAULT_COMPACT_AT_CHARS: usize = 180_000;
+/// Auto-compaction only fires once a conversation is long enough to be worth
+/// summarizing; `/compact` bypasses this.
+const MIN_COMPACT_MESSAGES: usize = 6;
+/// Per-message cap on what the summarizer is shown, so one huge tool result
+/// cannot crowd out the rest of the history.
+const SUMMARY_INPUT_CAP: usize = 6_000;
+
 pub struct Agent {
     pub config: Arc<Config>,
     pub provider: Arc<dyn Provider>,
@@ -51,6 +63,9 @@ pub struct Agent {
     /// `WROSECODE.md`), read once at startup and injected into every system
     /// prompt.
     pub instructions: String,
+    /// Transcript size (characters) that triggers auto-compaction before the
+    /// next request; see `WROSECODE_COMPACT_CHARS`.
+    pub compact_at_chars: usize,
 }
 
 impl Agent {
@@ -152,10 +167,12 @@ impl Agent {
             task_results: Arc::new(Mutex::new(HashMap::new())),
             store: crate::store::Store::open_default()?,
             instructions: crate::project::instruction_chain(&config.root),
+            compact_at_chars: threshold_from_env(),
         })
     }
 
     pub async fn turn(&mut self, text: &str) -> Result<String> {
+        self.compact_if_needed().await;
         if !self.ctf.category_locked() {
             self.ctf.category = crate::ctf::categorize(&self.config.root, text);
         }
@@ -214,6 +231,7 @@ impl Agent {
                 metrics: self.metrics.clone(),
                 task_results: self.task_results.clone(),
                 instructions: self.instructions.clone(),
+                compact_at_chars: self.compact_at_chars,
                 store: self.store.clone(),
             };
             let summary = child.run(&task).await?;
@@ -226,6 +244,70 @@ impl Agent {
             });
         }
         self.run(text).await
+    }
+
+    /// True once the conversation has outgrown `compact_at_chars` and the
+    /// next turn should summarize it first.
+    pub fn needs_compact(&self) -> bool {
+        self.messages.len() >= MIN_COMPACT_MESSAGES
+            && transcript_chars(&self.messages) > self.compact_at_chars
+    }
+
+    /// Auto-compaction: summarize a large history before the new request goes
+    /// out (Codex auto-compaction, clai's state-preserving compaction). A
+    /// failed summary is never fatal — the turn proceeds with the history it
+    /// still has.
+    async fn compact_if_needed(&mut self) {
+        if self.needs_compact() && self.compact("auto").await.is_err() {
+            // Keep the conversation as it is; the provider will tell us if it
+            // no longer fits.
+        }
+    }
+
+    /// Summarize the conversation and replace it with that summary. The new
+    /// history is two messages — the summary as the latest user turn and an
+    /// acknowledgement — so the request that follows reads as a continuation.
+    /// Leaves the history untouched when the summarizer fails or returns
+    /// nothing.
+    pub async fn compact(&mut self, reason: &str) -> Result<String> {
+        if self.messages.is_empty() {
+            bail!("nothing to compact — the conversation is empty");
+        }
+        let before = transcript_chars(&self.messages);
+        let count = self.messages.len();
+        let history = summarise_input(&self.messages);
+        let response = self
+            .provider
+            .complete_with_think(COMPACT_SYSTEM, &history, &[], false, None, ThinkLevel::Off)
+            .await?;
+        self.usage.add(response.usage);
+        let summary = text_of(response.content);
+        let summary = summary.trim();
+        if summary.is_empty() {
+            bail!("the summarizer returned an empty summary");
+        }
+        let summary: String = summary.chars().take(32_000).collect();
+        self.messages = vec![
+            Message {
+                role: "user".into(),
+                content: vec![Content::Text(format!(
+                    "This conversation was compacted to fit the context window \
+                     ({reason}: {before} characters, {count} messages). What follows \
+                     summarizes everything so far — treat it as the full history and \
+                     continue from it.\n\n{summary}"
+                ))],
+            },
+            Message {
+                role: "assistant".into(),
+                content: vec![Content::Text(
+                    "Understood — continuing from that summary.".into(),
+                )],
+            },
+        ];
+        let after = transcript_chars(&self.messages);
+        Ok(format!(
+            "compacted {before} → {after} characters ({count} messages → 2)"
+        ))
     }
 
     /// The concrete level for the next provider call: `auto` resolves to its
@@ -691,6 +773,7 @@ impl Agent {
                                 task_results: task_results.clone(),
                                 store,
                                 instructions: crate::project::instruction_chain(&config.root),
+                                compact_at_chars: threshold_from_env(),
                             };
                             let result = child.run(task).await;
                             if let Ok(summary) = &result {
@@ -969,9 +1052,98 @@ async fn auto_commit(root: &std::path::Path, paths: &[String], summary: &str) ->
     Ok(())
 }
 
+/// The summarizer's instructions (Codex compaction, clai's state-preserving
+/// summary): what to keep, in what order, and nothing else.
+const COMPACT_SYSTEM: &str = "You are the compaction engine inside a coding agent. \
+    Read the conversation below and rewrite it as one dense plain-text summary the \
+    agent can continue from. Keep, in this order: (1) the user's goals and every \
+    constraint or preference they stated; (2) project state — files read, edited, \
+    created or deleted, and the decisions or contents that matter for what comes \
+    next; (3) what has been verified so far and what is still unverified; (4) errors \
+    and how each was resolved; (5) decisions made, including anything deliberately \
+    skipped; (6) the most recent user request, verbatim. Plain text only: no \
+    preamble, no commentary, no markdown headings.";
+
+/// Approximate conversation size as the provider will see it.
+fn transcript_chars(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .map(|content| match content {
+            Content::Text(text) => text.len(),
+            Content::Result { output, .. } => output.len(),
+            Content::Call(call) => call.input.to_string().len(),
+        })
+        .sum()
+}
+
+/// The history handed to the summarizer: the whole conversation, with every
+/// text run capped so one giant tool result cannot crowd out the rest.
+fn summarise_input(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| Message {
+            role: message.role.clone(),
+            content: message
+                .content
+                .iter()
+                .map(|content| match content {
+                    Content::Text(text) => Content::Text(cap_text(text)),
+                    Content::Result {
+                        id,
+                        output,
+                        is_error,
+                    } => Content::Result {
+                        id: id.clone(),
+                        output: cap_text(output),
+                        is_error: *is_error,
+                    },
+                    Content::Call(call) => Content::Call(call.clone()),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn cap_text(text: &str) -> String {
+    if text.chars().count() <= SUMMARY_INPUT_CAP {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(SUMMARY_INPUT_CAP).collect();
+    format!("{head}\n…[truncated to {SUMMARY_INPUT_CAP} characters]")
+}
+
+/// The plain-text part of a completion.
+fn text_of(content: Vec<Content>) -> String {
+    content
+        .into_iter()
+        .filter_map(|content| match content {
+            Content::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `WROSECODE_COMPACT_CHARS`, or the default threshold.
+fn threshold_from_env() -> usize {
+    std::env::var("WROSECODE_COMPACT_CHARS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_COMPACT_AT_CHARS)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::task_requires_tool;
+    use super::*;
+    use crate::config::Permission;
+    use crate::provider::Response;
+    use crate::sandbox::SandboxPolicy;
+    use crate::store::Store;
+    use async_trait::async_trait;
+    use std::path::Path;
+    use std::sync::Mutex;
 
     #[test]
     fn action_requests_require_a_tool_but_chat_does_not() {
@@ -979,5 +1151,204 @@ mod tests {
         assert!(task_requires_tool("fix the scroll bug"));
         assert!(!task_requires_tool("hii"));
         assert!(!task_requires_tool("explain Rust ownership"));
+    }
+
+    /// Records what the summarizer was asked and answers with a fixed summary.
+    struct MockProvider {
+        seen: Mutex<Vec<(String, String)>>,
+    }
+
+    impl MockProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+        fn requests(&self) -> Vec<(String, String)> {
+            self.seen.lock().expect("mock lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        async fn chat_stream_with_think(
+            &self,
+            system: &str,
+            messages: &[Message],
+            _tools: &[serde_json::Value],
+            _require_tool: bool,
+            _progress: Option<&mpsc::UnboundedSender<Progress>>,
+            _think: ThinkLevel,
+        ) -> anyhow::Result<Response> {
+            let flat = messages
+                .iter()
+                .map(|message| format!("{}: {}", message.role, text_of(message.content.clone())))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.seen
+                .lock()
+                .expect("mock lock")
+                .push((system.to_string(), flat));
+            Ok(Response {
+                content: vec![Content::Text(
+                    "SUMMARY-TOKEN-99: the user wants the parser rewritten.".into(),
+                )],
+                usage: Usage {
+                    input: 5,
+                    output: 7,
+                    ..Usage::default()
+                },
+            })
+        }
+
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec!["mock-model".into()])
+        }
+    }
+
+    fn agent_with_mock(root: &Path) -> (Agent, Arc<MockProvider>) {
+        let config = Arc::new(Config {
+            root: root.to_path_buf(),
+            permission: Permission::Yolo,
+            model: "mock-model".into(),
+            provider: "mock".into(),
+            harness: "minimal".into(),
+            repair_retries: 0,
+            check_command: None,
+            skill_dirs: Vec::new(),
+            think: ThinkLevel::Medium,
+            thinking_level: 5,
+            max_parallel_tasks: 4,
+            shell_timeout_seconds: 30,
+            tool_retries: 1,
+            fallback_provider: String::new(),
+            fallback_model: String::new(),
+            redis_url: None,
+            budget_usd: 0.0,
+            qdrant_url: None,
+            ui_theme: "dark".into(),
+            verbosity: "normal".into(),
+            alternate_screen: true,
+            mouse_capture: Some("auto".into()),
+            alert_bell: false,
+            smooth_scroll_lines: 1,
+            sandbox: SandboxPolicy::default(),
+        });
+        let provider = MockProvider::new();
+        let client = reqwest::Client::new();
+        let agent = Agent {
+            config: config.clone(),
+            provider: provider.clone() as Arc<dyn Provider>,
+            tools: Tools::new(config.clone(), client),
+            harness: Harness::Claude,
+            messages: Vec::new(),
+            repo_map: Arc::new(Mutex::new(RepoMap::default())),
+            memory: Memory::new(&config.root),
+            skills: HashMap::new(),
+            event_tx: None,
+            mode: "build".into(),
+            active_skill: None,
+            last_api_latency: None,
+            ctf: CtfEngine::new(&config.root),
+            think: ThinkLevel::Medium,
+            thinking_level: 5,
+            think_fail_streak: 0,
+            auto_escalated: false,
+            last_turn_reasoning: 0,
+            usage: Usage::default(),
+            model_turns: 0,
+            started_at: Instant::now(),
+            metrics: Metrics::load(&config.root),
+            task_results: Arc::new(Mutex::new(HashMap::new())),
+            store: Store::open(&config.root.join("state.db")).expect("store"),
+            instructions: String::new(),
+            compact_at_chars: DEFAULT_COMPACT_AT_CHARS,
+        };
+        (agent, provider)
+    }
+
+    fn seed(agent: &mut Agent) {
+        for index in 0..3 {
+            agent.messages.push(Message {
+                role: "user".into(),
+                content: vec![Content::Text(format!(
+                    "SEED-MARKER-{index}: rewrite the parser, keep the CLI stable"
+                ))],
+            });
+            agent.messages.push(Message {
+                role: "assistant".into(),
+                content: vec![Content::Text(format!("working on step {index}"))],
+            });
+        }
+    }
+
+    fn joined(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .map(|message| text_of(message.content.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn compaction_replaces_the_history_with_a_summary() {
+        let root =
+            std::env::temp_dir().join(format!("wrosecode-compact-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut agent, provider) = agent_with_mock(&root);
+        seed(&mut agent);
+
+        let report = agent.compact("test").await.expect("compact");
+        assert!(report.contains("compacted"), "{report}");
+        assert!(report.contains("characters"), "{report}");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "one summarizer call");
+        let (system, history) = &requests[0];
+        assert!(system.contains("compaction engine"), "{system}");
+        assert!(history.contains("SEED-MARKER-0"), "history not sent");
+        assert!(history.contains("rewrite the parser"), "history not sent");
+
+        assert_eq!(agent.messages.len(), 2, "summary + acknowledgement");
+        let after = joined(&agent.messages);
+        assert!(after.contains("SUMMARY-TOKEN-99"), "{after}");
+        assert!(after.contains("compacted"), "{after}");
+        assert!(!after.contains("SEED-MARKER-1"), "old turns survived");
+        assert_eq!(agent.usage.input, 5, "summarizer usage is accounted");
+        assert_eq!(agent.usage.output, 7);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_conversation_has_nothing_to_compact() {
+        let root =
+            std::env::temp_dir().join(format!("wrosecode-compact-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut agent, provider) = agent_with_mock(&root);
+        assert!(agent.compact("test").await.is_err());
+        assert!(provider.requests().is_empty(), "no call was made");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn needs_compact_respects_size_and_length_thresholds() {
+        let root =
+            std::env::temp_dir().join(format!("wrosecode-compact-needs-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut agent, _provider) = agent_with_mock(&root);
+        agent.compact_at_chars = 100;
+
+        seed(&mut agent);
+        assert!(agent.needs_compact(), "six messages over the threshold");
+
+        agent.compact_at_chars = 10_000_000;
+        assert!(!agent.needs_compact(), "under the threshold");
+
+        agent.compact_at_chars = 1;
+        agent.messages.truncate(2);
+        assert!(!agent.needs_compact(), "too short to be worth summarizing");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

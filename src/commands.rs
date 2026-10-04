@@ -57,6 +57,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "List, add, or remove MCP servers",
     },
     CommandSpec {
+        name: "/compact",
+        category: "Session",
+        description: "Summarize the conversation to free context",
+    },
+    CommandSpec {
         name: "/clear",
         category: "Session",
         description: "Clear the transcript (add --context to also drop conversation context)",
@@ -258,6 +263,7 @@ mod tests {
         for name in [
             "/agents",
             "/clear",
+            "/compact",
             "/commit",
             "/connect",
             "/ctf",

@@ -5745,6 +5745,16 @@ async fn run_command(
                 Err(error) => ui.push(Speaker::System, format!("Writeup failed: {error:#}")),
             }
         }
+        "/compact" => {
+            ui.status = "Compacting context".into();
+            ui.render()?;
+            let outcome = agent.compact("/compact").await;
+            ui.status = "Ready".into();
+            match outcome {
+                Ok(message) => ui.push(Speaker::System, message),
+                Err(error) => ui.push(Speaker::System, format!("compaction failed: {error:#}")),
+            }
+        }
         "/diff" => {
             let diff = project::diff(&agent.config.root)?;
             ui.push(

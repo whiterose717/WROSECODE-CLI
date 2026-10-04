@@ -13,7 +13,7 @@ it a poor fit.
 | `apply_patch` | Adopted | `tools::patch` parses `*** Begin Patch` documents (`Update`/`Add`/`Delete`, `*** Move to:`), applies every hunk with an exactly-once match, and validates the whole document before writing anything. Scope-checked per touched path, requires a prior read, blocked in plan mode, and feeds the check loop (`tests/e2e_headless.rs::apply_patch_adds_a_file_and_the_model_sees_the_result`). |
 | Sandbox + approval as independent knobs | Adopted | `[sandbox] engine = none\|docker` is separate from `Permission::Ask\|AutoSafe\|Yolo`; both are read from config and overridable per run. |
 | AGENTS.md chain | Adopted | `project::instruction_chain` walks `AGENTS.md` from the filesystem root down to the project, appends `WROSECODE.md`, caps each file at 8 KB and the chain at 32 KB, and injects it into every system prompt (`tests/e2e_headless.rs::agents_md_chain_reaches_the_system_prompt`). |
-| Auto-compaction | Not implemented | **TODO** — long sessions grow without bound; `/compact` does not exist yet. |
+| Auto-compaction | Adopted | `Agent::compact` summarizes the history whenever `needs_compact()` fires — at the start of every `turn`, past `compact_at_chars` (180k characters, `WROSECODE_COMPACT_CHARS` overrides) and six messages — replacing it with the summary plus an acknowledgement; the summarizer sees each message capped at 6k characters, its usage is accounted, and a failed summary leaves the history untouched. `/compact` forces a pass. Covered by `agent::tests::compaction_replaces_the_history_with_a_summary` and `tests/e2e_headless.rs::a_large_resumed_history_is_compacted_before_the_turn`. |
 | `exec --json` | Adopted | `wrosecode exec --json`, asserted in `tests/e2e_headless.rs`. |
 | `resume` | Adopted | `--session ID` (+ `--fork`), `/sessions`, `latest`. |
 | Profiles | Adopted | `settings::Settings` profiles with model, think, think_map. |
@@ -77,7 +77,7 @@ it a poor fit.
 | --- | --- | --- |
 | Containerised runtime | Adopted | `[sandbox] engine = "docker"`, persistent container, `/workspace` bind mount. |
 | Stuck detector | Adopted | Empty/repeated replies raise thinking, rotate the category hypothesis, force a fresh context (CTF autopilot). |
-| Context condenser | Not implemented | **TODO** — tied to Codex auto-compaction. |
+| Context condenser | Adopted | The same mechanism as Codex auto-compaction (`Agent::compact` + `/compact`); the trigger here is transcript size rather than token-depth percentage, and the stuck detector still handles repeated-reply depth separately. |
 | Keyword-triggered microagents | Not implemented | **TODO** — `skills::match_skill` picks the closest skill per prompt but has no keyword gating. |
 | Delegation to child agents | Adopted | `delegate_task`. |
 | Headless browser tool | Adopted | `browser_capture`. |
