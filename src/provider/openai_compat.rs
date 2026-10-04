@@ -67,6 +67,10 @@ impl Provider for OpenAiCompat {
         progress: Option<&tokio::sync::mpsc::UnboundedSender<Progress>>,
         think: ThinkLevel,
     ) -> anyhow::Result<Response> {
+        // Splice the agent's volatile-tail boundary back into one block:
+        // OpenAI-style prefix caches match on byte identity and the stable
+        // part already leads the text.
+        let system = system.replace(super::SYSTEM_VOLATILE_MARK, "\n");
         let mut wire = vec![json!({"role":"system","content":system})];
         for message in messages {
             let text = message
@@ -215,7 +219,7 @@ impl Provider for OpenAiCompat {
             bail!("provider returned an empty streamed response");
         }
         if usage.input == 0 && usage.output == 0 {
-            usage = estimate_usage(system, messages, &content);
+            usage = estimate_usage(&system, messages, &content);
         }
         Ok(Response { content, usage })
     }

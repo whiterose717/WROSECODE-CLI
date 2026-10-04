@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the same gates CI runs, locally, in order, stopping at the first failure.
-#   ./scripts/check.sh            # fmt + clippy + tests + release build
-#   ./scripts/check.sh quick      # skip the release build
+#   ./scripts/check.sh            # fmt + clippy + tests + speed budgets + release build
+#   ./scripts/check.sh quick      # skip the speed budgets and the release build
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,6 +19,9 @@ step "cargo test --all-targets"
 cargo test --all-targets
 
 if [[ "${1:-}" != "quick" ]]; then
+    step "cargo test --release benchmarks (speed budgets)"
+    cargo test --release benchmarks -- --nocapture
+
     step "cargo build --release"
     cargo build --release
 fi

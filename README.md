@@ -11,6 +11,11 @@ install -Dm755 target/release/wrosecode ~/.local/bin/wrosecode
 wrosecode --permission yolo
 ```
 
+For a fully static Linux binary with no glibc dependency, run
+`./scripts/build-musl.sh` (it needs `rustup target add
+x86_64-unknown-linux-musl` and `musl-tools` for `musl-gcc`) and install
+`target/x86_64-unknown-linux-musl/release/wrosecode` instead.
+
 Rust was chosen for low input latency, predictable memory use, a single native binary, and direct terminal control. The architecture combines a differential TUI, streamed provider adapters, durable sessions, MCP tools, repository maps, skills, permission tiers, and parallel tool execution.
 
 ## CTF dashboard
@@ -406,6 +411,7 @@ it should, so a section cannot silently stop being read again.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
+cargo test --release benchmarks -- --nocapture   # speed budgets (also in ./scripts/check.sh and CI)
 ```
 
 Three layers run in that one command:
@@ -418,6 +424,10 @@ Three layers run in that one command:
 
 The end-to-end tests bind `127.0.0.1` on an ephemeral port, point the child
 process at a temporary `HOME`, and never touch the network or a real provider.
+
+The release-mode budgets in `src/benchmarks.rs` (output shaping, SSE
+draining, repo-map build) fail on regressions; `./scripts/benchmark.sh`
+records test-suite latency and corpus size to `.ctf/reports/benchmark.json`.
 
 ## Permissions
 

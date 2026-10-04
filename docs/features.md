@@ -1,7 +1,7 @@
 # Features
 
-What WROSECODE ships today. Gaps that Phase 6 must close are marked **TODO**;
-everything not marked is implemented and covered by tests.
+What WROSECODE ships today. Everything here is implemented and covered by
+tests unless a line says otherwise.
 
 ## Surfaces
 
@@ -151,6 +151,56 @@ everything not marked is implemented and covered by tests.
   command steps run the author's own shell, `{{prev}}`/`{{steps}}` hand later
   steps the bounded output of earlier ones, and `--goal`/`--until`/
   `--summary json`/`--events` behave exactly as they do for a prompt run.
+
+## Performance (Phase 7)
+
+- Cold start: the splash is painted before provider setup, skill discovery,
+  MCP reconnects, and session restore, so startup never waits on the network.
+  The measured first-paint time is stamped into the frame, must stay inside
+  the 50 ms budget (`splash::FIRST_PAINT_BUDGET_MS`, pinned by a unit test),
+  and the PTY run in `tests/e2e_tui.rs` fails if the splash stops being the
+  first frame or drifts past 250 ms on a debug CI build.
+- Release profile: fat LTO, `codegen-units = 1`, `opt-level = 3`, stripped
+  symbols, and `panic = "abort"` — the panic hook restores the terminal and
+  writes the crash report *before* the abort, and nothing catches panics, so
+  the hook plus abort composes. `./scripts/build-musl.sh` additionally
+  produces a static `x86_64-unknown-linux-musl` build (static-pie, no glibc).
+- One shared `reqwest` client with HTTP/2 (`http2` feature), connection
+  pooling (`pool_max_idle_per_host = 8`), and sane connect/request timeouts
+  feeds the provider, tools, and agent — no per-call TLS handshakes.
+- SSE parsing buffers incrementally and drains complete `data:` events with a
+  bounded scan (the CRLF pass only runs up to the LF hit), so a long stream
+  stays linear instead of re-scanning the buffer on every event.
+- Parallel tool execution: a batch of tool calls runs under a dynamic
+  semaphore (1 / 3 / 5 slots by thinking level, capped by `max_parallel_tasks`).
+- Result cache for `read_file`/`grep`/`glob` and matching read-only shell
+  results, plus a loop detector: the fourth byte-identical `(name, input)`
+  call in a row with no other tool in between fails locally with a "loop
+  detected" message instead of burning another round-trip (streak resets per
+  user query).
+- Output shaping: ANSI/progress escapes stripped, consecutive duplicate
+  lines collapsed, and long output split into head + tail under per-tool byte
+  caps (`tools::truncate`).
+- Stable cacheable prompt prefix: the system prompt is assembled as a
+  byte-stable block (harness, overlay, AGENTS.md chain, pins, session
+  constants, rules) followed by a boundary marker and a volatile tail (think
+  level, recall, repo map, skill). The Anthropic adapter turns the boundary
+  into a `cache_control` breakpoint so only the stable block is cached;
+  OpenAI-compatible providers splice the marker back into one text so
+  prefix-identity caches still hit.
+- Benchmarks with regression budgets in `src/benchmarks.rs` (output shaping
+  of 20k ANSI lines ≤ 100 ms, draining 1000 SSE events ≤ 50 ms, a cold
+  repo-map walk ≤ 2 s). They run in release mode from `./scripts/check.sh`
+  and CI (`cargo test --release benchmarks`) and fail the build when a hot
+  path regresses; dev runs only print the timings. `scripts/benchmark.sh`
+  additionally records test-suite latency and corpus size to
+  `.ctf/reports/benchmark.json`.
+- Deliberate adaptations: criterion was not pulled in for three numbers —
+  the budgets are plain release tests (fewer moving parts, same CI gate);
+  and speculatively dispatching the first read-only tool call while the
+  response is still streaming was skipped, because batches already start
+  the moment the response completes and dispatching mid-stream would race
+  tool ordering, permissions, and the snapshot step for a marginal win.
 
 ## Reference-project gap list
 

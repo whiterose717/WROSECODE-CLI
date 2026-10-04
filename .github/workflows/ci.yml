@@ -16,4 +16,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
+      # Phase 7 speed budgets: release-mode regression gate (src/benchmarks.rs)
+      - run: cargo test --release benchmarks -- --nocapture
       - run: cargo build --release --locked

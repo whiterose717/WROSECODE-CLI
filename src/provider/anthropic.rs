@@ -64,6 +64,19 @@ impl Anthropic {
         require_tool: bool,
         think: ThinkLevel,
     ) -> Value {
+        // The agent marks the stable/volatile split in the system prompt;
+        // turn it into a prompt-cache breakpoint: the stable block carries
+        // `cache_control` and the volatile tail rides after it unmarked, so
+        // recall/repo-map/skill/think changes never bust the cached prefix.
+        let system = match system.split_once(super::SYSTEM_VOLATILE_MARK) {
+            Some((stable, volatile)) if stable.trim().is_empty() => json!(volatile),
+            Some((stable, volatile)) if volatile.trim().is_empty() => json!(stable),
+            Some((stable, volatile)) => json!([
+                {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": volatile},
+            ]),
+            None => json!(system),
+        };
         let mut body = json!({"model":self.model,"max_tokens":8192,"system":system,
             "messages":Self::messages(messages),"tools":tools,"stream":true});
         if require_tool && !tools.is_empty() {
@@ -299,6 +312,32 @@ enum StreamBlock {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn the_system_split_becomes_a_prompt_cache_breakpoint() {
+        let provider = Anthropic {
+            client: reqwest::Client::new(),
+            key: "test".into(),
+            model: "test".into(),
+            endpoint: "http://127.0.0.1:0".into(),
+            headers: BTreeMap::new(),
+            think_map: None,
+        };
+        let marked = format!(
+            "stable prefix{}volatile tail",
+            crate::provider::SYSTEM_VOLATILE_MARK
+        );
+        let body = provider.body(&marked, &[], &[], false, ThinkLevel::Off);
+        let blocks = body["system"].as_array().expect("split into blocks");
+        assert_eq!(blocks.len(), 2, "{body}");
+        assert_eq!(blocks[0]["text"], "stable prefix");
+        assert_eq!(blocks[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(blocks[1]["text"], "volatile tail");
+
+        // Probe/compact calls carry no marker and stay a plain string.
+        let plain = provider.body("Connection test.", &[], &[], false, ThinkLevel::Off);
+        assert_eq!(plain["system"], json!("Connection test."));
+    }
 
     #[tokio::test]
     async fn parses_streamed_tool_call() {

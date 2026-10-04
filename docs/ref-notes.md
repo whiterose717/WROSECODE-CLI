@@ -104,5 +104,8 @@ Inspected 2026-10-04 (README + tree).
 | One-shot natural language → shell | Not implemented | There is no one-shot mode and no `--dry-run` preview: `--prompt` runs the full agent loop, and `--plan` is the read-only substitute for "just show me what you would do". |
 
 Deliberately skipped: provider/key sprawl and OAuth sign-in flows (we keep
-`providers.toml` + env/keyring keys), persistent PTY REPL sessions, and the
-`rtk` output rewriter (output shaping is Phase 7 work in our own code).
+`providers.toml` + env/keyring keys) and persistent PTY REPL sessions. The
+`rtk` output rewriter was taken instead as our own output shaping — ANSI and
+progress-bar stripping, consecutive-line dedupe, a head+tail split under
+per-tool byte caps (`tools::truncate`) — described under Performance in
+`docs/features.md`.

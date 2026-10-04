@@ -91,6 +91,15 @@ pub struct Response {
     pub usage: Usage,
 }
 
+/// Boundary between the byte-stable prefix of a system prompt and its
+/// volatile tail (think level, memory recall, repo map, matched skill).
+/// The agent emits the marker; the Anthropic transport turns it into a
+/// prompt-cache breakpoint (`cache_control` on the stable block, volatile
+/// block after it) and every other transport splices it back into a single
+/// text block. Prompt caches key on byte-identical prefixes, so everything
+/// before this marker must stay constant for the life of the session.
+pub const SYSTEM_VOLATILE_MARK: &str = "\n\u{1}wrose:volatile\u{1}\n";
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Chat with an explicit thinking level (spec PHASE 4): concrete levels
@@ -263,10 +272,20 @@ pub fn take_sse_event(pending: &mut Vec<u8>) -> Option<String> {
         .windows(2)
         .position(|window| window == b"\n\n")
         .map(|index| (index, 2));
-    let crlf = pending
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4));
+    // A CRLF separator that could beat the LF hit must start at or before
+    // index-3 (byte-compatible overlaps end there), so bound the second
+    // scan to that prefix: without the bound every drain of a long
+    // CRLF-free buffer re-scans all of it (O(n²) per stream).
+    let crlf = {
+        let limit = match lf {
+            Some((index, _)) => pending.len().min(index + 3),
+            None => pending.len(),
+        };
+        pending[..limit]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| (index, 4))
+    };
     let (end, separator) = match (lf, crlf) {
         (Some(a), Some(b)) => {
             if a.0 < b.0 {
@@ -399,5 +418,59 @@ mod integration_tests {
     #[tokio::test]
     async fn anthropic_custom_lifecycle() {
         lifecycle("anthropic").await;
+    }
+}
+
+#[cfg(test)]
+mod sse_event_tests {
+    use super::take_sse_event;
+
+    #[test]
+    fn drains_lf_terminated_events() {
+        let mut pending = b"data: {\"i\":1}\n\ndata: {\"i\":2}\n\n".to_vec();
+        assert_eq!(
+            take_sse_event(&mut pending).as_deref(),
+            Some("data: {\"i\":1}")
+        );
+        assert_eq!(
+            take_sse_event(&mut pending).as_deref(),
+            Some("data: {\"i\":2}")
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn drains_crlf_terminated_events() {
+        let mut pending = b"data: x\r\n\r\n".to_vec();
+        assert_eq!(take_sse_event(&mut pending).as_deref(), Some("data: x"));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn crlf_before_a_later_lf_wins_the_earlier_separator() {
+        let mut pending = b"data: a\r\n\r\ndata: b\n\n".to_vec();
+        assert_eq!(take_sse_event(&mut pending).as_deref(), Some("data: a"));
+        assert_eq!(take_sse_event(&mut pending).as_deref(), Some("data: b"));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn an_incomplete_event_stays_buffered() {
+        let mut pending = b"data: half".to_vec();
+        assert_eq!(take_sse_event(&mut pending), None);
+        assert_eq!(pending, b"data: half".to_vec());
+        pending.extend_from_slice(b"\n\n");
+        assert_eq!(take_sse_event(&mut pending).as_deref(), Some("data: half"));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_boundary_overlapping_crlf_still_beats_the_lf() {
+        // \r\n\r\n immediately followed by \n\n: the CRLF starts first and
+        // must win even though it byte-overlaps the LF hit by three.
+        let mut pending = b"\r\n\r\n\n\n".to_vec();
+        assert_eq!(take_sse_event(&mut pending).as_deref(), Some(""));
+        assert_eq!(take_sse_event(&mut pending).as_deref(), Some(""));
+        assert!(pending.is_empty());
     }
 }

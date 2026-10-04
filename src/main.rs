@@ -3,6 +3,8 @@ mod agent;
 mod api;
 mod attach;
 mod autopilot;
+#[cfg(test)]
+mod benchmarks;
 mod commands;
 mod config;
 mod coverage;

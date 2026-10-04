@@ -10,7 +10,7 @@ use crate::think::{auto_think, AutoAction, ThinkLevel};
 use crate::tools::{self, Tools};
 use anyhow::{bail, Result};
 use futures::future::join_all;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -52,6 +52,10 @@ pub struct Agent {
     pub thinking_level: u8,
     /// Consecutive tool-failure steps in `auto` (escalates at 3).
     think_fail_streak: u8,
+    /// The last three dispatched tool calls as `(name, canonical JSON
+    /// input)` for the current query — a fourth identical call in a row
+    /// trips the loop detector (see [`Agent::register_call`]).
+    recent_calls: VecDeque<(String, String)>,
     /// An `auto` escalation is still awaiting its progress step.
     auto_escalated: bool,
     /// Reasoning tokens of the most recent model turn, for the dashboard.
@@ -275,6 +279,7 @@ impl Agent {
             think: config.think,
             thinking_level: config.thinking_level,
             think_fail_streak: 0,
+            recent_calls: VecDeque::new(),
             auto_escalated: false,
             last_turn_reasoning: 0,
             usage: Usage::default(),
@@ -343,6 +348,7 @@ impl Agent {
                 think: self.think,
                 thinking_level: self.thinking_level,
                 think_fail_streak: 0,
+                recent_calls: VecDeque::new(),
                 auto_escalated: false,
                 last_turn_reasoning: 0,
                 usage: Usage::default(),
@@ -549,7 +555,32 @@ impl Agent {
         }
     }
 
+    /// Slide a dispatched call through the loop detector. Input is
+    /// canonicalised as sorted-key JSON (`serde_json` map ordering), and
+    /// the ring keeps the last three `(name, input)` pairs: the fourth
+    /// identical call in a row with no other tool in between reports
+    /// `true` so the caller can fail it instead of burning another
+    /// round-trip on a stuck model. The streak resets every user query.
+    fn register_call(&mut self, call: &ToolCall) -> bool {
+        let key = (call.name.clone(), call.input.to_string());
+        let looped = self.recent_calls.len() >= 3
+            && self
+                .recent_calls
+                .iter()
+                .rev()
+                .take(3)
+                .all(|last| *last == key);
+        self.recent_calls.push_back(key);
+        while self.recent_calls.len() > 3 {
+            self.recent_calls.pop_front();
+        }
+        looped
+    }
+
     async fn run(&mut self, query: &str) -> Result<String> {
+        // The loop detector is per query: a repeated setup across user
+        // turns is not a stuck model.
+        self.recent_calls.clear();
         let mut last_text = String::new();
         let mut repairs = 0;
         let mut used_tools_this_turn = false;
@@ -611,8 +642,14 @@ impl Agent {
                 )
             };
             let pinned = self.pinned_context();
-            let system = format!(
-                "{}\n{}{}{}Project: {}\nMode: {}\nCTF category: {}\nThinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
+            // Byte-stable prefix first: harness, agent overlay, AGENTS.md
+            // chain, pins, and session constants stay identical between
+            // requests so prompt caches (Anthropic `cache_control`,
+            // OpenAI-style automatic prefix caching) can hit. The volatile
+            // tail — think level, recall, repo map, skill — follows the
+            // boundary marker.
+            let stable = format!(
+                "{}\n{}{}{}Project: {}\nMode: {}\nCTF category: {}\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\n",
                 self.harness.prompt(),
                 overlay,
                 instructions,
@@ -620,11 +657,18 @@ impl Agent {
                 self.config.root.display(),
                 self.mode,
                 self.ctf.category,
+            );
+            let volatile = format!(
+                "Thinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
                 self.thinking_level,
                 self.think.name(),
                 memory,
                 map,
                 skill_text
+            );
+            let system = format!(
+                "{stable}{}{volatile}",
+                crate::provider::SYSTEM_VOLATILE_MARK
             );
             if let Some(tx) = &self.event_tx {
                 let _ = tx.send(Progress::ResetText);
@@ -727,6 +771,15 @@ impl Agent {
                     }
                 })
                 .collect();
+            // Loop detector: the fourth identical (name, input) call in a
+            // row fails locally with a clear message instead of burning
+            // another identical round-trip.
+            let mut looped = HashSet::new();
+            for call in &calls {
+                if self.register_call(call) {
+                    looped.insert(call.id.clone());
+                }
+            }
             let text = response
                 .content
                 .iter()
@@ -844,7 +897,18 @@ impl Agent {
                 let store = store.clone();
                 let agent_system = agent_system.clone();
                 let agent_name = agent_name.clone();
+                let looped = looped.clone();
                 async move {
+                    if looped.contains(&call.id) {
+                        return (
+                            call.id.clone(),
+                            Err(anyhow::anyhow!(
+                                "loop detected: the identical `{}` call has now run three times in a row with no change — try a different approach",
+                                call.name
+                            )),
+                            0,
+                        );
+                    }
                     let _permit = parallel_limit.acquire_owned().await.ok();
                     let started = Instant::now();
                     let result = if call.name == "delegate_task" {
@@ -938,6 +1002,7 @@ impl Agent {
                                 think,
                                 thinking_level: live_level,
                                 think_fail_streak: 0,
+                                recent_calls: VecDeque::new(),
                                 auto_escalated: false,
                                 last_turn_reasoning: 0,
                                 usage: Usage::default(),
@@ -1677,6 +1742,7 @@ mod tests {
             think: ThinkLevel::Medium,
             thinking_level: 5,
             think_fail_streak: 0,
+            recent_calls: VecDeque::new(),
             auto_escalated: false,
             last_turn_reasoning: 0,
             usage: Usage::default(),
@@ -1743,6 +1809,81 @@ mod tests {
         assert!(!after.contains("SEED-MARKER-1"), "old turns survived");
         assert_eq!(agent.usage.input, 5, "summarizer usage is accounted");
         assert_eq!(agent.usage.output, 7);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_system_prompt_marks_the_stable_volatile_boundary() {
+        let root =
+            std::env::temp_dir().join(format!("wrosecode-system-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut agent, provider) = agent_with_mock(&root);
+
+        agent.run("check the marker order").await.expect("run");
+
+        let requests = provider.requests();
+        let (system, _) = requests.last().expect("one request");
+        let (stable, volatile) = system
+            .split_once(crate::provider::SYSTEM_VOLATILE_MARK)
+            .expect("the agent must mark the stable/volatile boundary");
+        assert!(
+            stable.contains("Rules: Plan once silently"),
+            "rules belong to the stable prefix: {stable}"
+        );
+        assert!(
+            !stable.contains("Thinking level"),
+            "the think level busts the cache and belongs in the tail: {stable}"
+        );
+        assert!(
+            volatile.starts_with("Thinking level: 5/20"),
+            "volatile tail starts with the live think level: {volatile}"
+        );
+        assert!(volatile.contains("Relevant memory:"), "{volatile}");
+        assert!(volatile.contains("Repo map:"), "{volatile}");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn four_identical_calls_in_a_row_trip_the_loop_detector() {
+        let root = std::env::temp_dir().join(format!("wrosecode-loop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut agent, _provider) = agent_with_mock(&root);
+
+        let call = |id: &str| ToolCall {
+            id: id.to_string(),
+            name: "grep".into(),
+            input: serde_json::json!({"path": "src", "pattern": "flag{"}),
+        };
+        // Three identical calls are tolerated; the fourth trips.
+        assert!(!agent.register_call(&call("a")));
+        assert!(!agent.register_call(&call("b")));
+        assert!(!agent.register_call(&call("c")));
+        assert!(agent.register_call(&call("d")));
+        // A stuck model keeps tripping until it changes strategy...
+        assert!(agent.register_call(&call("e")));
+        // ...and one different call in between resets the streak: the
+        // next three identical calls pass again, the fourth trips.
+        let other = ToolCall {
+            id: "f".into(),
+            name: "glob".into(),
+            input: serde_json::json!({"pattern": "*.md"}),
+        };
+        assert!(!agent.register_call(&other));
+        assert!(!agent.register_call(&call("g")));
+        assert!(!agent.register_call(&call("h")));
+        assert!(!agent.register_call(&call("i")));
+        assert!(agent.register_call(&call("j")));
+        // Input is canonical JSON: key order must not matter.
+        let reordered = ToolCall {
+            id: "k".into(),
+            name: "grep".into(),
+            input: serde_json::json!({"pattern": "flag{", "path": "src"}),
+        };
+        assert!(agent.register_call(&reordered));
 
         std::fs::remove_dir_all(&root).unwrap();
     }
