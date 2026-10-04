@@ -66,7 +66,7 @@ it a poor fit.
 | --- | --- | --- |
 | Extension/skill/package system | Partial | Skills load from `skills/`, `.ctf/skills/`, `~/.wrosecode/skills/`. **TODO** install from git/path with versions and sandboxing. |
 | RPC/JSON mode | Adopted | `exec --json`, `--summary json`, `--web`. |
-| Session tree / branching | Not implemented | **TODO** — `--fork` copies a session; there is no tree view. |
+| Session tree / branching | Partial | `/fork [name]` and `--session ID --fork` branch a session (recording `parent`), `/tree` renders the forest from the JSON files with the active session marked, and headless runs now write those files too so every branch is listed. Forks happen at the current end of the conversation; branching back to an arbitrary earlier message is still missing. |
 | Steering-message queue | Adopted | Queued input while a turn runs, `Ctrl+C` cancels the turn only. |
 | Themes | Adopted | Six built-ins + user TOML palettes. |
 | Differential TUI rendering | Adopted | Frame-diff renderer, PTY-tested. |

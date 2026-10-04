@@ -264,7 +264,7 @@ async fn main() -> Result<()> {
     let store = store::Store::open_default()?;
     if let Some(path) = &cli.import_session {
         let imported = session::Session::load(path)?;
-        store.save_session(&imported)?;
+        persist_session(&store, &imported)?;
         println!("imported session {}", imported.name);
         return Ok(());
     }
@@ -391,6 +391,7 @@ async fn main() -> Result<()> {
         agent.pinned = loaded.pinned.clone();
         Some(if cli.fork {
             let mut forked = session::Session::fresh();
+            forked.parent = Some(loaded.name.clone());
             forked.summary = format!("Fork of {}", loaded.name);
             forked.pinned = loaded.pinned;
             forked.messages = loaded.messages;
@@ -498,7 +499,7 @@ async fn main() -> Result<()> {
             .transcript
             .push(("YOU".into(), format!("recipe {}", plan.name)));
         session.transcript.push(("WROSE".into(), response.clone()));
-        store.save_session(&session)?;
+        persist_session(&store, &session)?;
         if !verified && (cli.until.is_some() || cli.until_cmd.is_some() || cli.goal.is_some()) {
             std::process::exit(2);
         }
@@ -525,7 +526,7 @@ async fn main() -> Result<()> {
         session.provider_name = agent.config.provider.clone();
         session.model = agent.config.model.clone();
         session.summary = format!("ctf {}", options.target);
-        store.save_session(&session)?;
+        persist_session(&store, &session)?;
         // Spec 5.8: every autopilot run leaves `writeups/<challenge>.md`.
         let flags: Vec<String> = agent
             .ctf
@@ -646,7 +647,7 @@ async fn main() -> Result<()> {
         session.summary = prompt.chars().take(80).collect();
         session.transcript.push(("YOU".into(), prompt));
         session.transcript.push(("WROSE".into(), response.clone()));
-        store.save_session(&session)?;
+        persist_session(&store, &session)?;
         return Ok(());
     }
     if cli.headless {
@@ -830,6 +831,15 @@ fn print_outcome(
         eprintln!(" Saved    ~{} tokens via result cache", saved_bytes / 4);
         eprintln!("────────────────────────────────────────────────────────────");
     }
+}
+
+/// Persist a session both ways the app reads them: SQLite (what `--session`
+/// resumes) and the JSON file under `~/.wrosecode/sessions/` that `/sessions`
+/// and `/tree` list, so headless runs show up in the TUI like TUI ones do.
+fn persist_session(store: &store::Store, session: &session::Session) -> Result<()> {
+    store.save_session(session)?;
+    session.save(&session::Session::dir()?)?;
+    Ok(())
 }
 
 /// `--goal`, `--until`, and `--until-cmd` over a model answer — the same

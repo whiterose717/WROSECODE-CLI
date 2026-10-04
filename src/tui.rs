@@ -6093,7 +6093,7 @@ async fn run_command(
                 );
             }
         }
-        "/sessions" => {
+        "/sessions" | "/resume" => {
             save_session(session, agent, ui, &session_dir)?;
             let sessions = Session::list(&session_dir)?;
             let labels = sessions
@@ -6104,6 +6104,43 @@ async fn run_command(
                 *session = sessions[index].clone();
                 restore_session(session, agent, ui, settings)?;
                 ui.push(Speaker::System, format!("Resumed {}", session.name));
+            }
+        }
+        "/fork" => {
+            // Keep the current session on disk, then continue in a copy of
+            // it: both sides share the history up to this point and diverge
+            // from here.
+            save_session(session, agent, ui, &session_dir)?;
+            let parent = session.name.clone();
+            let mut forked = Session::fresh();
+            forked.parent = Some(parent.clone());
+            forked.summary = format!("Fork of {parent}");
+            forked.messages = session.messages.clone();
+            forked.transcript = session.transcript.clone();
+            forked.pinned = session.pinned.clone();
+            forked.provider_name = session.provider_name.clone();
+            forked.model = session.model.clone();
+            if !args.is_empty() {
+                if let Err(error) = forked.rename(&session_dir, args) {
+                    ui.push(Speaker::System, format!("{error:#}"));
+                    return Ok(());
+                }
+            }
+            *session = forked;
+            save_session(session, agent, ui, &session_dir)?;
+            ui.push(
+                Speaker::System,
+                format!("Forked {parent} into {}", session.name),
+            );
+        }
+        "/tree" => {
+            save_session(session, agent, ui, &session_dir)?;
+            let sessions = Session::list(&session_dir)?;
+            let lines = Session::tree(&sessions, &session.name);
+            if lines.is_empty() {
+                ui.push(Speaker::System, "No saved sessions yet".to_string());
+            } else {
+                ui.push(Speaker::System, lines.join("\n"));
             }
         }
         "/skills" => {
@@ -6157,7 +6194,7 @@ async fn run_command(
                 switch_provider(agent, ui, settings, &models[index].0, &models[index].1)?;
             }
         }
-        "/mcps" => {
+        "/mcps" | "/mcp" => {
             mcp_command(args, agent, ui, settings).await?;
         }
         "/editor" => {

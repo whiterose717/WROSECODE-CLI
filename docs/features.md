@@ -33,8 +33,12 @@ everything not marked is implemented and covered by tests.
 - Harness prompt styles `minimal | swe | claude` (`src/harness.rs`).
 - Thinking levels `off|low|medium|high|max|auto` with per-provider control
   (`thinking.budget_tokens`, `reasoning_effort`) and a one-shot 400 fallback.
-- Session persistence in SQLite (plus JSON export/import via
-  `--export-session` / `--import-session`).
+- Session persistence in SQLite plus the JSON files under
+  `~/.wrosecode/sessions/` (both written by every run, so headless sessions
+  show up in the TUI pickers), export/import via `--export-session` /
+  `--import-session`, `/fork [name]` and `--session ID --fork` to branch off
+  a saved conversation, and `/tree` to render the fork forest with the active
+  session marked.
 - Metrics: counters, per-model totals, latency histogram, `metrics.json`/csv.
 - Repo map (`src/repo_map.rs`): per-file symbols (syn for Rust, regex for
   other languages), mtime-cached, ranked by query relevance blended with a

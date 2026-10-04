@@ -708,3 +708,46 @@ fn recipe_list_prints_discoverable_recipes() {
     assert!(stdout.contains("Two-step audit"), "stdout: {stdout}");
     assert!(server.count() == 0, "recipe list should not call the model");
 }
+
+#[test]
+fn a_forked_run_records_the_session_it_forked_from() {
+    let server = spawn(vec![completion("FORK-OK")]);
+    let sandbox = Sandbox::new("fork", &server.url(""));
+    let seed = serde_json::json!({
+        "name": "seed",
+        "created": 1,
+        "summary": "seeded history",
+        "provider_name": "mock",
+        "model": "mock-model",
+        "messages": [{
+            "role": "user",
+            "content": [{ "Text": "SEED-FROM: the original session" }]
+        }],
+        "transcript": [],
+    });
+    sandbox.file("seed.json", &seed.to_string());
+    let imported = headless(&sandbox, "import", &["--import-session", "seed.json"]);
+    assert!(imported.status.success(), "session import failed");
+
+    let output = headless(&sandbox, "keep going", &["--session", "seed", "--fork"]);
+    assert_task_complete(&output, "FORK-OK");
+
+    let dir = sandbox.home.join(".wrosecode/sessions");
+    let mut forked_parent = None;
+    for entry in std::fs::read_dir(&dir).expect("sessions dir") {
+        let path = entry.expect("session entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read session")).unwrap();
+        if stored["parent"].is_string() {
+            forked_parent = stored["parent"].as_str().map(str::to_string);
+        }
+    }
+    assert_eq!(
+        forked_parent.as_deref(),
+        Some("seed"),
+        "the fork never recorded its parent session"
+    );
+}
