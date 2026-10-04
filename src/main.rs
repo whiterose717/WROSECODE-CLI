@@ -10,6 +10,7 @@ mod ctf;
 mod ctfd;
 mod events;
 mod harness;
+mod markdown;
 mod memory;
 mod metrics;
 mod project;
@@ -85,6 +86,9 @@ struct Cli {
     /// PATH, or `-` for stdout
     #[arg(long, value_name = "PATH")]
     events: Option<PathBuf>,
+    /// Activate a user-defined agent from `.wrosecode/agents/<name>.md`
+    #[arg(long, value_name = "NAME")]
+    agent: Option<String>,
     #[arg(long)]
     summary: Option<String>,
     #[arg(long)]
@@ -348,6 +352,26 @@ async fn main() -> Result<()> {
             agent.tools.mcps.push((server.name.clone(), mcp));
         }
     }
+    if let Some(name) = cli.agent.as_deref() {
+        let user_agents = markdown::discover_agents(&agent.config.root);
+        match user_agents.iter().find(|candidate| candidate.name == name) {
+            Some(user) => agent.set_user_agent(user)?,
+            None => {
+                let available: Vec<&str> = user_agents
+                    .iter()
+                    .map(|candidate| candidate.name.as_str())
+                    .collect();
+                anyhow::bail!(
+                    "unknown agent `{name}` ({})",
+                    if available.is_empty() {
+                        "no .wrosecode/agents/*.md files found".to_string()
+                    } else {
+                        format!("available: {}", available.join(", "))
+                    }
+                );
+            }
+        }
+    }
     let mut event_sink = attach_events(&mut agent, cli.events.as_deref())?;
     if ctf_mode {
         // Spec PHASE 5: exit 0 verified, exit 2 budget-exhausted, exit 1
@@ -415,6 +439,9 @@ async fn main() -> Result<()> {
         return api::serve(agent, store, &cli.listen).await;
     }
     if let Some(prompt) = cli.prompt {
+        // A headless prompt that is a user command (`/ship the fix`) expands
+        // just like it does in the TUI.
+        let prompt = markdown::expand_prompt(&agent.config.root, &prompt);
         write_event(
             &event_sink,
             &events::start_frame(

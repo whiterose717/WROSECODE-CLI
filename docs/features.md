@@ -69,8 +69,11 @@ everything not marked is implemented and covered by tests.
 ## Agents and subagents
 
 - `/plan` and `/build` agents, `@`-less subagent routing via `delegate_task`.
-- **TODO** markdown user-defined agents and commands
-  (`.wrosecode/agents/*.md`, `.wrosecode/commands/*.md`) with frontmatter.
+- Markdown user-defined agents and commands with YAML frontmatter:
+  `.wrosecode/commands/*.md` expands `$ARGUMENTS` and runs as a turn (TUI and
+  `--headless`), shows in `/help` and the palette; `.wrosecode/agents/*.md`
+  contributes a system prompt, `mode:`, and `thinking:` selected through
+  `/agents` or `--agent NAME`, and dropped by switching to a built-in.
 
 ## Orchestration
 
@@ -94,7 +97,7 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: opencode markdown agents/commands, LSP
+items there: opencode LSP
 feedback, session tree; goose recipes + HTTP MCP + planner/worker models;
 aider repo-map ranking, auto-commit loop, `/add` `/drop`, two-model mode,
 edit formats; open-interpreter multi-language runner and opt-in OS tools;

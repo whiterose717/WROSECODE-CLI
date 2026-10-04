@@ -1,8 +1,36 @@
+use std::collections::BTreeMap;
+
 #[derive(Clone, Copy)]
 pub struct CommandSpec {
     pub name: &'static str,
     pub category: &'static str,
     pub description: &'static str,
+}
+
+/// One row of the command palette: a built-in spec or a user command from
+/// `.wrosecode/commands/*.md`, both rendered the same way.
+#[derive(Clone, Debug)]
+pub struct PaletteEntry {
+    pub name: String,
+    pub description: String,
+}
+
+impl From<&CommandSpec> for PaletteEntry {
+    fn from(spec: &CommandSpec) -> Self {
+        PaletteEntry {
+            name: spec.name.into(),
+            description: spec.description.into(),
+        }
+    }
+}
+
+impl From<&crate::markdown::UserCommand> for PaletteEntry {
+    fn from(command: &crate::markdown::UserCommand) -> Self {
+        PaletteEntry {
+            name: command.name.clone(),
+            description: command.description.clone(),
+        }
+    }
 }
 
 pub const COMMANDS: &[CommandSpec] = &[
@@ -208,7 +236,9 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-pub fn help() -> String {
+/// The `/help` listing: every built-in category, then the user's own commands
+/// from `.wrosecode/commands/*.md` grouped by their `category:` frontmatter.
+pub fn help(user: &[crate::markdown::UserCommand]) -> String {
     let mut output = String::new();
     for category in ["Agents", "Providers", "Session", "Project", "Skills"] {
         output.push_str(category);
@@ -221,15 +251,39 @@ pub fn help() -> String {
         }
         output.push('\n');
     }
+    if !user.is_empty() {
+        let mut groups: BTreeMap<&str, Vec<&crate::markdown::UserCommand>> = BTreeMap::new();
+        for command in user {
+            groups
+                .entry(command.category.as_str())
+                .or_default()
+                .push(command);
+        }
+        for (category, commands) in groups {
+            output.push_str(category);
+            output.push('\n');
+            for command in commands {
+                output.push_str(&format!("  {:<12} {}\n", command.name, command.description));
+            }
+            output.push('\n');
+        }
+    }
     output
 }
 
-pub fn filtered(query: &str) -> Vec<&'static CommandSpec> {
+/// Fuzzy matches for the palette: built-ins first, then the user's commands.
+pub fn filtered(query: &str, user: &[crate::markdown::UserCommand]) -> Vec<PaletteEntry> {
     let needle = query.trim_start_matches('/').to_ascii_lowercase();
-    let mut matches: Vec<_> = COMMANDS
-        .iter()
-        .filter_map(|command| fuzzy_score(command.name, &needle).map(|score| (score, command)))
-        .collect();
+    let mut matches: Vec<(usize, PaletteEntry)> = Vec::new();
+    matches.extend(
+        COMMANDS
+            .iter()
+            .filter_map(|command| fuzzy_score(command.name, &needle).map(|s| (s, command.into()))),
+    );
+    matches
+        .extend(user.iter().filter_map(|command| {
+            fuzzy_score(&command.name, &needle).map(|s| (s, command.into()))
+        }));
     matches.sort_by_key(|(score, command)| (*score, command.name.len()));
     matches.into_iter().map(|(_, command)| command).collect()
 }
@@ -257,6 +311,7 @@ pub fn lookup(input: &str) -> Option<&'static CommandSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::UserCommand;
 
     #[test]
     fn registry_contains_all_requested_commands() {
@@ -292,7 +347,38 @@ mod tests {
             "/writeup",
         ] {
             assert!(lookup(name).is_some(), "missing {name}");
-            assert!(help().contains(name));
+            assert!(help(&[]).contains(name));
         }
+    }
+
+    fn user_command(name: &str, description: &str) -> UserCommand {
+        UserCommand {
+            name: name.into(),
+            description: description.into(),
+            category: "User".into(),
+            body: "do it".into(),
+        }
+    }
+
+    #[test]
+    fn the_palette_shows_user_commands_beside_the_builtins() {
+        let user = [user_command("/ship", "Commit and push")];
+        let entries = filtered("s", &user);
+        assert!(
+            entries.iter().any(|entry| entry.name == "/ship"),
+            "user command missing from {entries:?}"
+        );
+        assert!(entries.iter().any(|entry| entry.name == "/skills"));
+        assert!(filtered("", &user).len() > filtered("", &[]).len());
+    }
+
+    #[test]
+    fn help_lists_user_commands_under_their_category() {
+        let mut command = user_command("/ship", "Commit and push");
+        command.category = "Release".into();
+        let output = help(&[command]);
+        assert!(output.contains("Release"));
+        assert!(output.contains("/ship"));
+        assert!(output.contains("Commit and push"));
     }
 }

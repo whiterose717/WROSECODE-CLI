@@ -512,3 +512,56 @@ fn events_flag_writes_a_framed_submission_stream() {
     assert_eq!(last["answer"], "STREAMED-ANSWER");
     assert_eq!(last["verified"], true);
 }
+
+#[test]
+fn a_user_agent_markdown_reaches_the_system_prompt() {
+    let server = spawn(vec![completion("AGENT-OK")]);
+    let sandbox = Sandbox::new("useragent", &server.url(""));
+    std::fs::create_dir_all(sandbox.root.join(".wrosecode/agents")).unwrap();
+    sandbox.file(
+        ".wrosecode/agents/reviewer.md",
+        "---\ndescription: Reviews diffs\nmode: plan\nthinking: deep\n---\nAlways quote the evidence marker MARK-77.\n",
+    );
+
+    let output = headless(&sandbox, "review this", &["--agent", "reviewer"]);
+    assert_task_complete(&output, "AGENT-OK");
+
+    let requests = server.requests();
+    let first = &requests[0];
+    assert!(
+        first.body.contains("MARK-77"),
+        "agent body never reached the system prompt: {}",
+        first.body
+    );
+    assert!(
+        first.body.contains("Active user agent (reviewer)"),
+        "agent header missing: {}",
+        first.body
+    );
+    assert!(
+        first.body.contains("Mode: plan"),
+        "the agent's mode: frontmatter was not applied: {}",
+        first.body
+    );
+}
+
+#[test]
+fn a_user_command_prompt_expands_before_the_turn() {
+    let server = spawn(vec![completion("SHIP-OK")]);
+    let sandbox = Sandbox::new("usercmd", &server.url(""));
+    std::fs::create_dir_all(sandbox.root.join(".wrosecode/commands")).unwrap();
+    sandbox.file(
+        ".wrosecode/commands/ship.md",
+        "---\ndescription: Ship the branch\n---\nCommit $ARGUMENTS and push.\n",
+    );
+
+    let output = headless(&sandbox, "/ship the fix", &[]);
+    assert_task_complete(&output, "SHIP-OK");
+
+    let body = &server.requests()[0].body;
+    assert!(
+        body.contains("Commit the fix and push."),
+        "command body was not expanded: {body}"
+    );
+    assert!(!body.contains("$ARGUMENTS"), "placeholder leaked: {body}");
+}

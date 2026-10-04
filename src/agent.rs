@@ -66,6 +66,12 @@ pub struct Agent {
     /// Transcript size (characters) that triggers auto-compaction before the
     /// next request; see `WROSECODE_COMPACT_CHARS`.
     pub compact_at_chars: usize,
+    /// System prompt of the active user-defined agent
+    /// (`.wrosecode/agents/*.md`), injected into every system prompt; empty
+    /// for the built-in modes.
+    pub agent_system: String,
+    /// Display name of that agent; empty for the built-in modes.
+    pub agent_name: String,
 }
 
 impl Agent {
@@ -75,6 +81,23 @@ impl Agent {
         }
         self.mode = mode.into();
         self.tools.plan = mode != "build";
+        // The built-in modes carry no extra system prompt: selecting one drops
+        // an active user-defined agent.
+        self.agent_name.clear();
+        self.agent_system.clear();
+        Ok(())
+    }
+
+    /// Activate a user-defined markdown agent: its body is injected into every
+    /// system prompt, its `mode:` is applied, and a `thinking:` level named in
+    /// the file takes over.
+    pub fn set_user_agent(&mut self, user: &crate::markdown::UserAgent) -> Result<()> {
+        self.set_mode(&user.mode)?;
+        if let Some(level) = user.thinking.as_deref().and_then(ThinkLevel::parse) {
+            self.set_think(level);
+        }
+        self.agent_name = user.name.clone();
+        self.agent_system = user.body.clone();
         Ok(())
     }
 
@@ -168,6 +191,8 @@ impl Agent {
             store: crate::store::Store::open_default()?,
             instructions: crate::project::instruction_chain(&config.root),
             compact_at_chars: threshold_from_env(),
+            agent_system: String::new(),
+            agent_name: String::new(),
         })
     }
 
@@ -232,6 +257,8 @@ impl Agent {
                 task_results: self.task_results.clone(),
                 instructions: self.instructions.clone(),
                 compact_at_chars: self.compact_at_chars,
+                agent_system: self.agent_system.clone(),
+                agent_name: self.agent_name.clone(),
                 store: self.store.clone(),
             };
             let summary = child.run(&task).await?;
@@ -443,9 +470,18 @@ impl Agent {
                     self.instructions
                 )
             };
+            let overlay = if self.agent_system.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Active user agent ({}):\n{}\n",
+                    self.agent_name, self.agent_system
+                )
+            };
             let system = format!(
-                "{}\n{}Project: {}\nMode: {}\nCTF category: {}\nThinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
+                "{}\n{}{}Project: {}\nMode: {}\nCTF category: {}\nThinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
                 self.harness.prompt(),
+                overlay,
                 instructions,
                 self.config.root.display(),
                 self.mode,
@@ -632,6 +668,8 @@ impl Agent {
             let task_results = self.task_results.clone();
             let metrics = self.metrics.clone();
             let store = self.store.clone();
+            let agent_system = self.agent_system.clone();
+            let agent_name = self.agent_name.clone();
             // Snapshot every file this batch is about to touch, so `/undo`
             // can restore the pre-edit state (`src/snapshot.rs`).
             let mut snapshot_paths: Vec<std::path::PathBuf> = Vec::new();
@@ -670,6 +708,8 @@ impl Agent {
                 let task_results = task_results.clone();
                 let metrics = metrics.clone();
                 let store = store.clone();
+                let agent_system = agent_system.clone();
+                let agent_name = agent_name.clone();
                 async move {
                     let _permit = parallel_limit.acquire_owned().await.ok();
                     let started = Instant::now();
@@ -774,6 +814,8 @@ impl Agent {
                                 store,
                                 instructions: crate::project::instruction_chain(&config.root),
                                 compact_at_chars: threshold_from_env(),
+                                agent_system: agent_system.clone(),
+                                agent_name: agent_name.clone(),
                             };
                             let result = child.run(task).await;
                             if let Ok(summary) = &result {
@@ -1263,6 +1305,8 @@ mod tests {
             store: Store::open(&config.root.join("state.db")).expect("store"),
             instructions: String::new(),
             compact_at_chars: DEFAULT_COMPACT_AT_CHARS,
+            agent_system: String::new(),
+            agent_name: String::new(),
         };
         (agent, provider)
     }

@@ -506,6 +506,9 @@ struct Ui {
     busy: bool,
     spinner: usize,
     root: String,
+    /// User-defined slash commands from `.wrosecode/commands/*.md`, loaded
+    /// once at startup for the palette, `/help`, and dispatch.
+    user_commands: Vec<crate::markdown::UserCommand>,
     provider: String,
     model: String,
     harness: String,
@@ -899,6 +902,7 @@ impl Ui {
     }
 
     fn from_meta(meta: UiMeta, session_id: String) -> Self {
+        let user_commands = crate::markdown::discover_commands(std::path::Path::new(&meta.root));
         Self {
             renderer: Renderer::new(),
             entries: vec![Entry {
@@ -922,6 +926,7 @@ impl Ui {
             busy: false,
             spinner: 0,
             root: meta.root,
+            user_commands,
             provider: meta.provider,
             model: meta.model,
             harness: meta.harness,
@@ -2563,7 +2568,7 @@ impl Ui {
         let choices: Vec<String> = if self.picker.is_some() {
             picker_view(self)
         } else if self.palette {
-            commands::filtered(&self.input)
+            commands::filtered(&self.input, &self.user_commands)
                 .iter()
                 .map(|command| format!("{}  {}", command.name, command.description))
                 .collect()
@@ -3262,8 +3267,9 @@ pub fn completion_matches_at(
     let mut matches = Vec::new();
     if let Some(command) = token.strip_prefix('/') {
         if !command.contains('/') {
-            for spec in commands::filtered(command) {
-                matches.push(spec.name.to_string());
+            let user = crate::markdown::discover_commands(root);
+            for spec in commands::filtered(command, &user) {
+                matches.push(spec.name);
             }
             if !matches.is_empty() {
                 return matches;
@@ -4489,7 +4495,7 @@ pub async fn run(
             KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_up(5),
             KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_down(5),
             KeyCode::Up if ui.palette => {
-                let len = commands::filtered(&ui.input).len();
+                let len = commands::filtered(&ui.input, &ui.user_commands).len();
                 if len > 0 {
                     ui.selected = (ui.selected + len - 1) % len;
                 }
@@ -4498,7 +4504,7 @@ pub async fn run(
                 ui.selected = ui.selected.saturating_sub(1);
             }
             KeyCode::Down if ui.palette => {
-                let len = commands::filtered(&ui.input).len();
+                let len = commands::filtered(&ui.input, &ui.user_commands).len();
                 if len > 0 {
                     ui.selected = (ui.selected + 1) % len;
                 }
@@ -4579,9 +4585,9 @@ pub async fn run(
                     continue;
                 }
                 if ui.palette {
-                    let choices = commands::filtered(&ui.input);
+                    let choices = commands::filtered(&ui.input, &ui.user_commands);
                     if let Some(command) = choices.get(ui.selected) {
-                        ui.set_input(command.name.into());
+                        ui.set_input(command.name.clone());
                     }
                     ui.palette = false;
                     ui.selected = 0;
@@ -5310,6 +5316,20 @@ async fn run_command(
         .map(|(a, b)| (a, b.trim()))
         .unwrap_or((line, ""));
     if commands::lookup(line).is_none() {
+        // A user-defined command from `.wrosecode/commands/<name>.md` expands
+        // its body (`$ARGUMENTS` replaced) and runs it as a normal turn.
+        if let Some(command) = ui.user_commands.iter().find(|command| command.name == name) {
+            let prompt = command.expand(args);
+            let summary: String = prompt.chars().take(80).collect();
+            if !run_turn_queue(agent, ui, &prompt, events, permissions).await? {
+                return Ok(());
+            }
+            if session.summary == "New session" {
+                session.summary = summary;
+            }
+            save_session(&mut *session, agent, ui, &session_dir)?;
+            return Ok(());
+        }
         ui.push(
             Speaker::System,
             format!("Unknown command: {name}. Type /help."),
@@ -5317,7 +5337,7 @@ async fn run_command(
         return Ok(());
     }
     match name {
-        "/help" => ui.push(Speaker::System, commands::help()),
+        "/help" => ui.push(Speaker::System, commands::help(&ui.user_commands)),
         "/clear" => {
             let drop_context = args.split_whitespace().any(|flag| flag == "--context");
             ui.clear_transcript();
@@ -5342,14 +5362,42 @@ async fn run_command(
         }
         "/agents" => {
             let modes = ["build", "plan", "general"];
-            let labels = modes
+            let user = crate::markdown::discover_agents(&agent.config.root);
+            let mut labels: Vec<String> = modes
                 .iter()
                 .map(|mode| format!("{} {mode}", if agent.mode == *mode { "●" } else { " " }))
                 .collect();
+            let active = agent.agent_name.clone();
+            labels.extend(user.iter().map(|selected_agent| {
+                format!(
+                    "{} {} ({})",
+                    if selected_agent.name == active {
+                        "●"
+                    } else {
+                        " "
+                    },
+                    selected_agent.name,
+                    selected_agent.description
+                )
+            }));
             if let Some(index) = picker(ui, "Agents", labels)? {
-                agent.set_mode(modes[index])?;
-                ui.mode = modes[index].to_ascii_uppercase();
-                ui.push(Speaker::System, format!("{} agent active", modes[index]));
+                let selected = user
+                    .get(index.saturating_sub(modes.len()))
+                    .filter(|_| index >= modes.len());
+                if let Some(selected) = selected {
+                    agent.set_user_agent(selected)?;
+                    ui.mode = agent.mode.to_ascii_uppercase();
+                    ui.think = agent.think;
+                    ui.thinking_level = agent.thinking_level;
+                    ui.push(
+                        Speaker::System,
+                        format!("{} agent active ({})", selected.name, selected.description),
+                    );
+                } else if let Some(mode) = modes.get(index) {
+                    agent.set_mode(mode)?;
+                    ui.mode = mode.to_ascii_uppercase();
+                    ui.push(Speaker::System, format!("{mode} agent active"));
+                }
             }
         }
         "/harness" => {

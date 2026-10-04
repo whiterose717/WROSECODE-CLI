@@ -419,6 +419,33 @@ Skills load from bundled `skills/`, project `skills/`, `~/.wrosecode/skills/`, a
 
 `/harness minimal|swe|claude` switches prompt style without clearing history. `wrosecode acp` starts a basic ACP stdio agent.
 
+## Your own commands and agents
+
+Markdown files with YAML frontmatter extend the shell without recompiling anything. Commands load from `.wrosecode/commands/*.md` (project) and `~/.wrosecode/commands/` (personal); the project file wins on a name clash:
+
+```markdown
+---
+description: Commit and push the branch
+category: Project
+---
+Review the working tree, write one imperative commit message, commit, and push $ARGUMENTS.
+```
+
+`/ship the fix` expands `$ARGUMENTS` and runs the body as a normal turn — in the TUI and in `wrosecode --headless '/ship the fix'`. Your commands appear in `/help` and the `Ctrl+P` palette, and typing `/` completes them.
+
+Agents load from `.wrosecode/agents/*.md` and `~/.wrosecode/agents/`:
+
+```markdown
+---
+description: Reviews diffs, never edits
+mode: plan
+thinking: deep
+---
+Always quote the file and line you are criticising.
+```
+
+`wrosecode --agent reviewer 'review the diff'` activates one for a run; in the TUI it is listed in `/agents`. Its body is injected into every system prompt, `mode:` picks `build`, `plan`, or `general`, and `thinking:` sets the level. `/build`, `/plan`, or `/agents` on a built-in drops the custom agent.
+
 ## Slash commands
 
 `/help` shows the full command list, generated from the same registry as the palette.
