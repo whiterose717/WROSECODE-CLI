@@ -18,6 +18,10 @@ pub struct Session {
     pub model: String,
     pub messages: Vec<Message>,
     pub transcript: Vec<(String, String)>,
+    /// Files pinned with `/add`; restored into the agent when the session
+    /// resumes (older exports simply default to an empty list).
+    #[serde(default)]
+    pub pinned: Vec<String>,
 }
 
 impl Session {
@@ -38,6 +42,7 @@ impl Session {
             model: String::new(),
             messages: Vec::new(),
             transcript: Vec::new(),
+            pinned: Vec::new(),
         }
     }
     pub fn dir() -> Result<PathBuf> {

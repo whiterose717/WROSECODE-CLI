@@ -44,10 +44,10 @@ it a poor fit.
 
 | Item | Status | Note |
 | --- | --- | --- |
-| Repo map ranked by relevance | Partial | `repo_map.rs` extracts symbols (syn for Rust) and keyword-ranks them. **TODO** PageRank over references and a token budget. |
+| Repo map ranked by relevance | Adopted | `repo_map.rs` extracts symbols (syn for Rust, regex elsewhere), mtime-caches them, and ranks files by query relevance blended with a damped PageRank (0.85, 15 rounds) over the cross-file "file A mentions file B's symbols" graph. Output is capped at a 1024-token budget so a large repo cannot crowd the system prompt. |
 | Git auto-commit + `/undo` | Partial | `/commit` proposes messages and confirms; auto-commit and `/undo` are missing. |
 | Lint/test auto-loop after edits | Adopted | `config.check_command()` (`.wrosecode/project.toml`, written by `/init`) runs after every successful `write_file`/`edit_file`/`apply_patch` in `agent.rs`, feeding failures back as a repair turn. |
-| `/add` `/drop` explicit context | Not implemented | **TODO**. |
+| `/add` `/drop` explicit context | Adopted | `/add <path>` pins an existing project file and injects its contents into every system prompt (6k chars per file, 24k total, truncated with a marker); `/drop <path|all>` unpins; listing is `/add` with no argument. Pins live on the agent, survive session save/resume, and the headless entry point takes the repeatable `--add PATH` flag. Skill-fork and delegate children start with an empty pin list. |
 | Architect/editor two-model mode | Not implemented | Not applicable — `delegate_task` already lets a caller name a cheaper model per child; a global two-model toggle adds a second configuration axis for the same effect. |
 | Multiple edit formats per model | Not implemented | Not applicable — one exact-match `edit_file` plus `apply_patch` covers the space without per-model format negotiation. |
 

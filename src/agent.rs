@@ -72,6 +72,10 @@ pub struct Agent {
     pub agent_system: String,
     /// Display name of that agent; empty for the built-in modes.
     pub agent_name: String,
+    /// Files pinned with `/add` (aider-style explicit file context): their
+    /// contents ride along in every system prompt, capped, so the model never
+    /// has to re-read them. Project-relative paths.
+    pub pinned: Vec<String>,
 }
 
 impl Agent {
@@ -99,6 +103,86 @@ impl Agent {
         self.agent_name = user.name.clone();
         self.agent_system = user.body.clone();
         Ok(())
+    }
+
+    /// `/add <path>` — pin a project file so its contents are injected into
+    /// every system prompt (aider's explicit file context).
+    pub fn pin(&mut self, path: &str) -> Result<String> {
+        let relative = self.pin_path(path)?;
+        if !self.pinned.contains(&relative) {
+            self.pinned.push(relative.clone());
+        }
+        Ok(format!(
+            "Pinned {relative} ({} file(s) in context)",
+            self.pinned.len()
+        ))
+    }
+
+    /// `/drop <path>` — unpin one file; `/drop all` clears the whole list.
+    pub fn unpin(&mut self, path: &str) -> Result<String> {
+        if path.eq_ignore_ascii_case("all") {
+            let count = self.pinned.len();
+            self.pinned.clear();
+            return Ok(format!("Dropped {count} pinned file(s)"));
+        }
+        let relative = self.pin_path(path)?;
+        let before = self.pinned.len();
+        self.pinned.retain(|entry| entry != &relative);
+        if self.pinned.len() == before {
+            bail!("{relative} is not pinned");
+        }
+        Ok(format!(
+            "Dropped {relative} ({} file(s) left)",
+            self.pinned.len()
+        ))
+    }
+
+    /// Resolve a pin target to a project-relative path of an existing file.
+    fn pin_path(&self, path: &str) -> Result<String> {
+        let resolved = crate::tools::fs::resolve(&self.config.root, path)?;
+        if !resolved.is_file() {
+            bail!("{} is not a file", resolved.display());
+        }
+        Ok(resolved
+            .strip_prefix(&self.config.root)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| resolved.display().to_string()))
+    }
+
+    /// The pinned files as a system-prompt block: 6k characters per file and
+    /// 24k in total, so pinning a large source file cannot blow the budget.
+    fn pinned_context(&self) -> String {
+        const PER_FILE: usize = 6_000;
+        const TOTAL: usize = 24_000;
+        if self.pinned.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "Pinned files (selected by the user with /add; use them as context, do not re-read them):\n",
+        );
+        for name in &self.pinned {
+            if out.len() >= TOTAL {
+                out.push_str("(remaining pins omitted: context budget reached)\n");
+                break;
+            }
+            out.push_str(&format!("=== {name} ===\n"));
+            match std::fs::read_to_string(self.config.root.join(name)) {
+                Ok(mut text) => {
+                    if text.len() > PER_FILE {
+                        let mut cut = PER_FILE;
+                        while cut > 0 && !text.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        text.truncate(cut);
+                        text.push_str("\n… (truncated)");
+                    }
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+                Err(error) => out.push_str(&format!("(unreadable: {error})\n")),
+            }
+        }
+        out
     }
 
     pub async fn review(&mut self, diff: &str) -> Result<String> {
@@ -193,6 +277,7 @@ impl Agent {
             compact_at_chars: threshold_from_env(),
             agent_system: String::new(),
             agent_name: String::new(),
+            pinned: Vec::new(),
         })
     }
 
@@ -257,8 +342,11 @@ impl Agent {
                 task_results: self.task_results.clone(),
                 instructions: self.instructions.clone(),
                 compact_at_chars: self.compact_at_chars,
+                // Skill-fork children start with an empty pin list: they get
+                // their own focused context and can read files if they need to.
                 agent_system: self.agent_system.clone(),
                 agent_name: self.agent_name.clone(),
+                pinned: Vec::new(),
                 store: self.store.clone(),
             };
             let summary = child.run(&task).await?;
@@ -478,11 +566,13 @@ impl Agent {
                     self.agent_name, self.agent_system
                 )
             };
+            let pinned = self.pinned_context();
             let system = format!(
-                "{}\n{}{}Project: {}\nMode: {}\nCTF category: {}\nThinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
+                "{}\n{}{}{}Project: {}\nMode: {}\nCTF category: {}\nThinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
                 self.harness.prompt(),
                 overlay,
                 instructions,
+                pinned,
                 self.config.root.display(),
                 self.mode,
                 self.ctf.category,
@@ -816,6 +906,7 @@ impl Agent {
                                 compact_at_chars: threshold_from_env(),
                                 agent_system: agent_system.clone(),
                                 agent_name: agent_name.clone(),
+                                pinned: Vec::new(),
                             };
                             let result = child.run(task).await;
                             if let Ok(summary) = &result {
@@ -1307,6 +1398,7 @@ mod tests {
             compact_at_chars: DEFAULT_COMPACT_AT_CHARS,
             agent_system: String::new(),
             agent_name: String::new(),
+            pinned: Vec::new(),
         };
         (agent, provider)
     }
@@ -1393,6 +1485,67 @@ mod tests {
         agent.messages.truncate(2);
         assert!(!agent.needs_compact(), "too short to be worth summarizing");
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pinning_a_file_pins_it_once_and_puts_it_in_the_context() {
+        let root = std::env::temp_dir().join(format!("wrosecode-pin-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), "PIN-COUNT-7: port 4444").unwrap();
+        let (mut agent, _provider) = agent_with_mock(&root);
+
+        let first = agent.pin("notes.txt").expect("pin");
+        assert!(first.contains("notes.txt"), "{first}");
+        assert_eq!(agent.pinned, vec!["notes.txt".to_string()]);
+
+        agent.pin("notes.txt").expect("re-pin");
+        assert_eq!(agent.pinned.len(), 1, "pinning twice must not duplicate");
+
+        let context = agent.pinned_context();
+        assert!(context.contains("Pinned files"), "{context}");
+        assert!(context.contains("PIN-COUNT-7"), "{context}");
+
+        assert!(agent.pin("missing.txt").is_err(), "pinning a missing file");
+        assert!(agent.pin(".").is_err(), "pinning a directory");
+
+        let dropped = agent.unpin("notes.txt").expect("drop");
+        assert!(dropped.contains("notes.txt"), "{dropped}");
+        assert!(agent.pinned.is_empty());
+        assert!(agent.pinned_context().is_empty(), "no pins, no block");
+        assert!(
+            agent.unpin("notes.txt").is_err(),
+            "dropping an unpinned file must fail"
+        );
+
+        agent.pin("notes.txt").expect("re-pin");
+        let cleared = agent.unpin("all").expect("clear");
+        assert!(cleared.contains('1'), "{cleared}");
+        assert!(agent.pinned.is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pinned_context_truncates_a_file_that_is_too_large() {
+        let root = std::env::temp_dir().join(format!("wrosecode-pin-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("huge.txt"), "HUGE-PIN-MARKER ".repeat(2_000)).unwrap();
+        let (mut agent, _provider) = agent_with_mock(&root);
+        agent.pin("huge.txt").expect("pin");
+
+        let context = agent.pinned_context();
+        assert!(context.contains("HUGE-PIN-MARKER"), "{context}");
+        assert!(
+            context.contains("truncated"),
+            "the pin must be capped: {}",
+            context.len()
+        );
+        assert!(
+            context.len() < 9_000,
+            "one file must stay near its 6k budget, got {}",
+            context.len()
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

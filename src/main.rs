@@ -89,6 +89,10 @@ struct Cli {
     /// Activate a user-defined agent from `.wrosecode/agents/<name>.md`
     #[arg(long, value_name = "NAME")]
     agent: Option<String>,
+    /// Pin a file's contents into every prompt (aider-style explicit file
+    /// context). Repeatable; the same thing the `/add` command does live.
+    #[arg(long = "add", value_name = "PATH")]
+    add: Vec<String>,
     #[arg(long)]
     summary: Option<String>,
     #[arg(long)]
@@ -329,9 +333,11 @@ async fn main() -> Result<()> {
             .load_session(id)?
             .with_context(|| format!("session {id} was not found"))?;
         agent.messages = loaded.messages.clone();
+        agent.pinned = loaded.pinned.clone();
         Some(if cli.fork {
             let mut forked = session::Session::fresh();
             forked.summary = format!("Fork of {}", loaded.name);
+            forked.pinned = loaded.pinned;
             forked.messages = loaded.messages;
             forked.transcript = loaded.transcript;
             forked
@@ -341,6 +347,9 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    for path in &cli.add {
+        agent.pin(path).with_context(|| format!("--add {path}"))?;
+    }
     if let Some(binary) = cli.mcp_bin.as_deref() {
         agent.tools.mcps.push((
             "cli".into(),

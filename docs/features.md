@@ -37,8 +37,13 @@ everything not marked is implemented and covered by tests.
   `--export-session` / `--import-session`).
 - Metrics: counters, per-model totals, latency histogram, `metrics.json`/csv.
 - Repo map (`src/repo_map.rs`): per-file symbols (syn for Rust, regex for
-  other languages), mtime-cached, keyword-ranked for `/`-less prompting.
-  **TODO** PageRank over references and a token budget.
+  other languages), mtime-cached, ranked by query relevance blended with a
+  damped PageRank over the cross-file symbol-reference graph, emitted until a
+  1024-token budget runs out (`/`-less prompting).
+- Pinned file context (aider `/add` `/drop`): `/add <path>` injects the file
+  into every system prompt (6k chars per file, 24k total), `/drop` unpins,
+  `--add PATH` does it from a headless run; the list is saved with the
+  session.
 - Memory: project + personal markdown/jsonl with `remember`/relevance recall
   (`/memory`).
 
@@ -99,7 +104,6 @@ everything not marked is implemented and covered by tests.
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
 items there: opencode LSP
 feedback, session tree; goose recipes + HTTP MCP + planner/worker models;
-aider repo-map ranking, auto-commit loop, `/add` `/drop`, two-model mode,
-edit formats; open-interpreter multi-language runner and opt-in OS tools;
+aider auto-commit loop, two-model mode, edit formats; open-interpreter multi-language runner and opt-in OS tools;
 pi-mono packages + session branching; OpenHands condenser + microagents;
 PentesterFlow coverage checklists.

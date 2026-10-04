@@ -546,6 +546,30 @@ fn a_user_agent_markdown_reaches_the_system_prompt() {
 }
 
 #[test]
+fn a_pinned_file_rides_along_in_the_system_prompt() {
+    let server = spawn(vec![completion("PIN-OK")]);
+    let sandbox = Sandbox::new("pinned", &server.url(""));
+    sandbox.file(
+        "notes.txt",
+        "PIN-MARKER-31: the live target listens on port 4444 and the flag format is FLAG{...}.",
+    );
+
+    let output = headless(&sandbox, "which port is open?", &["--add", "notes.txt"]);
+    assert_task_complete(&output, "PIN-OK");
+
+    let requests = server.requests();
+    let body = &requests[0].body;
+    assert!(
+        body.contains("PIN-MARKER-31"),
+        "pinned contents never reached the prompt: {body}"
+    );
+    assert!(
+        body.contains("Pinned files"),
+        "the pin header is missing from the prompt: {body}"
+    );
+}
+
+#[test]
 fn a_user_command_prompt_expands_before_the_turn() {
     let server = spawn(vec![completion("SHIP-OK")]);
     let sandbox = Sandbox::new("usercmd", &server.url(""));

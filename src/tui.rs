@@ -4939,6 +4939,7 @@ fn save_session(
 
 fn sync_session(session: &mut Session, agent: &Agent, ui: &Ui) {
     session.messages = agent.messages.clone();
+    session.pinned = agent.pinned.clone();
     session.provider_name = agent.config.provider.clone();
     session.model = agent.config.model.clone();
     session.transcript = ui
@@ -4969,6 +4970,7 @@ fn restore_session(
         switch_provider(agent, ui, settings, &session.provider_name, &session.model)?;
     }
     agent.messages = session.messages.clone();
+    agent.pinned = session.pinned.clone();
     ui.entries = session
         .transcript
         .iter()
@@ -5943,10 +5945,41 @@ async fn run_command(
                 );
             }
         },
+        "/add" => {
+            if args.is_empty() {
+                let list = if agent.pinned.is_empty() {
+                    "No pinned files. Use /add <path> to pin one.".to_string()
+                } else {
+                    format!("Pinned files:\n{}", agent.pinned.join("\n"))
+                };
+                ui.push(Speaker::System, list);
+            } else {
+                for path in args.split_whitespace() {
+                    match agent.pin(path) {
+                        Ok(message) => ui.push(Speaker::System, message),
+                        Err(error) => ui.push(Speaker::System, format!("{path}: {error:#}")),
+                    }
+                }
+            }
+        }
+        "/drop" => {
+            if args.is_empty() {
+                ui.push(
+                    Speaker::System,
+                    "Usage: /drop <path> or /drop all".to_string(),
+                );
+            } else {
+                match agent.unpin(args) {
+                    Ok(message) => ui.push(Speaker::System, message),
+                    Err(error) => ui.push(Speaker::System, format!("{error:#}")),
+                }
+            }
+        }
         "/new" => {
             save_session(session, agent, ui, &session_dir)?;
             *session = Session::fresh();
             agent.messages.clear();
+            agent.pinned.clear();
             ui.entries.clear();
             ui.push(Speaker::System, "New session started");
         }

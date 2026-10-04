@@ -210,6 +210,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Re-apply the restore done by /undo",
     },
     CommandSpec {
+        name: "/add",
+        category: "Project",
+        description: "Pin a file's contents into every prompt (/add src/lib.rs)",
+    },
+    CommandSpec {
+        name: "/drop",
+        category: "Project",
+        description: "Unpin a file, or /drop all to clear the pinned list",
+    },
+    CommandSpec {
         name: "/flags",
         category: "Project",
         description: "Search detected flag history",
@@ -316,6 +326,7 @@ mod tests {
     #[test]
     fn registry_contains_all_requested_commands() {
         for name in [
+            "/add",
             "/agents",
             "/clear",
             "/compact",
@@ -325,6 +336,7 @@ mod tests {
             "/dashboard",
             "/debug",
             "/diff",
+            "/drop",
             "/editor",
             "/exit",
             "/greet",
