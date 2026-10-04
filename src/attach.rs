@@ -83,11 +83,7 @@ fn read_live() -> Option<DashStats> {
 
 /// Ask the running `--web` session for its stats.
 async fn fetch_status(listen: &str) -> Option<DashStats> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .connect_timeout(Duration::from_secs(2))
-        .build()
-        .ok()?;
+    let client = crate::provider::shared_client(2, 2).ok()?;
     let response = client
         .get(format!("http://{listen}/v1/status"))
         .send()

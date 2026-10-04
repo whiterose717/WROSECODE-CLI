@@ -47,7 +47,9 @@ tests unless a line says otherwise.
   `--session ID --fork` / `--fork-at N`; `/history` prints the message
   numbers) to branch off a saved conversation from its end or from any
   earlier message, and `/tree` to render the fork forest with the active
-  session marked.
+  session marked. Sessions carry stable `ses_…` IDs (status line,
+  `--session`/`-s`, `/sessions` with age labels); resuming restores history,
+  provider, and model.
 - Engagement coverage checklists (PentesterFlow): `.wrosecode/coverage.json`
   holds what has and has not been tested; the `coverage` tool (`list`, `add`,
   `done`, `undone`, unique-substring matching) lets the agent tick items off
@@ -120,7 +122,8 @@ tests unless a line says otherwise.
 ## Orchestration
 
 - Steering queue: keys land during a turn, `Enter` queues, `Ctrl+C` cancels
-  only the running turn.
+  only the running turn; at an idle prompt the first `Ctrl+C` arms a ~2s exit
+  window and the second quits.
 - Stuck detector: empty/repeated replies raise thinking, rotate the category
   hypothesis, and force a fresh-context attempt.
 - Submission stream: `--events PATH` appends framed NDJSON (`start`, `step`,
@@ -244,6 +247,33 @@ tests unless a line says otherwise.
   partition of each stream deliver exactly the events one whole feed
   does. Both sit in the normal test suite, so the standard gate fuzzes on
   every commit.
+
+## UX and auth hardening (v0.3)
+
+- The transcript owns the full terminal width: no always-on token or
+  timeline panels. Token/latency/cost counters stay internal (status line,
+  `/stats`, `live.json`, closing receipt). The subagent tree shows only
+  in-flight work, newest last and capped, with finished subagents collapsed
+  to one `✓ N subagents done` line. Tool command lines wrap instead of
+  clipping; tool output keeps its capped previews with explicit markers.
+- Idle `Ctrl+C` is two-stage (arm with a hint, second press within ~2s
+  quits); cancelling a turn arms the same window. `/model` is gone —
+  `/models` is the one model command, with an empty-state hint when nothing
+  is configured.
+- Every turn ends with a closing receipt: verification status, answer,
+  proof, model/tools/wait split, a numbered step list, tokens, cache rate,
+  cost, and savings (headless `--summary` prints the same steps).
+- Startup paints the wordmark in progressive reveal stages between the init
+  steps it was already doing — no added launch latency, first paint still
+  inside the 50 ms budget.
+- Any provider entry, built-ins included, can be removed; startup falls back
+  to another configured provider instead of failing. OAuth sign-in
+  (browser loopback with PKCE, or device code) stores tokens `0600` and
+  refreshes before use; the client ID always comes from operator
+  configuration.
+- One tuned HTTP client shape (`provider::shared_client`) serves startup,
+  provider tests, attach, CTFd, MCP, and OAuth. `--trace` logs per-step API,
+  tool, and slow-render timings as NDJSON to `~/.wrosecode/trace.log`.
 
 ## Reference-project gap list
 

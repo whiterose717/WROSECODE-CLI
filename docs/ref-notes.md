@@ -110,8 +110,14 @@ Inspected 2026-10-04 (README + tree).
 | Destructive-pattern blocking | Adopted | `shell::destructive()` matches `rm -rf`/`rm -fr`, `mkfs`, `dd if=`, fork bombs (`:(){`), `chmod -r 777 /` and raw writes to block devices, and `tools::execute` raises it above every approval mode: it prompts even in `yolo`, has no auto-approve path, and a run without a terminal is refused, so it never executes unattended. |
 | One-shot natural language → shell | Not implemented | There is no one-shot mode and no `--dry-run` preview: `--prompt` runs the full agent loop, and `--plan` is the read-only substitute for "just show me what you would do". |
 
-Deliberately skipped: provider/key sprawl and OAuth sign-in flows (we keep
-`providers.toml` + env/keyring keys) and persistent PTY REPL sessions. The
+Deliberately skipped: provider/key sprawl (we keep
+`providers.toml` + env/keyring keys) and persistent PTY REPL sessions. OAuth
+sign-in, by contrast, is adopted in generic form (`src/oauth.rs`): browser
+loopback (PKCE S256 + state check + paste fallback) and device-code flows
+against an operator-configured issuer/client ID, tokens stored `0600` under
+`~/.wrosecode/credentials/`, profile records `auth_method = "oauth"`, and
+refresh runs before provider use. No first-party client credentials are
+bundled. The
 `rtk` output rewriter was taken instead as our own output shaping — ANSI and
 progress-bar stripping, consecutive-line dedupe, a head+tail split under
 per-tool byte caps (`tools::truncate`) — described under Performance in

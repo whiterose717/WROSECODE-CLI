@@ -75,11 +75,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "List and switch available models",
     },
     CommandSpec {
-        name: "/model",
-        category: "Providers",
-        description: "Switch directly to a model",
-    },
-    CommandSpec {
         name: "/mcps",
         category: "Providers",
         description: "List, add, or remove MCP servers",

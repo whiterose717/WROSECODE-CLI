@@ -61,40 +61,40 @@ single `WROSECODE v…` line.
 Captured at 110×36 straight from a real run:
 
 ```
-╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗  ⠋  session 1791068182-690349-0 · [misc] · paint 42ms
+╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗  ⠧  session ses_1791153855-1574184-0 · [misc] · paint 11ms
 ║ ║╠╩╗│ │╠═╝╠═╗│  │ │║ ║╠═╗
 ╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝  WROSECODE v0.2.0 · FAST
  anthropic / claude-sonnet-5 · think medium · up to 3 agents · sandbox none · ask · /home/kali/Desktop/wrose
  BUILD · claude · [misc] · git master* · 0 mcp · 636 skills
- 3 connected · 10 need setup · /providers
- tip · / commands
-  resume 1791064953-653197-0  ·  New session
-  resume 1791064794-651035-0  ·  hiii
-  resume 1791058676-580737-0  ·  emoEasy4.8(475)Challenge RatingXP reward260XP rewardDifficulty distribution b
+ 2 connected · 10 need setup · /providers
+ tip · @ files
   ctf  wrosecode ctf <file|dir|url>  ·  or /ctf here
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
- TRANSCRIPT  1 entry                                                      │ TOKEN DASHBOARD
- INFO  WROSECODE v0.2.0 · session 1791068182-690349-0                     │ input         0 ░░░░░░░░░░░░░░░░
-       Type a request · /help commands · Ctrl+P palette                   │ output        0 ░░░░░░░░░░░░░░░░
-       Tab build/plan · [ ] thinking · PgUp/PgDn scroll · /clear          │ reason        0 ░░░░░░░░░░░░░░░░
-                                                                          │ cache R       0 ░░░░░░░░░░░░░░░░
-                                                                          │ cache W       0 ░░░░░░░░░░░░░░░░
-                                                                          │ model  claude-sonnet-5
-                                                                          │ cost   n/a
-                                                                          │ budget unlimited
-                                                                          │ p50/p95/p99 0/0/0ms
-                                                                          │ lat  ·
-                                                                          │ cache  0%
-                                                                          │ flags  0
-                                                                          │ turn   ·
- SUBAGENT TREE  0 active                                                  │ TOOL TIMELINE  0 calls
- root [misc] think medium · up to 3 agents                                  │
-                                                                          │
-                                                                          │
-                                                                          │
-                                                                          │
-                                                                          │
- Ready · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 3s · step 0 · none/ask · FAST · 3w · cost n/a · tool
+ TRANSCRIPT  1 entry
+ INFO  WROSECODE v0.2.0 · session ses_1791153855-1574184-0
+       Type a request · /help commands · Ctrl+P palette
+       Tab build/plan · [ ] thinking · PgUp/PgDn scroll · /clear
+
+
+
+
+
+
+
+
+
+
+
+
+ SUBAGENT TREE  0 running
+ root [misc] think medium · up to 3 agents
+
+
+
+
+
+
+ Ready · session ses_1791153855-1574184-0 · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 4s · step 0
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 >
 ```
@@ -104,15 +104,18 @@ health, rotating tip, recent sessions, and the `/ctf` hint — and they are what
 the spinner animates in. The wordmark carries `TURBO` / `FAST` / `SMART` /
 `DEEP` plus the worker count that tier actually allows (1 / 3 / 5 / 10).
 
-The right-hand dashboard shows input, output, reasoning, and cache traffic as
-bars, then the model, cost, budget, latency percentiles, cache hit rate, found
-flags, a per-turn token sparkline with the last turn duration, an error counter
-with the kind of the most recent failure, and the speed tier. The bottom status
-line leads with the run state, model, and `think:` label (the level name, or
+The transcript owns the full terminal width: there is no always-on token or
+timeline panel. Token, latency, and cost counters are still tracked
+internally and surface in the status line, in `/stats` on demand, in
+`~/.wrosecode/live.json`, and in the closing `── RESULT ─` receipt. The
+bottom pane shows the subagent tree — only in-flight work, newest last, with
+`+N more running` when it overflows — and finished subagents collapse to one
+`✓ N subagents done` line. The bottom status
+line leads with the run state, session ID, model, and `think:` label (the level name, or
 `auto→medium` while the auto controller drives it), then tokens, cache
 hit rate, elapsed time, tool step, sandbox and approval, speed tier and
 workers, cost, and tool counts — for example
-` Ready · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 3s · step 0 ·
+` Ready · session ses_1791153855-1574184-0 · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 4s · step 0 ·
 none/ask · FAST · 3w · cost n/a · tools 0:0`. During a turn it swaps in an
 animated spinner, the queue note, and the live timeout and tool progress.
 
@@ -159,7 +162,7 @@ CTF skills cover recon, web, pwn, crypto, reverse engineering, forensics, stego,
 | `@` at the start of a prompt | Open the file-mention picker (`Mention files`); `Esc` closes it |
 | Bracketed paste | A paste of 4+ lines collapses into `[Pasted N lines]`: `Enter` inserts it, `Esc` discards it |
 | `Tab` | Complete the current word (paths, slash commands, tool names) when the input is not empty; otherwise switch build and plan modes |
-| `Ctrl+C` | Clear what you are typing, then exit on a second press. During a turn it cancels the turn instead of closing the shell |
+| `Ctrl+C` | With text typed: clear the input. At an empty prompt: arm a ~2s exit window (`press Ctrl+C again to exit`); a second press inside it quits. During a turn it cancels the turn instead of closing the shell (which also arms the exit window, so Ctrl+C, Ctrl+C stops a run and exits) |
 | Mouse wheel | Scroll the transcript (smooth scrolling follows `smooth_scroll_lines`) |
 
 While scrolled up, the transcript header shows `· ↓ N new lines  (End to jump)`; each new line arriving is counted there until `End` returns to the bottom. Multi-line drafts grow the input box to four rows and then scroll with the caret. Prompt history (last 500 entries, consecutive duplicates collapsed) persists to `~/.wrosecode/history` and is recalled with `↑`/`↓`.
@@ -174,18 +177,19 @@ Six levels decide how much reasoning each provider call spends: `off`, `low`, `m
 
 ## Advanced dashboard and persistence
 
-The terminal dashboard has four live panes: transcript, token and cost metrics, subagent tree, and tool timeline. Drag the vertical separator with the mouse. `Ctrl+T` now cycles the thinking level; for colours `/theme` opens a picker over the palettes — dark, light, solarized, Dracula, Nord, and Mono — and `/theme NAME` applies one directly (`/theme` on an unknown name lists what exists). Your own palettes drop into `~/.wrosecode/themes/*.toml` as five hex colours (`text`, `muted`, `accent`, `status`, `background`, with an optional `name`); a file that fails to parse, has bad hex, or reuses a built-in name is skipped. `NO_COLOR` (any non-empty value) or `--no-color` turns colour off everywhere: the gradient wordmark becomes plain text and every frame renders without colour codes. The shell paints its first frame — gradient wordmark, info panel with provider, thinking, sandbox, approval, git, MCP and skill counts, provider health, a rotating tip, recent sessions, and the `/ctf` hint — before provider setup, skill discovery, MCP reconnects, and session restore, so startup never waits on the network: the measured time is stamped next to the session line (`· paint 9ms`), reported by `/debug` as `First paint`, and must stay inside a 50 ms budget. `Ctrl+P` opens fuzzy command search; `Ctrl+F` and `Ctrl+R` open the flag and prompt pickers with the same filter-as-you-type behaviour. The renderer targets 60 frames per second while writing only changed terminal rows.
+The terminal shows two live panes: the full-width transcript on top and the subagent tree below it (in-flight work only, capped, with finished work collapsed to one line). Clicking a transcript row expands or collapses its tool cell. `Ctrl+T` now cycles the thinking level; for colours `/theme` opens a picker over the palettes — dark, light, solarized, Dracula, Nord, and Mono — and `/theme NAME` applies one directly (`/theme` on an unknown name lists what exists). Your own palettes drop into `~/.wrosecode/themes/*.toml` as five hex colours (`text`, `muted`, `accent`, `status`, `background`, with an optional `name`); a file that fails to parse, has bad hex, or reuses a built-in name is skipped. `NO_COLOR` (any non-empty value) or `--no-color` turns colour off everywhere: the gradient wordmark becomes plain text and every frame renders without colour codes. The shell paints its first frame — gradient wordmark, info panel with provider, thinking, sandbox, approval, git, MCP and skill counts, provider health, a rotating tip, recent sessions, and the `/ctf` hint — before provider setup, skill discovery, MCP reconnects, and session restore, so startup never waits on the network: the measured time is stamped next to the session line (`· paint 9ms`), reported by `/debug` as `First paint`, and must stay inside a 50 ms budget. `Ctrl+P` opens fuzzy command search; `Ctrl+F` and `Ctrl+R` open the flag and prompt pickers with the same filter-as-you-type behaviour. The renderer targets 60 frames per second while writing only changed terminal rows.
 
-Sessions checkpoint to SQLite WAL every ten seconds at `~/.wrosecode/state.db`, while portable JSON session files remain available. Resume or fork work with:
+Sessions checkpoint to SQLite WAL every ten seconds at `~/.wrosecode/state.db`, while portable JSON session files remain available. Every session gets a stable `ses_…` ID, shown in the status line and in `/sessions` with a one-line summary and age; resuming restores conversation history, provider, and model. Resume or fork work with:
 
 ```bash
 wrosecode --session SESSION_ID
+wrosecode -s SESSION_ID
 wrosecode --session SESSION_ID --fork
 wrosecode --session SESSION_ID --export-session session.json
 wrosecode --import-session session.json
 ```
 
-Token counts, model latency percentiles, cache traffic, and costs come from provider usage. Configure prices in `pricing.toml` or `~/.wrosecode/pricing.toml`. Press `Ctrl+E` or run `/export` to write `metrics.json`, `metrics.csv`, and `latency.csv` (a latency histogram with one row per bucket: `bucket_upper_ms,count`). Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export the same counters to an OTLP HTTP collector.
+Token counts, model latency percentiles, cache traffic, and costs come from provider usage. Configure prices in `pricing.toml` or `~/.wrosecode/pricing.toml`. Press `Ctrl+E` or run `/export` to write `metrics.json`, `metrics.csv`, and `latency.csv` (a latency histogram with one row per bucket: `bucket_upper_ms,count`). Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export the same counters to an OTLP HTTP collector. Pass `--trace` to log per-step timings (API latency, tool time, slow renders) as NDJSON to `~/.wrosecode/trace.log`.
 
 Rate-limited provider replies (HTTP 429 / quota errors) are classified separately
 from other failures, counted in the dashboard (`WARN 429s n`), and exported with
@@ -449,7 +453,7 @@ docker run --rm -it -v "$PWD:/workspace" \
   -e ANTHROPIC_API_KEY wrosecode-sandbox --permission yolo
 ```
 
-With an interactive terminal, `wrosecode` opens a full-screen chat UI showing the conversation, tool activity, status, and a persistent input box. Anthropic text appears as it streams; the OpenAI-compatible backend displays its completed response. The UI redraws only changed lines, renders just the visible slice of a long transcript, and pins itself to the bottom while new output arrives (the header shows `· ↑N lines` when you have scrolled away). Type `/` at the start of the input to open the command palette. Keep typing to filter, use the arrow keys to select, press Enter to run, or Esc to close. `Tab` switches between build and read-only plan modes. Use `PageUp`/`PageDown` to scroll, `Up`/`Down` for prompt history, and `Ctrl+C` to exit. Messages typed while a turn is running are kept: they are queued and sent after the reply, and `Ctrl+C` during a turn cancels just that turn. One-shot calls and piped input keep plain text output. The UI displays permission requests and accepts `y` or `n`; `Ctrl+C` there denies the request and stays in the session.
+With an interactive terminal, `wrosecode` opens a full-screen chat UI showing the conversation, tool activity, status, and a persistent input box. Anthropic text appears as it streams; the OpenAI-compatible backend displays its completed response. The UI redraws only changed lines, renders just the visible slice of a long transcript, and pins itself to the bottom while new output arrives (the header shows `· ↑N lines` when you have scrolled away). Type `/` at the start of the input to open the command palette. Keep typing to filter, use the arrow keys to select, press Enter to run, or Esc to close. `Tab` switches between build and read-only plan modes. Use `PageUp`/`PageDown` to scroll, `Up`/`Down` for prompt history. Messages typed while a turn is running are kept: they are queued and sent after the reply, and `Ctrl+C` during a turn cancels just that turn (a second `Ctrl+C` within ~2s exits). One-shot calls and piped input keep plain text output. The UI displays permission requests and accepts `y` or `n`; `Ctrl+C` there denies the request and stays in the session.
 
 The `delegate_task` tool can select a different `provider` and `model` for a child task. Supported provider names are `anthropic`, `openai-compat`, `ollama`, and `lm-studio`.
 
@@ -586,11 +590,11 @@ wrosecode recipe run audit --set target=attackme.local
 | Area | Commands |
 | --- | --- |
 | Agents | `/agents`, `/build`, `/plan`, `/harness`, `/skills` |
-| Providers | `/connect`, `/providers`, `/models`, `/model`, `/mcps`, `/mcp` |
+| Providers | `/connect`, `/providers`, `/models`, `/mcps`, `/mcp` |
 | Session | `/new`, `/sessions`, `/resume`, `/fork`, `/history`, `/tree`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/dashboard`, `/verbosity`, `/think`, `/theme`, `/compact`, `/export`, `/help`, `/exit`, `/quit` |
 | Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/undo`, `/redo`, `/add`, `/drop`, `/recipe`, `/coverage`, `/flags`, `/writeup`, `/ctf`, `/sandbox` |
 
-`/providers` opens a searchable provider screen with twelve built-in entries and their connection status. Enter configures or selects a provider; `a` adds, `e` edits, `d` deletes a custom provider, and `t` tests a connection. `/connect` opens the custom provider form directly. The API key field is masked. `/models` searches models across connected providers; `/model MODEL` switches the current provider's model.
+`/providers` opens a searchable provider screen with the built-in entries and their connection status. Enter configures or selects a provider; `a` adds, `e` edits, `d` deletes any provider (built-ins included — deleting the active one switches to another configured provider first), and `t` tests a connection. `/connect` opens the custom provider form directly; `/connect openai` offers "Sign in with ChatGPT" (browser loopback or device-code OAuth, tokens stored owner-only at `~/.wrosecode/credentials/openai.json`) next to the plain API-key path. The API key field is masked. `/models` lists models across connected providers and switches to the picked one.
 
 Provider definitions are saved in `~/.wrosecode/providers.toml` without keys. Keys go to the OS keyring when available, otherwise to `~/.wrosecode/auth.json` with mode `0600`. Environment variables override stored keys. Custom provider keys can use `WROSECODE_NAME_API_KEY` (replace dashes in the name with underscores), or a saved `env:VARIABLE` reference. Custom providers support `openai_compat` and `anthropic` APIs; both support streamed replies and tool calls. Each profile can also set `think` (its default thinking level) and `think_map` (per-level provider values) — see *Thinking levels* above. Providers that need cloud-specific signing or URLs can use an OpenAI-compatible gateway as their base URL.
 
@@ -606,6 +610,24 @@ wrosecode providers test my-gateway
 wrosecode --provider my-gateway 'Explain this project'
 wrosecode providers remove my-gateway
 ```
+
+OAuth sign-in (ChatGPT-style) is available alongside API keys. It needs a
+client ID from your own OAuth client registration — nothing first-party is
+bundled:
+
+```bash
+wrosecode providers add openai --base-url https://api.openai.com/v1 \
+  --model gpt-5 --oauth --oauth-client-id YOUR_CLIENT_ID
+wrosecode providers add openai --base-url https://api.openai.com/v1 \
+  --model gpt-5 --oauth --device --oauth-client-id YOUR_CLIENT_ID
+```
+
+The browser flow opens the issuer's authorize URL and waits on a short-lived
+`127.0.0.1:1455` callback (paste the redirect URL instead when the browser
+cannot reach this machine); `--device` prints a code to enter at the
+issuer's verification page instead. Tokens land owner-only (`0600`) at
+`~/.wrosecode/credentials/<name>.json`, the profile records
+`auth_method = "oauth"`, and refresh happens automatically before use.
 
 Use `--stdin` or `--api-key env:VARIABLE` to keep keys out of shell history. You can add repeated `--header K=V` options for non-secret custom headers.
 

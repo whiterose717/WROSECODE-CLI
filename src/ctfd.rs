@@ -45,7 +45,7 @@ struct Client {
 impl Client {
     fn from_env() -> Result<Self> {
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: crate::provider::shared_client(10, 30)?,
             base: std::env::var("CTFD_URL").context("CTFD_URL is not set")?,
             token: std::env::var("CTFD_TOKEN").context("CTFD_TOKEN is not set")?,
         })

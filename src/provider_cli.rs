@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub enum ProviderAction {
@@ -34,6 +35,19 @@ pub struct AddArgs {
     pub model: Option<String>,
     #[arg(long = "header")]
     pub headers: Vec<String>,
+    /// Sign in with OAuth (browser loopback or device flow) instead of an
+    /// API key; the client ID must come from your own OAuth registration.
+    #[arg(long)]
+    pub oauth: bool,
+    /// Device-code flow (no browser callback needed).
+    #[arg(long)]
+    pub device: bool,
+    #[arg(long)]
+    pub oauth_client_id: Option<String>,
+    #[arg(long)]
+    pub oauth_issuer: Option<String>,
+    #[arg(long)]
+    pub oauth_scope: Option<String>,
 }
 #[derive(Args)]
 pub struct KeyArgs {
@@ -71,6 +85,9 @@ pub async fn run(action: ProviderAction) -> Result<()> {
             if settings.profile(&args.name).is_some() {
                 bail!("provider {} already exists", args.name);
             }
+            if args.oauth {
+                return oauth_add(&mut settings, &args).await;
+            }
             let key = read_key(args.api_key, args.stdin)?;
             let mut headers = BTreeMap::new();
             for header in args.headers {
@@ -96,6 +113,10 @@ pub async fn run(action: ProviderAction) -> Result<()> {
                 think: None,
                 think_map: None,
                 builtin: false,
+                auth_method: "api_key".into(),
+                oauth_client_id: String::new(),
+                oauth_issuer: String::new(),
+                oauth_scope: String::new(),
             };
             if profile.base_url.is_empty() {
                 bail!("base URL is required");
@@ -139,10 +160,7 @@ pub async fn run(action: ProviderAction) -> Result<()> {
             } else {
                 settings.providers.iter().map(|p| p.name.clone()).collect()
             };
-            let client = reqwest::Client::builder()
-                .pool_max_idle_per_host(8)
-                .timeout(std::time::Duration::from_secs(15))
-                .build()?;
+            let client = provider::shared_client(10, 15)?;
             let mut failed = false;
             for name in names {
                 match test_one(&mut settings, &name, &client).await {
@@ -173,6 +191,7 @@ pub async fn test_one(
     if profile.base_url.is_empty() {
         bail!("needs setup: base URL is empty");
     }
+    settings.refresh_oauth_if_needed(&profile, client).await?;
     let key = settings.key(&profile);
     if key.is_none() && !settings.no_key_needed(&profile) {
         bail!("key missing");
@@ -192,4 +211,91 @@ fn read_key(value: Option<String>, stdin: bool) -> Result<Option<String>> {
         return Ok(Some(key.trim_end_matches(['\r', '\n']).into()));
     }
     Ok(value)
+}
+
+/// `providers add --oauth`: run the browser loopback or device-code flow,
+/// store the tokens owner-only, and record the `oauth` auth method on the
+/// profile instead of an API key.
+async fn oauth_add(settings: &mut Settings, args: &AddArgs) -> Result<()> {
+    let client = provider::shared_client(10, 30)?;
+    let cfg = crate::oauth::OAuthConfig::new(
+        &args.oauth_client_id.clone().unwrap_or_default(),
+        &args.oauth_issuer.clone().unwrap_or_default(),
+        &args.oauth_scope.clone().unwrap_or_default(),
+    );
+    cfg.validate()?;
+    let tokens = if args.device {
+        let pending = crate::oauth::start_device(&client, &cfg).await?;
+        println!("Open {} and enter code {}", pending.url, pending.user_code);
+        crate::oauth::await_device(&client, &pending).await?
+    } else {
+        let (verifier, challenge) = crate::oauth::pkce()?;
+        let state = crate::oauth::random_state()?;
+        let url = crate::oauth::authorize_url(&cfg, &challenge, &state)?;
+        println!("Open this URL to sign in:\n{url}");
+        let _ = crate::oauth::open_browser(&url);
+        println!("Waiting for the browser callback (or paste the redirect URL here):");
+        let code = tokio::select! {
+            result = crate::oauth::await_callback(
+                cfg.callback_port,
+                &state,
+                crate::oauth::CALLBACK_TIMEOUT,
+            ) => result?,
+            pasted = read_redirect_line() => pasted?,
+        };
+        crate::oauth::exchange_code(&client, &cfg, &code, &verifier).await?
+    };
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    let path = crate::oauth::store_tokens(&home, &args.name, &tokens)?;
+    let mut headers = BTreeMap::new();
+    for header in &args.headers {
+        let (name, value) = header.split_once('=').context("header must be K=V")?;
+        if name.is_empty() {
+            bail!("header name is empty");
+        }
+        headers.insert(name.into(), value.into());
+    }
+    settings.upsert_provider(ProviderProfile {
+        name: args.name.clone(),
+        kind: args.kind.clone(),
+        base_url: args.base_url.clone(),
+        model: args.model.clone().unwrap_or_default(),
+        key_ref: String::new(),
+        headers,
+        think: None,
+        think_map: None,
+        builtin: false,
+        auth_method: "oauth".into(),
+        oauth_client_id: cfg.client_id.clone(),
+        oauth_issuer: args.oauth_issuer.clone().unwrap_or_default(),
+        oauth_scope: args.oauth_scope.clone().unwrap_or_default(),
+    })?;
+    println!(
+        "Signed in{}; tokens stored owner-only at {}",
+        tokens
+            .account_id
+            .as_deref()
+            .map(|id| format!(" as {id}"))
+            .unwrap_or_default(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// One pasted line from stdin: the full redirect URL, or the bare code.
+/// A closed stdin never resolves, so the browser callback can still win.
+async fn read_redirect_line() -> Result<String> {
+    use tokio::io::AsyncBufReadExt as _;
+    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).await?;
+        if read == 0 {
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves");
+        }
+        if let Some(code) = crate::oauth::code_from_pasted(&line) {
+            return Ok(code);
+        }
+    }
 }

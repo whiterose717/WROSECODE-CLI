@@ -29,6 +29,24 @@ pub struct Session {
     pub parent: Option<String>,
 }
 
+/// Human age for `/sessions` labels and CLI listings.
+pub fn age_text(created_secs: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let age = now.saturating_sub(created_secs);
+    if age < 90 {
+        format!("{age}s ago")
+    } else if age < 5400 {
+        format!("{}m ago", age / 60)
+    } else if age < 172_800 {
+        format!("{}h ago", age / 3600)
+    } else {
+        format!("{}d ago", age / 86_400)
+    }
+}
+
 fn redact_json(value: &mut Value) {
     match value {
         Value::String(text) => {
@@ -58,8 +76,10 @@ impl Session {
             .unwrap_or_default()
             .as_secs();
         Self {
+            // Stable, greppable session ID: `ses_<unixtime>-<pid>-<counter>`.
+            // Shown in the status line and accepted by `--session`/`-s`.
             name: format!(
-                "{created}-{}-{}",
+                "ses_{created}-{}-{}",
                 std::process::id(),
                 NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
             ),
@@ -633,6 +653,18 @@ mod tests {
         assert!(session.summary.contains(secret));
         assert!(session.transcript[0].1.contains(secret));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_ids_are_stable_and_human_greppable() {
+        let session = Session::fresh();
+        assert!(
+            session.name.starts_with("ses_"),
+            "session id carries the ses_ prefix: {}",
+            session.name
+        );
+        assert!(age_text(session.created).ends_with("ago"));
+        assert_eq!(age_text(session.created.saturating_add(3_600)), "0s ago");
     }
 
     #[test]

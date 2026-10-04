@@ -25,6 +25,9 @@ tokio = { version = "=1.47.1", features = ["full"] }
 walkdir = "=2.5.0"
 axum = { version = "=0.8.9", features = ["json"] }
 base64 = "=0.23.1"
+ring = "=0.17.14"
+rand = "=0.10.3"
+url = "=2.5.8"
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 
 [profile.release]

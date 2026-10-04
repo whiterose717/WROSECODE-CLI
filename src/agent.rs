@@ -83,6 +83,12 @@ pub struct Agent {
     /// contents ride along in every system prompt, capped, so the model never
     /// has to re-read them. Project-relative paths.
     pub pinned: Vec<String>,
+    /// `--trace` timing sink: per-step API/tool timings as NDJSON. A default
+    /// sink logs nowhere, so instrumentation never branches on the flag.
+    pub trace: crate::trace::TraceSink,
+    /// One short line per tool call executed by the current turn, for the
+    /// end-of-task summary block (TUI result block and headless outcome).
+    pub step_log: Vec<String>,
 }
 
 /// Whether this turn runs on the configured planner model: the goose
@@ -293,10 +299,16 @@ impl Agent {
             agent_system: String::new(),
             agent_name: String::new(),
             pinned: Vec::new(),
+            step_log: Vec::new(),
+            trace: crate::trace::TraceSink::default(),
         })
     }
 
     pub async fn turn(&mut self, text: &str) -> Result<String> {
+        self.step_log.clear();
+        let _trace = self
+            .trace
+            .guard("turn", text.chars().take(80).collect::<String>());
         self.compact_if_needed().await;
         if !self.ctf.category_locked() {
             self.ctf.category = crate::ctf::categorize(&self.config.root, text);
@@ -363,6 +375,8 @@ impl Agent {
                 agent_system: self.agent_system.clone(),
                 agent_name: self.agent_name.clone(),
                 pinned: Vec::new(),
+                step_log: Vec::new(),
+                trace: self.trace.clone(),
                 store: self.store.clone(),
             };
             let summary = child.run(&task).await?;
@@ -747,6 +761,11 @@ impl Agent {
                 response = forced;
             }
             self.last_api_latency = Some(started.elapsed());
+            self.trace.log(
+                "provider",
+                started.elapsed().as_millis(),
+                &format!("{} turns", self.model_turns),
+            );
             self.model_turns += 1;
             self.usage.add(response.usage);
             self.last_turn_reasoning = response.usage.reasoning;
@@ -857,6 +876,7 @@ impl Agent {
             let store = self.store.clone();
             let agent_system = self.agent_system.clone();
             let agent_name = self.agent_name.clone();
+            let trace = self.trace.clone();
             // Snapshot every file this batch is about to touch, so `/undo`
             // can restore the pre-edit state (`src/snapshot.rs`).
             let mut snapshot_paths: Vec<std::path::PathBuf> = Vec::new();
@@ -885,6 +905,7 @@ impl Agent {
             } else {
                 crate::snapshot::capture(&self.config.root, &snapshot_paths)
             };
+            let batch_started = Instant::now();
             let results = join_all(calls.iter().map(|call| {
                 let provider = provider.clone();
                 let config = config.clone();
@@ -896,6 +917,7 @@ impl Agent {
                 let metrics = metrics.clone();
                 let store = store.clone();
                 let agent_system = agent_system.clone();
+                let trace = trace.clone();
                 let agent_name = agent_name.clone();
                 let looped = looped.clone();
                 async move {
@@ -1016,6 +1038,8 @@ impl Agent {
                                 agent_system: agent_system.clone(),
                                 agent_name: agent_name.clone(),
                                 pinned: Vec::new(),
+                                step_log: Vec::new(),
+                                trace: trace.clone(),
                             };
                             let result = child.run(task).await;
                             if let Ok(summary) = &result {
@@ -1043,6 +1067,11 @@ impl Agent {
                 }
             }))
             .await;
+            self.trace.log(
+                "tools",
+                batch_started.elapsed().as_millis(),
+                &format!("{} calls", calls.len()),
+            );
             let mut edited_paths: Vec<String> = calls
                 .iter()
                 .zip(results.iter())
@@ -1068,6 +1097,7 @@ impl Agent {
             }
             for (call, (_, result, elapsed_ms)) in calls.iter().zip(results.iter()) {
                 self.metrics.record_tool(result.is_ok());
+                self.step_log.push(step_title(call, result.is_ok()));
                 if let Ok(output) = result {
                     self.emit_flags(&format!("tool:{}", call.name), output)
                         .await;
@@ -1307,6 +1337,32 @@ fn format_tool_title(name: &str, detail: &str) -> String {
         _ => "Ran",
     };
     format!("{verb} {name} {detail}").trim().to_string()
+}
+
+/// One line per executed tool call for the end-of-task summary: the call
+/// name plus its most informative argument, capped with an explicit marker
+/// so a long command cannot blow up the receipt.
+pub(crate) fn step_title(call: &ToolCall, ok: bool) -> String {
+    let detail = call.input["path"]
+        .as_str()
+        .or_else(|| call.input["pattern"].as_str())
+        .or_else(|| call.input["command"].as_str())
+        .or_else(|| call.input["url"].as_str())
+        .or_else(|| call.input["query"].as_str())
+        .or_else(|| call.input["task"].as_str())
+        .unwrap_or("");
+    let mut line = format!("{} {detail}", call.name);
+    if !ok {
+        line.push_str(" (failed)");
+    }
+    const CAP: usize = 72;
+    let line = line.trim().to_string();
+    if line.chars().count() > CAP {
+        let head: String = line.chars().take(CAP.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        line
+    }
 }
 
 fn task_requires_tool(query: &str) -> bool {
@@ -1742,6 +1798,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn step_titles_name_the_call_and_cap_long_commands() {
+        let call = ToolCall {
+            id: "1".into(),
+            name: "shell".into(),
+            input: serde_json::json!({"command": "echo hi"}),
+        };
+        assert_eq!(step_title(&call, true), "shell echo hi");
+        assert_eq!(step_title(&call, false), "shell echo hi (failed)");
+        let long = ToolCall {
+            id: "2".into(),
+            name: "shell".into(),
+            input: serde_json::json!({"command": "x".repeat(200)}),
+        };
+        let title = step_title(&long, false);
+        assert!(title.ends_with('…'), "{title}");
+        assert_eq!(title.chars().count(), 72, "{title}");
+    }
+
     fn agent_with_mock(root: &Path) -> (Agent, Arc<MockProvider>) {
         let config = Arc::new(Config {
             root: root.to_path_buf(),
@@ -1811,6 +1886,8 @@ mod tests {
             agent_system: String::new(),
             agent_name: String::new(),
             pinned: Vec::new(),
+            step_log: Vec::new(),
+            trace: crate::trace::TraceSink::default(),
         };
         (agent, provider)
     }

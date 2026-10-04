@@ -96,23 +96,42 @@ pub fn paint_lines(
         .collect()
 }
 
-/// Take over the screen: clear it (alternate screens start as whatever was
-/// left behind) and paint the banner. Returns as soon as the bytes are out —
-/// the caller still has providers, skills, and sessions to load.
-pub fn paint(profile: TerminalProfile, boot: &Instant) -> io::Result<()> {
+/// Progressive reveal stage of the startup wordmark: stage 0 draws the first
+/// logo row, each later stage one more, until the full banner is showing.
+/// Callers repaint between init steps they were already doing (provider
+/// setup, skills, MCP), so a slow startup visibly sweeps the banner in while
+/// a fast one just flashes past — the stages themselves never sleep, adding
+/// no launch latency.
+pub fn paint_stage(profile: TerminalProfile, boot: &Instant, stage: u8) -> io::Result<()> {
     let ms = boot.elapsed().as_millis();
-    let _ = FIRST_PAINT_MS.set(ms);
+    if stage == 0 {
+        let _ = FIRST_PAINT_MS.set(ms);
+    }
     let width = crossterm::terminal::size()
         .map(|(width, _)| width)
         .unwrap_or(80);
+    let lines = reveal_lines(paint_lines(width, profile.colors, Some(ms)), stage);
     let mut out = io::stdout().lock();
     if profile.alternate {
         execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
     }
-    for line in paint_lines(width, profile.colors, Some(ms)) {
+    for line in lines {
         writeln!(out, "{line}")?;
     }
     out.flush()
+}
+
+/// Hide wordmark rows beyond the reveal stage (later rows paint blank, then
+/// fill in on the next stage). The tail lines always show: version, timing
+/// and status stay readable from the very first frame.
+fn reveal_lines(mut lines: Vec<String>, stage: u8) -> Vec<String> {
+    let shown = (stage as usize + 1).min(LOGO.len());
+    for (index, line) in lines.iter_mut().enumerate().take(LOGO.len()) {
+        if index >= shown {
+            line.clear();
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -159,5 +178,20 @@ mod tests {
         // Nothing painted yet: budget check fails closed.
         assert!(!within_budget());
         assert!(first_paint_ms().is_none());
+    }
+
+    #[test]
+    fn reveal_stages_draw_the_wordmark_progressively() {
+        let full = banner(Some(3));
+        let stage0 = reveal_lines(full.clone(), 0);
+        assert!(!stage0[0].is_empty(), "first row shows at once");
+        assert!(stage0[1].is_empty() && stage0[2].is_empty());
+        // Tail lines (version, timing) stay readable from frame one.
+        assert!(stage0[3].contains(env!("CARGO_PKG_VERSION")));
+        assert!(stage0[4].contains("first paint"));
+        let stage2 = reveal_lines(full.clone(), 2);
+        assert_eq!(stage2, full, "the last stage is the full banner");
+        let beyond = reveal_lines(full.clone(), 9);
+        assert_eq!(beyond, full, "stages past the end clamp");
     }
 }

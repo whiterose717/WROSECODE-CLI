@@ -11,7 +11,7 @@ use crate::{
     settings::{McpServerDef, ProviderProfile, Settings},
     skills,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::cursor;
 use crossterm::event::{
     self, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -493,7 +493,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Speaker {
     User,
     Agent,
@@ -558,9 +558,16 @@ struct Ui {
     flags_found: usize,
     navigation_mode: bool,
     theme: usize,
-    pane_percent: usize,
-    dragging_separator: bool,
-    tool_timeline: Vec<String>,
+    /// Finished delegate subagents this session, collapsed to one summary
+    /// line in the tree pane instead of growing it without bound.
+    finished_children: usize,
+    finished_ms: u128,
+    /// Last Ctrl+C at an idle prompt (or cancelling a turn): a second press
+    /// within the exit window quits instead of just clearing input.
+    last_interrupt: Option<std::time::Instant>,
+    /// `--trace` timing sink, shared with the agent: slow frames land in
+    /// `~/.wrosecode/trace.log` next to the API/tool timings.
+    pub trace: crate::trace::TraceSink,
     metrics: crate::metrics::MetricsSnapshot,
     timeout_seconds: u64,
     search_query: String,
@@ -571,7 +578,6 @@ struct Ui {
     turn_tokens: Vec<u64>,
     turn_usage: Usage,
     turn_started: Option<std::time::Instant>,
-    last_turn_ms: u64,
     error_count: usize,
     last_error_kind: &'static str,
     completion: Option<CompletionState>,
@@ -911,7 +917,9 @@ impl UiMeta {
 
 impl Ui {
     fn new(agent: &Agent, session_id: String) -> Self {
-        Self::from_meta(UiMeta::from(agent), session_id)
+        let mut ui = Self::from_meta(UiMeta::from(agent), session_id);
+        ui.trace = agent.trace.clone();
+        ui
     }
 
     fn from_meta(meta: UiMeta, session_id: String) -> Self {
@@ -967,10 +975,11 @@ impl Ui {
             flags_found: 0,
             navigation_mode: false,
             theme: meta.theme,
-            pane_percent: 68,
-            dragging_separator: false,
-            tool_timeline: Vec::new(),
+            finished_children: 0,
+            finished_ms: 0,
+            last_interrupt: None,
             metrics: crate::metrics::MetricsSnapshot::default(),
+            trace: crate::trace::TraceSink::default(),
             timeout_seconds: meta.timeout_seconds,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -980,7 +989,6 @@ impl Ui {
             turn_tokens: Vec::new(),
             turn_usage: Usage::default(),
             turn_started: None,
-            last_turn_ms: 0,
             error_count: 0,
             last_error_kind: "",
             transcript_lines: Vec::new(),
@@ -1139,7 +1147,6 @@ impl Ui {
         self.finalize_think();
         if let Some(started) = self.turn_started.take() {
             let wall_ms = started.elapsed().as_millis() as u64;
-            self.last_turn_ms = wall_ms;
             self.turn_tokens.push(self.turn_usage.output.max(1));
             if self.turn_tokens.len() > 64 {
                 self.turn_tokens.remove(0);
@@ -1181,8 +1188,9 @@ impl Ui {
     }
 
     /// The end-of-task summary block (spec 3.3): verification status,
-    /// answer, proof, time split, steps, tokens, cache rate, cost, savings.
-    fn push_result_block(&mut self) {
+    /// answer, proof, time split, numbered step list, tokens, cache rate,
+    /// cost, savings.
+    fn push_result_block(&mut self, steps: &[String]) {
         let base = self.task_base.take().unwrap_or_default();
         let wall = self
             .task_started
@@ -1223,14 +1231,23 @@ impl Ui {
             cache_read,
             ..Usage::default()
         });
-        let steps = self.tool_calls.saturating_sub(base.tool_calls);
+        let step_count = self.tool_calls.saturating_sub(base.tool_calls);
+        let mut step_lines = String::new();
+        // The closing receipt names what the turn did, one line per step;
+        // the list is capped so a long run cannot flood the transcript.
+        for (index, step) in steps.iter().enumerate().take(8) {
+            step_lines.push_str(&format!("\n {}. {step}", index + 1));
+        }
+        if steps.len() > 8 {
+            step_lines.push_str(&format!("\n … +{} more", steps.len() - 8));
+        }
         let cost = if base.has_cost || self.metrics.cost_usd.is_some() {
             Some(self.metrics.cost_usd.unwrap_or(0.0) - base.cost)
         } else {
             None
         };
         let mut text = format!(
-            " {status}\n answer: {answer}\n proof: {proof}\n time {} (model {} · tools {} · wait {})\n steps {steps} · tokens {} ({hit}% cache) · cost {} · saved ~{} tok",
+            " {status}\n answer: {answer}\n proof: {proof}\n time {} (model {} · tools {} · wait {})\n steps {step_count}{step_lines} · tokens {} ({hit}% cache) · cost {} · saved ~{} tok",
             secs_text(wall),
             secs_text(model),
             secs_text(tools),
@@ -1428,7 +1445,8 @@ impl Ui {
         self.think_row = None;
         self.top_entry = None;
         self.line_origin.clear();
-        self.tool_timeline.clear();
+        self.finished_children = 0;
+        self.finished_ms = 0;
         self.last_flag.clear();
         self.search_query.clear();
         self.search_matches.clear();
@@ -1471,6 +1489,28 @@ impl Ui {
         } else {
             format!(" · ↓ {} new lines  (End to jump)", self.new_since_detach)
         }
+    }
+
+    /// Two-stage idle Ctrl+C: the first press clears the draft (or, with an
+    /// empty prompt, arms a ~2s exit window with a hint); a second press
+    /// inside the window quits. Returns true when the event loop should exit.
+    fn ctrl_c_idle(&mut self) -> bool {
+        if self.input.is_empty() {
+            let recent = self
+                .last_interrupt
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(2));
+            self.last_interrupt = Some(std::time::Instant::now());
+            if recent {
+                return true;
+            }
+            self.status = "Ready · (press Ctrl+C again to exit)".into();
+            return false;
+        }
+        self.last_interrupt = Some(std::time::Instant::now());
+        self.clear_input();
+        self.completion = None;
+        self.status = "Input cleared · Ctrl+C again to exit".into();
+        false
     }
 
     /// Insert a transcript row while keeping a scrolled-up viewport anchored.
@@ -1606,10 +1646,16 @@ impl Ui {
                 self.inflight_tools = self.inflight_tools.saturating_sub(1);
                 self.turn_tool_ms += elapsed_ms;
                 self.tool_ms_total += elapsed_ms;
-                // Nested child: update its row under the root cell.
+                // Nested child: update its row under the root cell. Finished
+                // children collapse into the tree summary line instead of
+                // growing the tree pane without bound.
                 if id.contains('/') {
                     if let Some(cell) = self.child_cells.get_mut(&id) {
-                        cell.running = false;
+                        if cell.running {
+                            cell.running = false;
+                            self.finished_children += 1;
+                            self.finished_ms += elapsed_ms;
+                        }
                         cell.ok = ok;
                         cell.elapsed_ms = elapsed_ms;
                     }
@@ -1672,7 +1718,6 @@ impl Ui {
                             },
                             added,
                         );
-                        self.push_timeline(&title, false, elapsed_ms);
                     }
                     return;
                 }
@@ -1708,7 +1753,6 @@ impl Ui {
                     let text = self.cell_text(&id, &cell);
                     self.tool_cells.insert(id.clone(), cell);
                     self.set_entry_text(row, text);
-                    self.push_timeline(&title, ok, elapsed_ms);
                 }
             }
             Progress::Plan(items) => self.plan = items,
@@ -1776,18 +1820,6 @@ impl Ui {
         }
         let text = self.cell_text(id, &cell);
         self.set_entry_text(cell.row, text);
-    }
-
-    /// One timeline line per finished tool, capped like the session itself.
-    fn push_timeline(&mut self, title: &str, ok: bool, elapsed_ms: u128) {
-        let icon = if ok { "✓" } else { "✗" };
-        self.tool_timeline.push(format!(
-            "{icon} {title} · {:.1}s",
-            elapsed_ms as f64 / 1000.0
-        ));
-        if self.tool_timeline.len() > 200 {
-            self.tool_timeline.remove(0);
-        }
     }
 
     /// Full text for a tool cell: header, nested child tools, and either the
@@ -2147,9 +2179,16 @@ impl Ui {
     }
 
     fn render(&mut self) -> io::Result<()> {
+        let started = std::time::Instant::now();
         let (width, height) = terminal::size()?;
         let (frame, cursor) = self.compose(width, height);
-        self.renderer.draw(&frame, cursor, (width, height))
+        let outcome = self.renderer.draw(&frame, cursor, (width, height));
+        // Slow frames go to the trace log; every frame would drown it.
+        let ms = started.elapsed().as_millis();
+        if ms > 16 {
+            self.trace.log("render", ms, &format!("{width}x{height}"));
+        }
+        outcome
     }
 
     /// Build one frame for a `width` x `height` terminal. Layout only, no IO,
@@ -2349,16 +2388,10 @@ impl Ui {
         let chip_rows = usize::from(self.paste_chip.is_some());
         let body_end = height_usize.saturating_sub(2 + input_rows + chip_rows);
         let body_height = body_end.saturating_sub(body_start);
-        // The clamp keeps a usable left pane but must never exceed the
-        // terminal itself: on a 23-column screen the old bounds produced a
-        // 24-column pane and pushed rows two cells past the edge.
-        let left_width = width_usize
-            .saturating_mul(self.pane_percent)
-            .checked_div(100)
-            .unwrap_or(0)
-            .clamp(24, width_usize.saturating_sub(22).max(24))
-            .min(width_usize.saturating_sub(1));
-        let right_width = width_usize.saturating_sub(left_width + 1);
+        // The transcript owns the full terminal width. Token, latency and
+        // cost counters stay internal (status line, `/stats`, `live.json`)
+        // instead of occupying permanent screen real estate.
+        let left_width = width_usize;
         let top_height = body_height.saturating_mul(2).checked_div(3).unwrap_or(0);
         let bottom_height = body_height.saturating_sub(top_height);
         // Wrapped rows come from the cache; scrolling reslices instead of
@@ -2405,110 +2438,8 @@ impl Ui {
         };
         self.top_entry = self.line_origin.get(transcript_start).copied();
 
-        let usage_max = [
-            self.usage.input,
-            self.usage.output,
-            self.usage.reasoning,
-            self.usage.cache_read,
-            self.usage.cache_write,
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(1)
-        .max(1);
-        let turn_note = if self.last_turn_ms > 0 {
-            format!(" · {}", format_duration_ms(self.last_turn_ms))
-        } else {
-            String::new()
-        };
-        let mut dashboard: Vec<String> = vec![
-            " TOKEN DASHBOARD".to_string(),
-            metric_bar("input", self.usage.input, usage_max, right_width),
-            metric_bar("output", self.usage.output, usage_max, right_width),
-            metric_bar("reason", self.usage.reasoning, usage_max, right_width),
-            metric_bar("cache R", self.usage.cache_read, usage_max, right_width),
-            metric_bar("cache W", self.usage.cache_write, usage_max, right_width),
-            format!(" model  {}", self.model),
-            format!(
-                " cost   {}",
-                self.metrics
-                    .cost_usd
-                    .map(|cost| format!("${cost:.5}"))
-                    .unwrap_or_else(|| "n/a".into())
-            ),
-            if self.budget_usd > 0.0 {
-                let percent = self.metrics.cost_usd.unwrap_or(0.0) * 100.0 / self.budget_usd;
-                if percent >= 80.0 {
-                    format!(" WARN budget {percent:.0}% of ${:.2}", self.budget_usd)
-                } else {
-                    format!(" budget {percent:.0}% of ${:.2}", self.budget_usd)
-                }
-            } else {
-                " budget unlimited".into()
-            },
-            format!(
-                " p50/p95/p99 {}/{}/{}ms",
-                self.metrics.latency_p50_ms,
-                self.metrics.latency_p95_ms,
-                self.metrics.latency_p99_ms
-            ),
-            format!(
-                " lat  {}",
-                sparkline(
-                    &self
-                        .metrics
-                        .latency_histogram
-                        .iter()
-                        .map(|bucket| bucket.count)
-                        .collect::<Vec<u64>>(),
-                    right_width.saturating_sub(6).max(4)
-                )
-            ),
-        ];
-        if self.metrics.rate_limits > 0 {
-            dashboard.push(format!(" WARN 429s {}", self.metrics.rate_limits));
-        }
-        if self.metrics.by_model.len() > 1 {
-            for (name, model) in self.metrics.by_model.iter().take(4) {
-                dashboard.push(format!(
-                    "  {} {} tok ${}",
-                    clip(name, right_width.saturating_sub(14).max(6)),
-                    compact_number(model.usage.input + model.usage.output),
-                    model
-                        .cost_usd
-                        .map(|cost| format!("{cost:.5}"))
-                        .unwrap_or_else(|| "?".into())
-                ));
-            }
-        }
-        dashboard.extend_from_slice(&[
-            format!(" cache  {}%", cache_percent(self.usage)),
-            format!(" flags  {}", self.flags_found),
-            format!(
-                " turn   {}{}",
-                sparkline(
-                    &self.turn_tokens,
-                    right_width.saturating_sub(8 + turn_note.len()).max(4)
-                ),
-                turn_note
-            ),
-            format!(
-                " errors {}{}",
-                self.error_count,
-                if self.error_count > 0 {
-                    format!(" · last {}", self.last_error_kind)
-                } else {
-                    String::new()
-                }
-            ),
-            format!(
-                " tier   {} · {} workers",
-                speed_tier(self.thinking_level),
-                level_workers(self.thinking_level)
-            ),
-        ]);
         for row in 0..top_height {
-            let left = if row == 0 {
+            let line = if row == 0 {
                 format!(
                     " TRANSCRIPT  {} {}{}",
                     self.entries.len(),
@@ -2525,29 +2456,40 @@ impl Ui {
                     .map(|line| (*line).to_string())
                     .unwrap_or_default()
             };
-            let right = dashboard.get(row).cloned().unwrap_or_default();
-            frame[body_start + row] = Row::new(
-                join_panes(&left, &right, left_width, right_width),
-                colors.text,
-            );
+            frame[body_start + row] = Row::new(clip(&line, left_width), colors.text);
         }
-        let active: Vec<String> = self
-            .tool_rows
+        // The subagent tree shows only in-flight work, newest last, capped
+        // to the pane so it can never shove the transcript out of view.
+        // Finished subagents collapse to a single summary line.
+        let mut running: Vec<&ToolCell> = self
+            .tool_cells
             .values()
-            .filter_map(|index| self.entries.get(*index))
-            .map(|entry| {
-                let filled = self.spinner % 6 + 1;
-                format!(
-                    " ├─ [{}{}] {}",
-                    "█".repeat(filled),
-                    "░".repeat(7 - filled),
-                    entry.text.trim()
-                )
-            })
+            .filter(|cell| cell.running)
             .collect();
+        running.sort_by_key(|cell| cell.row);
+        // Header + root line + one footer line are reserved; the rest is the
+        // capped running window.
+        let slots = bottom_height.saturating_sub(3);
+        let hidden = running.len().saturating_sub(slots);
+        // Oldest at the top of the window, newest at the bottom: a
+        // scrolling view over the in-flight list.
+        let shown: Vec<&ToolCell> = running.into_iter().skip(hidden).collect();
+        let filled = self.spinner % 6 + 1;
+        let footer = if hidden > 0 {
+            format!(" +{hidden} more running")
+        } else if self.finished_children > 0 {
+            format!(
+                " ✓ {} subagents done · {}",
+                self.finished_children,
+                format_duration_ms(self.finished_ms.min(u64::MAX as u128) as u64)
+            )
+        } else {
+            String::new()
+        };
         for row in 0..bottom_height {
-            let left = if row == 0 {
-                format!(" SUBAGENT TREE  {} active", active.len())
+            let line = if row == 0 {
+                let running_count = self.tool_cells.values().filter(|cell| cell.running).count();
+                format!(" SUBAGENT TREE  {running_count} running")
             } else if row == 1 {
                 format!(
                     " root [{}] think {} · {}",
@@ -2555,27 +2497,24 @@ impl Ui {
                     self.think_label(),
                     level_resources(self.thinking_level)
                 )
+            } else if row == bottom_height.saturating_sub(1) && !footer.is_empty() {
+                footer.clone()
             } else {
-                active.get(row - 2).cloned().unwrap_or_default()
-            };
-            let right = if row == 0 {
-                format!(" TOOL TIMELINE  {} calls", self.tool_calls)
-            } else {
-                let start = self
-                    .tool_timeline
-                    .len()
-                    .saturating_sub(bottom_height.saturating_sub(1));
-                self.tool_timeline
-                    .get(start + row - 1)
-                    .cloned()
+                shown
+                    .get(row - 2)
+                    .map(|cell| {
+                        format!(
+                            " ├─ [{}{}] {}",
+                            "█".repeat(filled),
+                            "░".repeat(7 - filled),
+                            clip(&cell.title, left_width.saturating_sub(16).max(8))
+                        )
+                    })
                     .unwrap_or_default()
             };
             let target = body_start + top_height + row;
             if target < body_end {
-                frame[target] = Row::new(
-                    join_panes(&left, &right, left_width, right_width),
-                    colors.muted,
-                );
+                frame[target] = Row::new(clip(&line, left_width), colors.muted);
             }
         }
         let choices: Vec<String> = if self.picker.is_some() {
@@ -2640,10 +2579,11 @@ impl Ui {
         };
         let status_text = if self.busy {
             format!(
-                " {} {}{} · {} · think:{} · tok {}/{} · cache {}% · {}s · step {} · {}/{} · {} · {}w · cost {} · timeout {}s · tools {}:{}",
+                " {} {}{} · session {} · {} · think:{} · tok {}/{} · cache {}% · {}s · step {} · {}/{} · {} · {}w · cost {} · timeout {}s · tools {}:{}",
                 spinner[self.spinner % spinner.len()],
                 self.status,
                 queue_note,
+                self.session_id,
                 self.model,
                 self.think_label(),
                 self.usage.input,
@@ -2665,9 +2605,10 @@ impl Ui {
             )
         } else {
             format!(
-                " {}{} · {} · think:{} · tok {}/{} · cache {}% · {}s · step {} · {}/{} · {} · {}w · cost {} · tools {}:{} · errors {} · flags {}",
+                " {}{} · session {} · {} · think:{} · tok {}/{} · cache {}% · {}s · step {} · {}/{} · {} · {}w · cost {} · tools {}:{} · errors {} · flags {}",
                 self.status,
                 queue_note,
+                self.session_id,
                 self.model,
                 self.think_label(),
                 self.usage.input,
@@ -2832,7 +2773,9 @@ fn clip(text: &str, width: usize) -> String {
 }
 
 /// One transcript entry as rendered rows: label on the first line, indented
-/// continuation lines after it, clipped to the transcript pane.
+/// continuation lines after it, clipped to the transcript pane. A tool call's
+/// command line is never truncated: it wraps onto as many rows as it needs.
+/// Tool *output* stays capped with its own explicit markers instead.
 fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
     let label = match entry.speaker {
         Speaker::User => "YOU",
@@ -2843,7 +2786,11 @@ fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
     let available = left_width.saturating_sub(9).max(1);
     let mut lines = Vec::new();
     for (part_index, line) in entry.text.lines().enumerate() {
-        for (wrap_index, part) in if verbose {
+        // The first line of a tool cell is the command or task being run:
+        // always show all of it, wrapped, so a long command is never cut
+        // off mid-text the way silent clipping would.
+        let wrap_first = verbose || (part_index == 0 && entry.speaker == Speaker::Tool);
+        for (wrap_index, part) in if wrap_first {
             wrap(line, available)
         } else {
             vec![clip(line, available)]
@@ -3109,28 +3056,6 @@ fn register_user_themes() {
         extra.clear();
         extra.extend(loaded);
     }
-}
-
-fn join_panes(left: &str, right: &str, left_width: usize, right_width: usize) -> String {
-    format!(
-        "{:<left_width$}│{:<right_width$}",
-        clip(left, left_width),
-        clip(right, right_width)
-    )
-}
-
-fn metric_bar(label: &str, value: u64, maximum: u64, width: usize) -> String {
-    let bar_width = width.saturating_sub(19).min(18);
-    let filled = value
-        .saturating_mul(bar_width as u64)
-        .checked_div(maximum)
-        .unwrap_or(0) as usize;
-    format!(
-        " {label:<7} {:>7} {}{}",
-        compact_number(value),
-        "█".repeat(filled),
-        "░".repeat(bar_width.saturating_sub(filled))
-    )
 }
 
 /// `8400` -> `8.4s`, `320` -> `320ms`, `125_000` -> `2m5s`.
@@ -4194,8 +4119,6 @@ pub async fn run(
             continue;
         }
         if let Event::Mouse(mouse) = &next {
-            let (terminal_width, _) = terminal::size()?;
-            let separator = terminal_width as usize * ui.pane_percent / 100;
             if ui.dashboard {
                 // The dashboard has no scrollback: the wheel moves the panel
                 // selection instead (spec 3.2).
@@ -4208,17 +4131,6 @@ pub async fn run(
                 continue;
             }
             match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left)
-                    if (mouse.column as usize).abs_diff(separator) <= 1 =>
-                {
-                    ui.dragging_separator = true;
-                }
-                MouseEventKind::Drag(MouseButton::Left) if ui.dragging_separator => {
-                    ui.pane_percent = (mouse.column as usize * 100
-                        / terminal_width.max(1) as usize)
-                        .clamp(40, 80);
-                }
-                MouseEventKind::Up(MouseButton::Left) => ui.dragging_separator = false,
                 // A click on a transcript row expands or collapses its cell
                 // (spec 3.1): map the terminal row back through line_origin.
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -4253,14 +4165,11 @@ pub async fn run(
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && key.code == KeyCode::Char('c')
         {
-            // One press clears what you were typing; a second press from an
-            // empty prompt exits.
-            if ui.input.is_empty() {
+            // A cancelled turn arms the same window, so Ctrl+C, Ctrl+C stops
+            // a run and exits.
+            if ui.ctrl_c_idle() {
                 break;
             }
-            ui.clear_input();
-            ui.completion = None;
-            ui.status = "Input cleared · Ctrl+C again to exit".into();
             continue;
         }
         match key.code {
@@ -4735,6 +4644,8 @@ async fn run_prompt(
     match outcome {
         TurnOutcome::Cancelled => {
             agent.messages.truncate(messages_before);
+            // Arm the exit window: a second Ctrl+C within ~2s quits.
+            ui.last_interrupt = Some(std::time::Instant::now());
             ui.push(
                 Speaker::System,
                 "Turn cancelled. Your input and any queued messages are kept.",
@@ -4822,8 +4733,9 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
                     }
                     KeyCode::Enter if ui.input.is_empty() => ui.toggle_top_entry(),
                     KeyCode::Enter if ui.paste_chip.is_some() => {
-                        let (pasted, _) = ui.paste_chip.take().expect("chip is present");
-                        ui.insert_str(&pasted);
+                        if let Some((pasted, _)) = ui.paste_chip.take() {
+                            ui.insert_str(&pasted);
+                        }
                     }
                     KeyCode::Enter => {
                         let queued = ui.take_input();
@@ -4891,7 +4803,7 @@ async fn run_turn_queue(
             return Ok(false);
         }
         let Some(next) = ui.pending.first().cloned() else {
-            ui.push_result_block();
+            ui.push_result_block(&agent.step_log);
             return Ok(true);
         };
         ui.pending.remove(0);
@@ -4977,14 +4889,14 @@ fn sync_session(session: &mut Session, agent: &Agent, ui: &Ui) {
         .collect();
 }
 
-fn restore_session(
+async fn restore_session(
     session: &Session,
     agent: &mut Agent,
     ui: &mut Ui,
     settings: &Settings,
 ) -> Result<()> {
     if !session.provider_name.is_empty() && !session.model.is_empty() {
-        switch_provider(agent, ui, settings, &session.provider_name, &session.model)?;
+        switch_provider(agent, ui, settings, &session.provider_name, &session.model).await?;
     }
     apply_session_state(session, agent, ui);
     Ok(())
@@ -5251,7 +5163,7 @@ fn picker(ui: &mut Ui, title: &str, items: Vec<String>) -> Result<Option<usize>>
     }
 }
 
-fn switch_provider(
+async fn switch_provider(
     agent: &mut Agent,
     ui: &mut Ui,
     settings: &Settings,
@@ -5261,6 +5173,9 @@ fn switch_provider(
     let profile = settings
         .profile(name)
         .ok_or_else(|| anyhow::anyhow!("unknown provider: {name}"))?;
+    settings
+        .refresh_oauth_if_needed(profile, &agent.tools.client)
+        .await?;
     let provider = provider::create_profile(
         profile,
         settings.key(profile),
@@ -6146,11 +6061,18 @@ async fn run_command(
             let sessions = Session::list(&session_dir)?;
             let labels = sessions
                 .iter()
-                .map(|s| format!("{}  {}  {}", s.created, s.name, s.summary))
+                .map(|s| {
+                    format!(
+                        "{}  {}  {}",
+                        crate::session::age_text(s.created),
+                        s.name,
+                        s.summary
+                    )
+                })
                 .collect();
             if let Some(index) = picker(ui, "Sessions", labels)? {
                 *session = sessions[index].clone();
-                restore_session(session, agent, ui, settings)?;
+                restore_session(session, agent, ui, settings).await?;
                 ui.push(Speaker::System, format!("Resumed {}", session.name));
             }
         }
@@ -6359,16 +6281,6 @@ async fn run_command(
         "/providers" => {
             provider_screen(agent, ui, settings).await?;
         }
-        "/model" => {
-            let model = if args.is_empty() {
-                ask_line(ui, "Model", &agent.config.model)?
-            } else {
-                Some(args.into())
-            };
-            if let Some(model) = model {
-                switch_provider(agent, ui, settings, &agent.config.provider.clone(), &model)?;
-            }
-        }
         "/models" => {
             if !agent.config.planner_model.is_empty() {
                 ui.push(
@@ -6383,12 +6295,20 @@ async fn run_command(
                 );
             }
             let models = available_models(agent, settings).await;
-            let labels = models
-                .iter()
-                .map(|(name, model)| format!("{name}  /  {model}"))
-                .collect();
-            if let Some(index) = picker(ui, "Models", labels)? {
-                switch_provider(agent, ui, settings, &models[index].0, &models[index].1)?;
+            if models.is_empty() {
+                ui.push(
+                    Speaker::System,
+                    "No configured models: add one with /connect or /providers".to_string(),
+                );
+            } else {
+                let labels = models
+                    .iter()
+                    .map(|(name, model)| format!("{name}  /  {model}"))
+                    .collect();
+                if let Some(index) = picker(ui, "Models", labels)? {
+                    switch_provider(agent, ui, settings, &models[index].0, &models[index].1)
+                        .await?;
+                }
             }
         }
         "/mcps" | "/mcp" => {
@@ -6508,6 +6428,23 @@ async fn provider_form(
         if existing.is_none() && settings.profile(&name).is_some() {
             anyhow::bail!("provider {name} already exists");
         }
+        if existing.is_none() && name == "openai" {
+            // `/connect openai` offers both doors: ChatGPT browser sign-in
+            // next to the plain API-key path.
+            let choice = picker(
+                ui,
+                "Auth",
+                vec![
+                    "Sign in with ChatGPT (browser OAuth)".into(),
+                    "Use API key".into(),
+                ],
+            )?;
+            match choice {
+                Some(0) => return oauth_connect(name, agent, ui, settings).await,
+                Some(_) => {}
+                None => return Ok(()),
+            }
+        }
         let previous = existing.clone();
         let default_url = previous.as_ref().map(|p| p.base_url.as_str()).unwrap_or("");
         let Some(base_url) = ask_line(ui, "Base URL", default_url)? else {
@@ -6575,6 +6512,22 @@ async fn provider_form(
             think: previous.as_ref().and_then(|p| p.think),
             think_map: previous.as_ref().and_then(|p| p.think_map.clone()),
             builtin: Settings::builtin(&name),
+            auth_method: previous
+                .as_ref()
+                .map(|p| p.auth_method.clone())
+                .unwrap_or_else(|| "api_key".into()),
+            oauth_client_id: previous
+                .as_ref()
+                .map(|p| p.oauth_client_id.clone())
+                .unwrap_or_default(),
+            oauth_issuer: previous
+                .as_ref()
+                .map(|p| p.oauth_issuer.clone())
+                .unwrap_or_default(),
+            oauth_scope: previous
+                .as_ref()
+                .map(|p| p.oauth_scope.clone())
+                .unwrap_or_default(),
         };
         if key.is_none() && !settings.no_key_needed(&profile) && !entered_key.starts_with("env:") {
             anyhow::bail!("API key is required for {name}");
@@ -6672,7 +6625,7 @@ async fn provider_form(
             );
         }
         if !profile.model.is_empty() {
-            switch_provider(agent, ui, settings, &name, &profile.model)?;
+            switch_provider(agent, ui, settings, &name, &profile.model).await?;
         }
         ui.status = format!(
             "{name} key {}",
@@ -6685,6 +6638,140 @@ async fn provider_form(
         );
         return Ok(());
     }
+}
+
+/// `/connect openai` → "Sign in with ChatGPT": browser loopback or device
+/// flow, tokens stored owner-only, profile recorded as `oauth` — the API-key
+/// path stays untouched in `provider_form`.
+async fn oauth_connect(
+    name: String,
+    agent: &mut Agent,
+    ui: &mut Ui,
+    settings: &mut Settings,
+) -> Result<()> {
+    let previous = settings.profile(&name).cloned();
+    let Some(base_url) = ask_line(
+        ui,
+        "Base URL",
+        previous
+            .as_ref()
+            .map(|profile| profile.base_url.as_str())
+            .unwrap_or("https://api.openai.com/v1"),
+    )?
+    else {
+        return Ok(());
+    };
+    let base_url = Settings::normalize_url(&base_url)?;
+    if base_url.is_empty() {
+        anyhow::bail!("base URL is required");
+    }
+    let Some(model) = ask_line(
+        ui,
+        "Model",
+        previous
+            .as_ref()
+            .map(|profile| profile.model.as_str())
+            .unwrap_or(""),
+    )?
+    else {
+        return Ok(());
+    };
+    let default_client = previous
+        .as_ref()
+        .map(|profile| profile.oauth_client_id.as_str())
+        .unwrap_or("");
+    let default_client = if default_client.is_empty() {
+        std::env::var("WROSECODE_OAUTH_CLIENT_ID").unwrap_or_default()
+    } else {
+        default_client.into()
+    };
+    let Some(client_id) = ask_line(
+        ui,
+        "OAuth client ID (from your own OAuth client registration)",
+        &default_client,
+    )?
+    else {
+        return Ok(());
+    };
+    let cfg = crate::oauth::OAuthConfig::new(&client_id, "", "");
+    cfg.validate()?;
+    let method = picker(
+        ui,
+        "Sign in",
+        vec![
+            "Browser (localhost callback)".into(),
+            "Device code (headless / remote)".into(),
+        ],
+    )?;
+    let Some(method) = method else {
+        return Ok(());
+    };
+    let client = agent.tools.client.clone();
+    let tokens = if method == 0 {
+        let (verifier, challenge) = crate::oauth::pkce()?;
+        let state = crate::oauth::random_state()?;
+        let url = crate::oauth::authorize_url(&cfg, &challenge, &state)?;
+        ui.push(
+            Speaker::System,
+            format!("Open this URL to sign in with ChatGPT:\n{url}"),
+        );
+        let _ = crate::oauth::open_browser(&url);
+        ui.push(
+            Speaker::System,
+            "Waiting for the browser callback…".to_string(),
+        );
+        ui.render()?;
+        let code =
+            crate::oauth::await_callback(cfg.callback_port, &state, crate::oauth::CALLBACK_TIMEOUT)
+                .await?;
+        crate::oauth::exchange_code(&client, &cfg, &code, &verifier).await?
+    } else {
+        let pending = crate::oauth::start_device(&client, &cfg).await?;
+        ui.push(
+            Speaker::System,
+            format!("Open {} and enter code {}", pending.url, pending.user_code),
+        );
+        ui.render()?;
+        crate::oauth::await_device(&client, &pending).await?
+    };
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    let path = crate::oauth::store_tokens(&home, &name, &tokens)?;
+    settings.upsert_provider(ProviderProfile {
+        name: name.clone(),
+        kind: "openai_compat".into(),
+        base_url,
+        model: model.clone(),
+        key_ref: String::new(),
+        headers: previous
+            .as_ref()
+            .map(|profile| profile.headers.clone())
+            .unwrap_or_default(),
+        think: previous.as_ref().and_then(|profile| profile.think),
+        think_map: previous
+            .as_ref()
+            .and_then(|profile| profile.think_map.clone()),
+        builtin: Settings::builtin(&name),
+        auth_method: "oauth".into(),
+        oauth_client_id: cfg.client_id.clone(),
+        oauth_issuer: String::new(),
+        oauth_scope: String::new(),
+    })?;
+    if !model.is_empty() {
+        switch_provider(agent, ui, settings, &name, &model).await?;
+    }
+    ui.push(
+        Speaker::System,
+        format!(
+            "Signed in{}; tokens stored owner-only at {}",
+            tokens
+                .account_id
+                .as_deref()
+                .map(|id| format!(" as {id}"))
+                .unwrap_or_default(),
+            path.display()
+        ),
+    );
+    Ok(())
 }
 
 async fn provider_screen(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings) -> Result<()> {
@@ -6788,45 +6875,51 @@ async fn provider_screen(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings
                 }
                 KeyCode::Char('d') if ui.input.is_empty() => {
                     if let Some(profile) = selected {
-                        if profile.builtin {
-                            ui.push(Speaker::System, "Built-in providers cannot be deleted");
-                        } else {
-                            let fallback = settings
-                                .providers
-                                .iter()
-                                .find(|other| {
-                                    other.name != profile.name
-                                        && !other.model.is_empty()
-                                        && !other.base_url.is_empty()
-                                        && (settings.key(other).is_some()
-                                            || settings.no_key_needed(other))
-                                })
-                                .cloned();
-                            if agent.config.provider == profile.name && fallback.is_none() {
-                                ui.push(
-                                    Speaker::System,
-                                    "Connect another provider before deleting the active one",
-                                );
-                                continue;
-                            }
-                            ui.picker = None;
-                            if ask_line(ui, &format!("Type DELETE to remove {}", profile.name), "")?
-                                .as_deref()
-                                == Some("DELETE")
-                            {
-                                settings.remove_provider(&profile.name)?;
-                                if agent.config.provider == profile.name {
-                                    let fallback = fallback.expect("checked above");
+                        // Any entry — built-in defaults included — can go.
+                        // Deleting the active provider requires a fallback
+                        // with a model, a base URL, and a key first.
+                        let fallback = settings
+                            .providers
+                            .iter()
+                            .find(|other| {
+                                other.name != profile.name
+                                    && !other.model.is_empty()
+                                    && !other.base_url.is_empty()
+                                    && (settings.key(other).is_some()
+                                        || settings.no_key_needed(other))
+                            })
+                            .cloned();
+                        if agent.config.provider == profile.name && fallback.is_none() {
+                            ui.push(
+                                Speaker::System,
+                                "Connect another provider before deleting the active one",
+                            );
+                            continue;
+                        }
+                        ui.picker = None;
+                        if ask_line(ui, &format!("Type DELETE to remove {}", profile.name), "")?
+                            .as_deref()
+                            == Some("DELETE")
+                        {
+                            settings.remove_provider(&profile.name)?;
+                            if agent.config.provider == profile.name {
+                                if let Some(fallback) = fallback {
                                     switch_provider(
                                         agent,
                                         ui,
                                         settings,
                                         &fallback.name,
                                         &fallback.model,
-                                    )?;
+                                    )
+                                    .await?;
+                                } else {
+                                    ui.push(
+                                        Speaker::System,
+                                        "Connect another provider before deleting the active one",
+                                    );
                                 }
-                                ui.push(Speaker::System, format!("Removed {}", profile.name));
                             }
+                            ui.push(Speaker::System, format!("Removed {}", profile.name));
                         }
                     }
                 }
@@ -7154,6 +7247,146 @@ mod tests {
             status.starts_with(&format!(" {}", ui.status)),
             "the state word opens the line: {status}"
         );
+        assert!(
+            status.contains("session test"),
+            "the status line names the resumable session: {status}"
+        );
+    }
+
+    #[test]
+    fn idle_ctrl_c_arms_then_confirms_exit() {
+        let mut ui = shell();
+        assert!(
+            !ui.ctrl_c_idle(),
+            "the first idle press only arms the exit window"
+        );
+        assert!(
+            ui.status.contains("press Ctrl+C again"),
+            "the first press explains the second: {}",
+            ui.status
+        );
+        assert!(ui.ctrl_c_idle(), "the second press inside the window exits");
+
+        ui.input = "draft".into();
+        ui.cursor = 5;
+        assert!(
+            !ui.ctrl_c_idle(),
+            "a press with a draft clears instead of exiting"
+        );
+        assert!(ui.input.is_empty(), "the draft was cleared");
+        assert!(
+            ui.status.contains("Input cleared"),
+            "clearing is reported: {}",
+            ui.status
+        );
+
+        ui.last_interrupt = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(3))
+                .expect("a recent-enough clock"),
+        );
+        assert!(
+            !ui.ctrl_c_idle(),
+            "an expired window does not exit on the next press"
+        );
+    }
+
+    #[test]
+    fn tool_command_lines_wrap_instead_of_clipping() {
+        let command = format!("run {}", "x".repeat(200));
+        let entry = Entry {
+            speaker: Speaker::Tool,
+            text: format!("{command}\noutput line"),
+        };
+        let rows = entry_lines(&entry, 40, false);
+        assert!(
+            rows.len() > 2,
+            "a long command needs several wrapped rows: {rows:?}"
+        );
+        assert!(
+            rows[0].starts_with(" TOOL "),
+            "the label stays on the first row: {:?}",
+            rows[0]
+        );
+        let mut seen = String::new();
+        // The command wraps to exactly seven rows here; the eighth row is
+        // the (separately capped) output body.
+        assert_eq!(rows.len(), 8, "command rows plus output: {rows:?}");
+        for (index, row) in rows.iter().enumerate().take(7) {
+            let body = if index == 0 {
+                row.strip_prefix(" TOOL  ").unwrap_or(row)
+            } else {
+                row.strip_prefix("       ").unwrap_or(row)
+            };
+            seen.push_str(body);
+        }
+        assert!(
+            seen.contains(&command),
+            "the full command remains visible: {rows:?}"
+        );
+        for row in &rows {
+            assert!(
+                row.chars().count() <= 40,
+                "wrapped rows still fit the pane: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_tree_caps_running_work_and_collapses_finished_children() {
+        let mut ui = shell();
+        for index in 0..10 {
+            ui.tool_cells.insert(
+                format!("call-{index}"),
+                ToolCell {
+                    title: format!("Delegated part {index}"),
+                    running: true,
+                    ok: false,
+                    output: String::new(),
+                    elapsed_ms: 0,
+                    exit_code: None,
+                    row: index,
+                },
+            );
+        }
+        let (frame, _) = ui.compose(80, 24);
+        let joined = frame
+            .iter()
+            .map(|row| row.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("SUBAGENT TREE  10 running"),
+            "the tree counts in-flight work:\n{joined}"
+        );
+        assert!(
+            joined.contains("more running"),
+            "overflow collapses to a count instead of growing:\n{joined}"
+        );
+
+        for cell in ui.tool_cells.values_mut() {
+            cell.running = false;
+        }
+        ui.finished_children = 4;
+        ui.finished_ms = 12_400;
+        let (frame, _) = ui.compose(80, 24);
+        let joined = frame
+            .iter()
+            .map(|row| row.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("SUBAGENT TREE  0 running"),
+            "nothing running is explicit:\n{joined}"
+        );
+        assert!(
+            joined.contains("✓ 4 subagents done"),
+            "finished work collapses to one line:\n{joined}"
+        );
+        assert!(
+            !joined.contains("Delegated part 9"),
+            "finished titles leave the tree pane:\n{joined}"
+        );
     }
 
     #[test]
@@ -7430,10 +7663,9 @@ mod tests {
         let after_entry = ui.transcript_rebuilds;
         assert!(after_entry > first, "new content invalidates the cache");
 
-        ui.pane_percent = 50;
-        ui.compose(80, 24);
+        ui.compose(60, 24);
         let after_width = ui.transcript_rebuilds;
-        assert!(after_width > after_entry, "a different pane width re-wraps");
+        assert!(after_width > after_entry, "a different width re-wraps");
 
         ui.verbosity = "verbose".into();
         ui.compose(80, 24);
@@ -8141,12 +8373,18 @@ mod tests {
         ui.push(Speaker::Agent, "the flag is flag{ok}");
         ui.task_begin();
         ui.verified = true;
-        ui.push_result_block();
+        let steps = vec![
+            "read_file chal.txt".to_string(),
+            "decode flag{ok}".to_string(),
+        ];
+        ui.push_result_block(&steps);
         let text = &ui.entries.last().expect("a result block was pushed").text;
         assert!(text.contains("── RESULT ─ ✔ verified"), "{text}");
         assert!(text.contains("answer: the flag is flag{ok}"), "{text}");
         assert!(text.contains("proof: none"), "{text}");
         assert!(text.contains("steps "), "{text}");
+        assert!(text.contains("1. read_file chal.txt"), "{text}");
+        assert!(text.contains("2. decode flag{ok}"), "{text}");
         // The acceptance shape: time split, steps, tokens, cache hit %,
         // cost, and the saved-cache readout all live in one block.
         assert!(
@@ -8160,13 +8398,13 @@ mod tests {
         let mut ui = shell();
         ui.task_begin();
         ui.record_error("network");
-        ui.push_result_block();
+        ui.push_result_block(&[]);
         let text = &ui.entries.last().expect("a result block was pushed").text;
         assert!(text.contains("── RESULT ─ ✗ failed"), "{text}");
 
         let mut ui = shell();
         ui.task_begin();
-        ui.push_result_block();
+        ui.push_result_block(&[]);
         let text = &ui.entries.last().expect("a result block was pushed").text;
         assert!(text.contains("── RESULT ─ ⚠ unverified"), "{text}");
     }

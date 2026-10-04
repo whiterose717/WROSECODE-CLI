@@ -17,6 +17,7 @@ mod lsp;
 mod markdown;
 mod memory;
 mod metrics;
+mod oauth;
 mod package;
 mod project;
 mod provider;
@@ -34,6 +35,7 @@ mod store;
 mod telemetry;
 mod think;
 mod tools;
+mod trace;
 mod tui;
 
 use agent::Agent;
@@ -96,6 +98,10 @@ struct Cli {
     /// PATH, or `-` for stdout
     #[arg(long, value_name = "PATH")]
     events: Option<PathBuf>,
+    /// Log per-step timings (API latency, tool time, slow renders) as NDJSON
+    /// to `~/.wrosecode/trace.log` for speed work
+    #[arg(long)]
+    trace: bool,
     /// Activate a user-defined agent from `.wrosecode/agents/<name>.md`
     #[arg(long, value_name = "NAME")]
     agent: Option<String>,
@@ -120,7 +126,8 @@ struct Cli {
     web: bool,
     #[arg(long, default_value = "127.0.0.1:7878")]
     listen: String,
-    #[arg(long)]
+    /// Resume a saved session by ID (`wrosecode --session <id>`).
+    #[arg(long, short = 's')]
     session: Option<String>,
     #[arg(long)]
     fork: bool,
@@ -382,23 +389,47 @@ async fn main() -> Result<()> {
         && !cli.recipe_list
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
+    let profile = tui::TerminalProfile::detect(
+        config.alternate_screen,
+        config.mouse_capture.as_deref(),
+        cli.no_color,
+    );
     let guard = if tui_mode {
-        let profile = tui::TerminalProfile::detect(
-            config.alternate_screen,
-            config.mouse_capture.as_deref(),
-            cli.no_color,
-        );
         let guard = tui::TerminalGuard::enter(profile)?;
-        splash::paint(profile, &boot)?;
+        splash::paint_stage(profile, &boot, 0)?;
         Some(guard)
     } else {
         None
     };
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(8)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
+    let client = provider::shared_client(10, 120)?;
+    if let Some(profile) = settings.profile(&config.provider) {
+        // OAuth tokens refresh here so the first turn never starts on an
+        // expired credential.
+        settings
+            .refresh_oauth_if_needed(profile, &client)
+            .await
+            .context("OAuth token refresh failed")?;
+    }
+    let mut config = (*config).clone();
+    if settings.profile(&config.provider).is_none() {
+        // The configured provider is gone (a removed default, a renamed
+        // entry): fall back to another configured provider instead of
+        // failing to start, and say so out loud.
+        if let Some(fallback) = settings.first_usable() {
+            eprintln!(
+                "provider `{}` is not configured; using `{}/{}` instead",
+                config.provider, fallback.name, fallback.model
+            );
+            config.provider = fallback.name.clone();
+            config.model = fallback.model.clone();
+        } else {
+            anyhow::bail!(
+                "provider `{}` is not configured and no usable provider remains (add one with /connect or `wrosecode providers add`)",
+                config.provider
+            );
+        }
+    }
+    let config = Arc::new(config);
     let provider = if let Some(profile) = settings.profile(&config.provider) {
         provider::create_profile(
             profile,
@@ -409,6 +440,11 @@ async fn main() -> Result<()> {
     } else {
         provider::create(&config.provider, &config.model, client.clone())?
     };
+    if tui_mode {
+        // The reveal costs nothing itself: it repaints between init steps
+        // that were already going to run.
+        let _ = splash::paint_stage(profile, &boot, 1);
+    }
     for source in &cli.install_skill {
         let names = package::install(&skills::default_skills_dir(), source)
             .await
@@ -418,6 +454,10 @@ async fn main() -> Result<()> {
         }
     }
     let mut agent = Agent::new(config, provider, client)?;
+    agent.trace = crate::trace::TraceSink::open(cli.trace);
+    if agent.trace.enabled() && !cli.quiet {
+        eprintln!("tracing per-step timings to ~/.wrosecode/trace.log");
+    }
     let resumed_session = if let Some(id) = &cli.session {
         let loaded = store
             .load_session(id)?
@@ -443,6 +483,31 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // A resumed session brings its provider and model back: the agent keeps
+    // working where it left off instead of silently switching backends.
+    if let Some(resumed) = &resumed_session {
+        let switch = !resumed.provider_name.is_empty()
+            && !resumed.model.is_empty()
+            && (resumed.provider_name != agent.config.provider
+                || resumed.model != agent.config.model);
+        if switch {
+            if let Some(profile) = settings.profile(&resumed.provider_name) {
+                if let Ok(restored) = provider::create_profile(
+                    profile,
+                    settings.key(profile),
+                    &resumed.model,
+                    agent.tools.client.clone(),
+                ) {
+                    agent.provider = restored;
+                    agent.config = Arc::new(Config {
+                        provider: resumed.provider_name.clone(),
+                        model: resumed.model.clone(),
+                        ..(*agent.config).clone()
+                    });
+                }
+            }
+        }
+    }
     for path in &cli.add {
         agent.pin(path).with_context(|| format!("--add {path}"))?;
     }
@@ -456,6 +521,11 @@ async fn main() -> Result<()> {
         if let Ok(mcp) = tools::mcp::Mcp::connect_def(server).await {
             agent.tools.mcps.push((server.name.clone(), mcp));
         }
+    }
+    if tui_mode {
+        // Final reveal stage: the full banner is showing before the TUI
+        // loop takes over the screen.
+        let _ = splash::paint_stage(profile, &boot, 2);
     }
     if let Some(name) = cli.agent.as_deref() {
         let user_agents = markdown::discover_agents(&agent.config.root);
@@ -762,7 +832,12 @@ async fn race_models(
         let mut config = (*agents[0].config).clone();
         config.provider = provider_name.into();
         config.model = model.into();
-        agents.push(Agent::new(Arc::new(config), provider, client.clone())?);
+        let mut racer = Agent::new(Arc::new(config), provider, client.clone())?;
+        racer.trace = agents
+            .first()
+            .map(|agent| agent.trace.clone())
+            .unwrap_or_default();
+        agents.push(racer);
     }
     let mut futures = FuturesUnordered::new();
     for mut candidate in agents {
@@ -853,6 +928,12 @@ fn print_outcome(
             " Steps    {} model turns · {} cached tool calls",
             agent.model_turns, cache_hits
         );
+        for (index, step) in agent.step_log.iter().enumerate().take(8) {
+            eprintln!(" {}. {step}", index + 1);
+        }
+        if agent.step_log.len() > 8 {
+            eprintln!(" … +{} more", agent.step_log.len() - 8);
+        }
         eprintln!(
             " Tokens   {} in · {} out · {} reasoning{}",
             agent.usage.input,
@@ -917,7 +998,11 @@ fn attach_events(agent: &mut Agent, path: Option<&Path>) -> Result<Option<EventS
     let forwarder = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             if let Some(frame) = events::frame(&event) {
-                let _ = sink.lock().expect("event sink").write(&frame);
+                // A poisoned sink drops the frame instead of aborting the
+                // whole process mid-turn.
+                if let Ok(mut sink) = sink.lock() {
+                    let _ = sink.write(&frame);
+                }
             }
         }
     });
@@ -930,6 +1015,8 @@ fn attach_events(agent: &mut Agent, path: Option<&Path>) -> Result<Option<EventS
 
 fn write_event(stream: &Option<EventStream>, frame: &serde_json::Value) {
     if let Some(stream) = stream {
-        let _ = stream.sink.lock().expect("event sink").write(frame);
+        if let Ok(mut sink) = stream.sink.lock() {
+            let _ = sink.write(frame);
+        }
     }
 }

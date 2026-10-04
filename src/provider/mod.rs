@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod openai_compat;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -231,6 +232,18 @@ pub fn create_profile(
     }
 }
 
+/// The one tuned HTTP client shape every part of the app should use:
+/// pooled connections plus explicit connect/request timeouts, so no call
+/// site drifts back to an untimed `Client::new()`.
+pub fn shared_client(connect_secs: u64, timeout_secs: u64) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(8)
+        .connect_timeout(Duration::from_secs(connect_secs))
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .context("build HTTP client")
+}
+
 pub async fn send_retry(builder: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
     for attempt in 0..3 {
         let cloned = builder
@@ -370,6 +383,10 @@ mod integration_tests {
             think: None,
             think_map: None,
             builtin: false,
+            auth_method: "api_key".into(),
+            oauth_client_id: String::new(),
+            oauth_issuer: String::new(),
+            oauth_scope: String::new(),
         };
         settings.upsert_provider(profile).unwrap();
         settings.set_key(&name, secret).unwrap();

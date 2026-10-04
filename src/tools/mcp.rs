@@ -69,10 +69,7 @@ impl Mcp {
     /// The streamable-HTTP transport: POSTs to `url`, session-scoped by the
     /// `Mcp-Session-Id` header when the server issues one.
     pub async fn connect_http(url: &str, headers: &[(String, String)]) -> Result<Arc<Self>> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .context("build MCP HTTP client")?;
+        let client = crate::provider::shared_client(10, 120).context("build MCP HTTP client")?;
         let client = Arc::new(Self {
             state: Mutex::new(State {
                 wire: Wire::Http {

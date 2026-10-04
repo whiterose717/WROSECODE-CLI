@@ -14,6 +14,17 @@ pub struct ProviderProfile {
     pub model: String,
     pub key_ref: String,
     pub headers: BTreeMap<String, String>,
+    /// How this profile authenticates: `api_key` (default) or `oauth`.
+    /// OAuth tokens live in `~/.wrosecode/credentials/<name>.json`, never
+    /// in `providers.toml`.
+    pub auth_method: String,
+    /// OAuth client ID from the operator's own client registration (never
+    /// a bundled first-party credential).
+    pub oauth_client_id: String,
+    /// OAuth issuer base URL (empty means the OpenAI default).
+    pub oauth_issuer: String,
+    /// OAuth scope string.
+    pub oauth_scope: String,
     /// The profile's default thinking mode — takes precedence over
     /// `[agent].think` from config.toml (but never over `--think`).
     pub think: Option<ThinkLevel>,
@@ -169,6 +180,10 @@ impl Settings {
                                 .map(|env| format!("env:{env}"))
                                 .unwrap_or_default(),
                             headers: BTreeMap::new(),
+                            auth_method: "api_key".into(),
+                            oauth_client_id: String::new(),
+                            oauth_issuer: String::new(),
+                            oauth_scope: String::new(),
                             think: None,
                             think_map: None,
                         })
@@ -182,7 +197,11 @@ impl Settings {
         let array = doc["provider"]
             .as_array_of_tables_mut()
             .context("provider must be an array of tables")?;
-        let mut changed = !file.exists();
+        // An existing file is authoritative: seed the built-in catalogue
+        // only for a fresh file, so removing a default (even `anthropic`)
+        // sticks instead of being resurrected on the next load.
+        let fresh = !file.exists();
+        let mut changed = fresh;
         for profile in legacy {
             if !array
                 .iter()
@@ -193,9 +212,10 @@ impl Settings {
             }
         }
         for &(name, kind, base_url, model, env) in DEFAULTS {
-            if !array
-                .iter()
-                .any(|table| table["name"].as_str() == Some(name))
+            if fresh
+                && !array
+                    .iter()
+                    .any(|table| table["name"].as_str() == Some(name))
             {
                 array.push(profile_table(&ProviderProfile {
                     name: name.into(),
@@ -208,6 +228,10 @@ impl Settings {
                         format!("env:{env}")
                     },
                     headers: BTreeMap::new(),
+                    auth_method: "api_key".into(),
+                    oauth_client_id: String::new(),
+                    oauth_issuer: String::new(),
+                    oauth_scope: String::new(),
                     think: None,
                     think_map: None,
                     builtin: true,
@@ -239,6 +263,16 @@ impl Settings {
     }
     pub fn builtin(name: &str) -> bool {
         DEFAULTS.iter().any(|entry| entry.0 == name)
+    }
+    /// First configured provider that can actually run: a base URL, a model,
+    /// and either a retrievable key or no key needed. Used when the active
+    /// provider was removed.
+    pub fn first_usable(&self) -> Option<&ProviderProfile> {
+        self.providers.iter().find(|profile| {
+            !profile.base_url.is_empty()
+                && !profile.model.is_empty()
+                && (self.key(profile).is_some() || self.no_key_needed(profile))
+        })
     }
     pub fn validate_name(name: &str) -> Result<()> {
         if name.is_empty()
@@ -296,9 +330,9 @@ impl Settings {
         Ok(())
     }
     pub fn remove_provider(&mut self, name: &str) -> Result<()> {
-        if Self::builtin(name) {
-            bail!("built-in provider cannot be removed");
-        }
+        // Even built-in defaults (including `anthropic`) are removable: the
+        // catalogue is user data, and the startup path falls back to another
+        // configured provider when the active one is gone.
         if self.profile(name).is_none() {
             bail!("unknown provider: {name}");
         }
@@ -319,9 +353,63 @@ impl Settings {
         Ok(())
     }
     pub fn key(&self, profile: &ProviderProfile) -> Option<String> {
+        if profile.auth_method == "oauth" {
+            // OAuth profiles keep tokens out of providers.toml entirely:
+            // only a live, unexpired access token is ever handed out.
+            let home = std::env::var_os("HOME").map(PathBuf::from)?;
+            let tokens = crate::oauth::load_tokens(&home, &profile.name)?;
+            if tokens.expired() {
+                return None;
+            }
+            crate::crash::register_secret(&tokens.access_token);
+            return Some(tokens.access_token);
+        }
         let key = self.lookup_key(profile)?;
         crate::crash::register_secret(&key);
         Some(key)
+    }
+
+    /// OAuth issuer/client/scope for a profile, falling back to
+    /// `WROSECODE_OAUTH_*` env vars when the profile leaves them blank.
+    pub fn oauth_config(&self, profile: &ProviderProfile) -> crate::oauth::OAuthConfig {
+        let pick = |field: &str, env: &str, default: &str| {
+            if field.is_empty() {
+                std::env::var(env).unwrap_or_else(|_| default.into())
+            } else {
+                field.into()
+            }
+        };
+        crate::oauth::OAuthConfig::new(
+            &pick(&profile.oauth_client_id, "WROSECODE_OAUTH_CLIENT_ID", ""),
+            &pick(&profile.oauth_issuer, "WROSECODE_OAUTH_ISSUER", ""),
+            &pick(&profile.oauth_scope, "WROSECODE_OAUTH_SCOPE", "codex"),
+        )
+    }
+
+    /// Refresh an OAuth profile's tokens when expired or close to it.
+    /// A no-op for API-key profiles and for tokens that are still fresh;
+    /// call before provider use (startup, connect, switch).
+    pub async fn refresh_oauth_if_needed(
+        &self,
+        profile: &ProviderProfile,
+        client: &reqwest::Client,
+    ) -> Result<()> {
+        if profile.auth_method != "oauth" {
+            return Ok(());
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+        let Some(tokens) = crate::oauth::load_tokens(&home, &profile.name) else {
+            return Ok(());
+        };
+        if !tokens.expired() {
+            return Ok(());
+        }
+        let Some(refresh) = tokens.refresh_token.clone() else {
+            return Ok(());
+        };
+        let fresh = crate::oauth::refresh(client, &self.oauth_config(profile), &refresh).await?;
+        crate::oauth::store_tokens(&home, &profile.name, &fresh)?;
+        Ok(())
     }
 
     fn lookup_key(&self, profile: &ProviderProfile) -> Option<String> {
@@ -511,6 +599,16 @@ fn update_table(table: &mut Table, profile: &ProviderProfile) {
     table["base_url"] = value(&profile.base_url);
     table["model"] = value(&profile.model);
     table["key_ref"] = value(&profile.key_ref);
+    table["auth_method"] = value(&profile.auth_method);
+    if !profile.oauth_client_id.is_empty() {
+        table["oauth_client_id"] = value(&profile.oauth_client_id);
+    }
+    if !profile.oauth_issuer.is_empty() {
+        table["oauth_issuer"] = value(&profile.oauth_issuer);
+    }
+    if !profile.oauth_scope.is_empty() {
+        table["oauth_scope"] = value(&profile.oauth_scope);
+    }
     if let Some(think) = profile.think {
         table["think"] = value(think.name());
     }
@@ -588,6 +686,26 @@ fn parse_profiles(doc: &DocumentMut) -> Result<Vec<ProviderProfile>> {
                 headers,
                 think,
                 think_map,
+                auth_method: table
+                    .get("auth_method")
+                    .and_then(Item::as_str)
+                    .unwrap_or("api_key")
+                    .into(),
+                oauth_client_id: table
+                    .get("oauth_client_id")
+                    .and_then(Item::as_str)
+                    .unwrap_or_default()
+                    .into(),
+                oauth_issuer: table
+                    .get("oauth_issuer")
+                    .and_then(Item::as_str)
+                    .unwrap_or_default()
+                    .into(),
+                oauth_scope: table
+                    .get("oauth_scope")
+                    .and_then(Item::as_str)
+                    .unwrap_or_default()
+                    .into(),
             });
         }
     }
@@ -620,6 +738,23 @@ pub fn redact(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn builtin_providers_can_be_removed_and_stay_removed() {
+        let dir = std::env::temp_dir().join(format!("wrose-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut settings = Settings::load_at(dir.clone()).unwrap();
+        assert!(settings.profile("anthropic").is_some(), "seeded by default");
+        settings
+            .remove_provider("anthropic")
+            .expect("remove builtin");
+        assert!(settings.profile("anthropic").is_none());
+        // A reload must not resurrect the removed default: an existing
+        // catalogue file is authoritative.
+        let mut settings = Settings::load_at(dir.clone()).unwrap();
+        assert!(settings.profile("anthropic").is_none());
+        assert!(settings.remove_provider("nope").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn mcps_accept_a_url_endpoint_or_a_binary_but_not_both() {
         let dir = std::env::temp_dir().join(format!("wrose-mcp-{}", std::process::id()));
@@ -697,6 +832,10 @@ args = ["--stdio"]
             think: None,
             think_map: None,
             builtin: false,
+            auth_method: "api_key".into(),
+            oauth_client_id: String::new(),
+            oauth_issuer: String::new(),
+            oauth_scope: String::new(),
         })
         .unwrap();
         assert!(std::fs::read_to_string(&path)
@@ -765,6 +904,10 @@ args = ["--stdio"]
                 think: Some(ThinkLevel::High),
                 think_map: Some(map.clone()),
                 builtin: false,
+                auth_method: "api_key".into(),
+                oauth_client_id: String::new(),
+                oauth_issuer: String::new(),
+                oauth_scope: String::new(),
             })
             .unwrap();
         let reloaded = Settings::load_at(dir.clone()).unwrap();
