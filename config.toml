@@ -18,7 +18,12 @@ alert_bell = true
 smooth_scroll_lines = 1
 
 [agent]
-# 0 = answer immediately, 20 = longest reasoning budget. [ and ] adjust it live.
+# Thinking mode: off | low | medium | high | max | auto. Ctrl+T cycles it,
+# /think <level> sets it, --think overrides it. auto starts at medium,
+# escalates after repeated failures, and drops back after progress.
+think = "medium"
+# 0 = answer immediately, 20 = longest reasoning budget — the strength the
+# mode above maps to (only used when no think mode is configured).
 thinking_level = 5
 # Upper bound for the worker pool. The agent lowers this itself for easy turns.
 max_parallel_tasks = 20

@@ -36,7 +36,7 @@ Captured at 110×36 straight from a real run:
 ╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗  ⠋  session 1791068182-690349-0 · [misc] · paint 42ms
 ║ ║╠╩╗│ │╠═╝╠═╗│  │ │║ ║╠═╗
 ╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝  WROSECODE v0.2.0 · FAST
- anthropic / claude-sonnet-5 · think 5 · up to 3 agents · sandbox none · ask · /home/kali/Desktop/wrose
+ anthropic / claude-sonnet-5 · think medium · up to 3 agents · sandbox none · ask · /home/kali/Desktop/wrose
  BUILD · claude · [misc] · git master* · 0 mcp · 636 skills
  3 connected · 10 need setup · /providers
  tip · / commands
@@ -60,13 +60,13 @@ Captured at 110×36 straight from a real run:
                                                                           │ flags  0
                                                                           │ turn   ·
  SUBAGENT TREE  0 active                                                  │ TOOL TIMELINE  0 calls
- root [misc] think 5/20 · up to 3 agents                                  │
+ root [misc] think medium · up to 3 agents                                  │
                                                                           │
                                                                           │
                                                                           │
                                                                           │
                                                                           │
- Ready · claude-sonnet-5 · think:5 · tok 0/0 · cache 0% · 3s · step 0 · none/ask · FAST · 3w · cost n/a · tool
+ Ready · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 3s · step 0 · none/ask · FAST · 3w · cost n/a · tool
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 >
 ```
@@ -80,10 +80,11 @@ The right-hand dashboard shows input, output, reasoning, and cache traffic as
 bars, then the model, cost, budget, latency percentiles, cache hit rate, found
 flags, a per-turn token sparkline with the last turn duration, an error counter
 with the kind of the most recent failure, and the speed tier. The bottom status
-line leads with the run state, model, and `think:` level, then tokens, cache
+line leads with the run state, model, and `think:` label (the level name, or
+`auto→medium` while the auto controller drives it), then tokens, cache
 hit rate, elapsed time, tool step, sandbox and approval, speed tier and
 workers, cost, and tool counts — for example
-` Ready · claude-sonnet-5 · think:5 · tok 0/0 · cache 0% · 3s · step 0 ·
+` Ready · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 3s · step 0 ·
 none/ask · FAST · 3w · cost n/a · tools 0:0`. During a turn it swaps in an
 animated spinner, the queue note, and the live timeout and tool progress.
 
@@ -124,9 +125,9 @@ CTF skills cover recon, web, pwn, crypto, reverse engineering, forensics, stego,
 | `Ctrl+A` / `Ctrl+E` | Jump to the start / end of the line |
 | `Alt+←` / `Alt+→` (also `Alt+B` / `Alt+F`) | Jump a word left / right |
 | `Ctrl+L` | Clear the visible transcript and redraw (history and conversation context are kept; `/clear --context` drops the context too) |
-| `Ctrl+T` | Cycle the color theme (same list as `/theme`) |
+| `Ctrl+T` | Cycle the thinking level (`off` → `low` → `medium` → `high` → `max` → `auto`) |
 | `Ctrl+Shift+C` | Copy latest output |
-| `[` / `]` | Lower or raise thinking level (0–20) |
+| `[` / `]` | Step the thinking level down or up (same cycle as `Ctrl+T`) |
 | `@` at the start of a prompt | Open the file-mention picker (`Mention files`); `Esc` closes it |
 | Bracketed paste | A paste of 4+ lines collapses into `[Pasted N lines]`: `Enter` inserts it, `Esc` discards it |
 | `Tab` | Complete the current word (paths, slash commands, tool names) when the input is not empty; otherwise switch build and plan modes |
@@ -137,9 +138,15 @@ While scrolled up, the transcript header shows `· ↓ N new lines  (End to jump
 
 Shell calls have a 30 second timeout and are terminated if stuck. Panics and turn errors are written to `.ctf/errors.log`; the TUI keeps provider errors visible with a recovery suggestion. One-shot runs print a computed usage report, and `--summary json` emits a machine-readable `TaskComplete` object.
 
+### Thinking levels
+
+Six levels decide how much reasoning each provider call spends: `off`, `low`, `medium`, `high`, `max`, and `auto`. `Ctrl+T` cycles them, `[` / `]` step down and up, `/think <level>` sets one directly (bare `/think` prints the current level and the list), and `--think <level>` fixes the startup default. The mode resolves `--think` → the provider profile's `think` key in `~/.wrosecode/providers.toml` (so a model can carry its own default) → `[agent] think` in `config.toml` → the legacy numeric `[agent] thinking_level`. Each concrete level maps to the provider's native control — Anthropic extended-thinking `budget_tokens` (1024 / 2048 / 4096 / 6144 for low / medium / high / max, clamped to 8191) or an OpenAI-style `reasoning_effort` (`low` / `medium` / `high`, with `max` reported as `high`) — and a per-model `think_map` on the profile overrides that with either a string or a token count per level. A provider that rejects the parameter retries once without it, records `think control ignored` in the transcript, and marks the status bar `think:… (ignored)`.
+
+`auto` is a controller rather than a strength: it starts at `medium`, escalates one concrete level after three consecutive failing steps (the transcript shows `think: medium → high (no progress ×3)`), drops back one level once progress returns, and settles a trivial read/answer task at `low`. The status bar shows it as `auto→high` — mode plus the live level. The dashboard's Thinking panel reports the previous turn's model time and reasoning tokens (`last turn 4.2s · reasoning 1280 tok`).
+
 ## Advanced dashboard and persistence
 
-The terminal dashboard has four live panes: transcript, token and cost metrics, subagent tree, and tool timeline. Drag the vertical separator with the mouse. `Ctrl+T` cycles the palettes — dark, light, solarized, Dracula, Nord, and Mono — and `/theme` opens a picker and `/theme NAME` applies one directly (`/theme` on an unknown name lists what exists). Your own palettes drop into `~/.wrosecode/themes/*.toml` as five hex colours (`text`, `muted`, `accent`, `status`, `background`, with an optional `name`); a file that fails to parse, has bad hex, or reuses a built-in name is skipped. `NO_COLOR` (any non-empty value) or `--no-color` turns colour off everywhere: the gradient wordmark becomes plain text and every frame renders without colour codes. The shell paints its first frame — gradient wordmark, info panel with provider, thinking, sandbox, approval, git, MCP and skill counts, provider health, a rotating tip, recent sessions, and the `/ctf` hint — before provider setup, skill discovery, MCP reconnects, and session restore, so startup never waits on the network: the measured time is stamped next to the session line (`· paint 9ms`), reported by `/debug` as `First paint`, and must stay inside a 50 ms budget. `Ctrl+P` opens fuzzy command search; `Ctrl+F` and `Ctrl+R` open the flag and prompt pickers with the same filter-as-you-type behaviour. The renderer targets 60 frames per second while writing only changed terminal rows.
+The terminal dashboard has four live panes: transcript, token and cost metrics, subagent tree, and tool timeline. Drag the vertical separator with the mouse. `Ctrl+T` now cycles the thinking level; for colours `/theme` opens a picker over the palettes — dark, light, solarized, Dracula, Nord, and Mono — and `/theme NAME` applies one directly (`/theme` on an unknown name lists what exists). Your own palettes drop into `~/.wrosecode/themes/*.toml` as five hex colours (`text`, `muted`, `accent`, `status`, `background`, with an optional `name`); a file that fails to parse, has bad hex, or reuses a built-in name is skipped. `NO_COLOR` (any non-empty value) or `--no-color` turns colour off everywhere: the gradient wordmark becomes plain text and every frame renders without colour codes. The shell paints its first frame — gradient wordmark, info panel with provider, thinking, sandbox, approval, git, MCP and skill counts, provider health, a rotating tip, recent sessions, and the `/ctf` hint — before provider setup, skill discovery, MCP reconnects, and session restore, so startup never waits on the network: the measured time is stamped next to the session line (`· paint 9ms`), reported by `/debug` as `First paint`, and must stay inside a 50 ms budget. `Ctrl+P` opens fuzzy command search; `Ctrl+F` and `Ctrl+R` open the flag and prompt pickers with the same filter-as-you-type behaviour. The renderer targets 60 frames per second while writing only changed terminal rows.
 
 Sessions checkpoint to SQLite WAL every ten seconds at `~/.wrosecode/state.db`, while portable JSON session files remain available. Resume or fork work with:
 
@@ -328,7 +335,7 @@ built-in defaults rather than failing to start. CLI flags always win.
 | Section | Purpose |
 | --- | --- |
 | `[ui]` | Theme, verbosity, alternate screen, `mouse_capture`, `alert_bell`, scroll step. |
-| `[agent]` | Thinking level, worker ceiling, shell timeout, retries, permission tier, budget. |
+| `[agent]` | Thinking mode (`think`), legacy level (`thinking_level`), worker ceiling, shell timeout, retries, permission tier, budget. |
 | `[ctf]` | Flag regexes, clipboard copy, CTFd auto-submit. |
 | `[cache]` | `memory` or `redis`, plus Redis and Qdrant URLs. |
 | `[sandbox]` | Where `shell` calls run (`none` or `docker`) and the container settings. |
@@ -384,12 +391,12 @@ Skills load from bundled `skills/`, project `skills/`, `~/.wrosecode/skills/`, a
 | --- | --- |
 | Agents | `/agents`, `/build`, `/plan`, `/harness`, `/skills` |
 | Providers | `/connect`, `/providers`, `/models`, `/model`, `/mcps` |
-| Session | `/new`, `/sessions`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/dashboard`, `/verbosity`, `/theme`, `/export`, `/help`, `/exit`, `/quit` |
+| Session | `/new`, `/sessions`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/dashboard`, `/verbosity`, `/think`, `/theme`, `/export`, `/help`, `/exit`, `/quit` |
 | Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/flags`, `/writeup`, `/sandbox` |
 
 `/providers` opens a searchable provider screen with twelve built-in entries and their connection status. Enter configures or selects a provider; `a` adds, `e` edits, `d` deletes a custom provider, and `t` tests a connection. `/connect` opens the custom provider form directly. The API key field is masked. `/models` searches models across connected providers; `/model MODEL` switches the current provider's model.
 
-Provider definitions are saved in `~/.wrosecode/providers.toml` without keys. Keys go to the OS keyring when available, otherwise to `~/.wrosecode/auth.json` with mode `0600`. Environment variables override stored keys. Custom provider keys can use `WROSECODE_NAME_API_KEY` (replace dashes in the name with underscores), or a saved `env:VARIABLE` reference. Custom providers support `openai_compat` and `anthropic` APIs; both support streamed replies and tool calls. Providers that need cloud-specific signing or URLs can use an OpenAI-compatible gateway as their base URL.
+Provider definitions are saved in `~/.wrosecode/providers.toml` without keys. Keys go to the OS keyring when available, otherwise to `~/.wrosecode/auth.json` with mode `0600`. Environment variables override stored keys. Custom provider keys can use `WROSECODE_NAME_API_KEY` (replace dashes in the name with underscores), or a saved `env:VARIABLE` reference. Custom providers support `openai_compat` and `anthropic` APIs; both support streamed replies and tool calls. Each profile can also set `think` (its default thinking level) and `think_map` (per-level provider values) — see *Thinking levels* above. Providers that need cloud-specific signing or URLs can use an OpenAI-compatible gateway as their base URL.
 
 The same registry is available without the TUI:
 

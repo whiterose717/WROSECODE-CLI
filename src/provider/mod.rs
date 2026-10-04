@@ -32,6 +32,17 @@ pub enum Progress {
         flag: String,
         source: String,
     },
+    /// The `auto` thinking controller changed the level — rendered in the
+    /// transcript as `think: medium → high (no progress ×3)`.
+    Think {
+        from: String,
+        to: String,
+        to_level: u8,
+        reason: String,
+    },
+    /// The provider rejected our thinking control (HTTP 400 on the thinking
+    /// parameter); the turn continues without it and the status bar says so.
+    ThinkIgnored(String),
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -82,6 +93,21 @@ pub struct Response {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Chat with an explicit thinking level (spec PHASE 4): concrete levels
+    /// map to the provider's native control through the model's `think_map`,
+    /// `Off` sends none. Implementations report a rejected control through
+    /// [`Progress::ThinkIgnored`] and continue without it.
+    async fn chat_stream_with_think(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Value],
+        require_tool: bool,
+        progress: Option<&mpsc::UnboundedSender<Progress>>,
+        think: crate::think::ThinkLevel,
+    ) -> anyhow::Result<Response>;
+
+    /// Thinking-free chat (probes, tests, and other trivial calls).
     async fn chat_stream(
         &self,
         system: &str,
@@ -89,7 +115,17 @@ pub trait Provider: Send + Sync {
         tools: &[Value],
         require_tool: bool,
         progress: Option<&mpsc::UnboundedSender<Progress>>,
-    ) -> anyhow::Result<Response>;
+    ) -> anyhow::Result<Response> {
+        self.chat_stream_with_think(
+            system,
+            messages,
+            tools,
+            require_tool,
+            progress,
+            crate::think::ThinkLevel::Off,
+        )
+        .await
+    }
     async fn list_models(&self) -> anyhow::Result<Vec<String>>;
     async fn probe_chat(&self) -> anyhow::Result<()> {
         let messages = [Message {
@@ -111,15 +147,17 @@ pub trait Provider: Send + Sync {
         }
         Ok(start.elapsed())
     }
-    async fn complete(
+    /// The thinking-level variant the agent's run loop uses.
+    async fn complete_with_think(
         &self,
         system: &str,
         messages: &[Message],
         tools: &[Value],
         require_tool: bool,
         progress: Option<&mpsc::UnboundedSender<Progress>>,
+        think: crate::think::ThinkLevel,
     ) -> anyhow::Result<Response> {
-        self.chat_stream(system, messages, tools, require_tool, progress)
+        self.chat_stream_with_think(system, messages, tools, require_tool, progress, think)
             .await
     }
 }
@@ -162,6 +200,7 @@ pub fn create_profile(
                 model: model.into(),
                 endpoint,
                 headers,
+                think_map: profile.think_map.clone(),
             }))
         }
         "openai_compat" | "openai-compatible" | "openai" | "ollama" => {
@@ -176,6 +215,7 @@ pub fn create_profile(
                 model: model.into(),
                 endpoint,
                 headers,
+                think_map: profile.think_map.clone(),
             }))
         }
         other => anyhow::bail!("unsupported provider kind: {other}"),
@@ -308,6 +348,8 @@ mod integration_tests {
             model: "mock-model".into(),
             key_ref: String::new(),
             headers: BTreeMap::new(),
+            think: None,
+            think_map: None,
             builtin: false,
         };
         settings.upsert_provider(profile).unwrap();

@@ -118,6 +118,12 @@ fn offline_stats() -> DashStats {
         mode: "chat".into(),
         category: String::new(),
         thinking_level: runtime.agent.thinking_level.min(20),
+        think: tui::think_label(
+            runtime.agent.think.unwrap_or_else(|| {
+                crate::think::ThinkLevel::from_level(runtime.agent.thinking_level)
+            }),
+            runtime.agent.thinking_level.min(20),
+        ),
         status: "offline".into(),
         budget_usd: runtime.agent.budget_usd,
         plan: Vec::new(),

@@ -104,7 +104,7 @@ bad hex, unparsable files, or a shadow of a built-in name) at the top of
 `tui::run`, before `Ui::new` so `config.toml` can already name a user palette.
 `theme(index)` wraps over built-ins then user palettes, `theme_index` keeps
 legacy names like `wrose-dark` resolving to dark, `theme_position` answers
-`Ctrl+T` and `/theme NAME`, and `theme_names` feeds the picker and the
+`/theme NAME`, and `theme_names` feeds the picker and the
 unknown-theme list, so a palette cannot drift from the registry.
 
 While the transcript is empty, `compose` renders the start screen: the gradient
@@ -114,10 +114,26 @@ directory, mode, harness, git branch, and MCP and skill counts, then provider
 health with a `/providers` hint, a rotating tip advanced from the spinner tick,
 three recent sessions with one-line `resume` suggestions, and a `/ctf` hint.
 After the first message it collapses to a one-line `WROSECODE v…` header. The
-bottom status line leads with the run state, model, `think:` level, tokens,
+bottom status line leads with the run state, model, `think:` label, tokens,
 cache hit rate, elapsed seconds, and the per-turn tool step, then sandbox,
 tier, workers, cost, and tool counts — front-loaded so the fields that matter
 survive clipping on narrow terminals.
+
+Thinking levels live in one `src/think.rs`: `ThinkLevel`
+(`off|low|medium|high|max|auto`, a clap `ValueEnum` and serde-lowercase), its
+0–20 `anchor()` (the speed-tier and worker bands stay untouched), and the pure
+`auto_think` policy behind `Agent::auto_step` / `auto_finish`. The mode
+resolves `--think` → the profile's `think` key → `[agent] think` → the legacy
+numeric `thinking_level` in `main`, and the profile's per-model `think_map`
+(overridable strings or token counts in `~/.wrosecode/providers.toml`) feeds
+`Anthropic::thinking_param` and `OpenAiCompat::reasoning_effort`. Both
+builders emit their native control (`thinking.budget_tokens` or
+`reasoning_effort`) and fall back on a 400 by retrying once without it,
+sending `Progress::ThinkIgnored`, which the TUI records as
+`think control ignored` plus a `(ignored)` status marker. The agent's run loop
+calls `complete_with_think` with the live level; `auto` transitions travel
+back as `Progress::Think` and land in the transcript as
+`think: medium → high (no progress ×3)`.
 
 Metrics are a separate hot-path object shared as `Arc`: every provider response
 and tool call records into counters, per-model totals, and a fixed-bucket

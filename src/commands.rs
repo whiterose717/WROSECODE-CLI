@@ -117,6 +117,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Set compact, normal, or verbose tool output",
     },
     CommandSpec {
+        name: "/think",
+        category: "Session",
+        description: "Set thinking level: off, low, medium, high, max, auto",
+    },
+    CommandSpec {
         name: "/help",
         category: "Session",
         description: "Show every slash command",
@@ -259,6 +264,7 @@ mod tests {
             "/skills",
             "/stats",
             "/theme",
+            "/think",
         ] {
             assert!(lookup(name).is_some(), "missing {name}");
             assert!(help().contains(name));

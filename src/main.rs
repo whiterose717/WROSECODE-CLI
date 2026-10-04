@@ -22,6 +22,7 @@ mod skills;
 mod splash;
 mod store;
 mod telemetry;
+mod think;
 mod tools;
 mod tui;
 
@@ -33,6 +34,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
+use think::ThinkLevel;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser)]
@@ -42,6 +44,10 @@ struct Cli {
     prompt: Option<String>,
     #[arg(long, value_enum)]
     permission: Option<Permission>,
+    /// Thinking level: off | low | medium | high | max | auto (auto starts
+    /// at medium and adapts to progress). Cycles live with Ctrl+T.
+    #[arg(long, value_enum)]
+    think: Option<ThinkLevel>,
     #[arg(long, default_value = "anthropic")]
     provider: String,
     #[arg(long)]
@@ -198,6 +204,20 @@ async fn main() -> Result<()> {
                 }
             })
     });
+    // Thinking mode precedence: --think > the provider profile's think key
+    // (model-specific) > [agent].think from config.toml > derived from the
+    // legacy numeric thinking_level. An explicit mode rewrites the effective
+    // 0–20 strength to its anchor; without one the legacy number stands.
+    let configured_think = cli
+        .think
+        .or_else(|| {
+            settings
+                .profile(&cli.provider)
+                .and_then(|profile| profile.think)
+        })
+        .or(runtime.agent.think);
+    let think = configured_think
+        .unwrap_or_else(|| ThinkLevel::from_level(runtime.agent.thinking_level.min(20)));
     let config = Arc::new(Config {
         root,
         permission: cli.permission.unwrap_or(runtime.agent.permission),
@@ -207,7 +227,10 @@ async fn main() -> Result<()> {
         repair_retries: cli.repair_retries,
         check_command: cli.check_command,
         skill_dirs: cli.skill_dirs,
-        thinking_level: runtime.agent.thinking_level.min(20),
+        think,
+        thinking_level: configured_think
+            .map(ThinkLevel::anchor)
+            .unwrap_or_else(|| runtime.agent.thinking_level.min(20)),
         max_parallel_tasks: runtime.agent.max_parallel_tasks.clamp(1, 20),
         shell_timeout_seconds: runtime.agent.shell_timeout_seconds.max(1),
         tool_retries: runtime.agent.tool_retries.clamp(1, 3),

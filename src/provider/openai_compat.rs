@@ -1,4 +1,5 @@
 use super::{Content, Message, Progress, Provider, Response, ToolCall, Usage};
+use crate::think::{ThinkLevel, ThinkValue};
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -11,17 +12,60 @@ pub struct OpenAiCompat {
     pub key: Option<String>,
     pub model: String,
     pub headers: BTreeMap<String, String>,
+    /// Per-level `reasoning_effort` values from providers.toml; when set the
+    /// map is authoritative (a level missing from it sends no control).
+    pub think_map: Option<BTreeMap<String, ThinkValue>>,
+}
+
+impl OpenAiCompat {
+    /// The native `reasoning_effort` control. A configured `think_map` wins;
+    /// otherwise low/medium/high map directly and `max` uses the highest
+    /// effort the API offers. Wrong-typed or empty values disable the
+    /// control for that level — the turn continues without it.
+    fn reasoning_effort(
+        think: ThinkLevel,
+        map: Option<&BTreeMap<String, ThinkValue>>,
+    ) -> Option<String> {
+        if think == ThinkLevel::Off {
+            return None;
+        }
+        match map {
+            Some(map) => match map.get(think.name())? {
+                ThinkValue::Text(text) => (!text.is_empty()).then(|| text.clone()),
+                ThinkValue::Number(_) => None,
+            },
+            None => match think.name() {
+                "low" | "medium" | "high" => Some(think.name().into()),
+                "max" => Some("high".into()),
+                _ => None,
+            },
+        }
+    }
+
+    fn request(&self, body: &Value) -> reqwest::RequestBuilder {
+        let mut request = self.client.post(&self.endpoint).json(body);
+        if let Some(key) = &self.key {
+            if !key.is_empty() {
+                request = request.bearer_auth(key);
+            }
+        }
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        request
+    }
 }
 
 #[async_trait]
 impl Provider for OpenAiCompat {
-    async fn chat_stream(
+    async fn chat_stream_with_think(
         &self,
         system: &str,
         messages: &[Message],
         tools: &[Value],
         require_tool: bool,
         progress: Option<&tokio::sync::mpsc::UnboundedSender<Progress>>,
+        think: ThinkLevel,
     ) -> anyhow::Result<Response> {
         let mut wire = vec![json!({"role":"system","content":system})];
         for message in messages {
@@ -58,17 +102,28 @@ impl Provider for OpenAiCompat {
         if require_tool && !tools.is_empty() {
             body["tool_choice"] = json!("required");
         }
-        let mut request = self.client.post(&self.endpoint).json(&body);
-        if let Some(key) = &self.key {
-            if !key.is_empty() {
-                request = request.bearer_auth(key);
+        if let Some(effort) = Self::reasoning_effort(think, self.think_map.as_ref()) {
+            body["reasoning_effort"] = json!(effort);
+        }
+        let mut response = super::send_retry(self.request(&body)).await?;
+        if response.status().as_u16() == 400 && body.get("reasoning_effort").is_some() {
+            // This endpoint rejected `reasoning_effort` — retry once without
+            // it so the turn still goes through, and let the caller report
+            // that the level was ignored (spec PHASE 4).
+            let mut fallback = body.clone();
+            if let Some(object) = fallback.as_object_mut() {
+                object.remove("reasoning_effort");
             }
-        }
-        for (name, value) in &self.headers {
-            request = request.header(name, value);
-        }
-        let response = super::send_retry(request).await?;
-        if !response.status().is_success() {
+            response = super::send_retry(self.request(&fallback)).await?;
+            if !response.status().is_success() {
+                bail!("{}", super::classify_status(response.status()));
+            }
+            if let Some(sender) = progress {
+                let _ = sender.send(Progress::ThinkIgnored(
+                    "provider rejected reasoning_effort".into(),
+                ));
+            }
+        } else if !response.status().is_success() {
             bail!("{}", super::classify_status(response.status()));
         }
         if !response
@@ -284,5 +339,75 @@ fn estimate_usage(system: &str, messages: &[Message], content: &[Content]) -> Us
         output: (output_chars / 4) as u64,
         estimated: true,
         ..Usage::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(level: &str, value: ThinkValue) -> BTreeMap<String, ThinkValue> {
+        let mut map = BTreeMap::new();
+        map.insert(level.to_string(), value);
+        map
+    }
+
+    #[test]
+    fn reasoning_effort_maps_defaults() {
+        assert_eq!(
+            OpenAiCompat::reasoning_effort(ThinkLevel::Low, None).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            OpenAiCompat::reasoning_effort(ThinkLevel::Medium, None).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            OpenAiCompat::reasoning_effort(ThinkLevel::High, None).as_deref(),
+            Some("high")
+        );
+        // `max` is the highest effort the API offers.
+        assert_eq!(
+            OpenAiCompat::reasoning_effort(ThinkLevel::Max, None).as_deref(),
+            Some("high")
+        );
+        assert_eq!(OpenAiCompat::reasoning_effort(ThinkLevel::Off, None), None);
+        assert_eq!(OpenAiCompat::reasoning_effort(ThinkLevel::Auto, None), None);
+    }
+
+    #[test]
+    fn reasoning_effort_map_wins() {
+        // Text values pass through, empty ones disable the control.
+        assert_eq!(
+            OpenAiCompat::reasoning_effort(
+                ThinkLevel::High,
+                Some(&map("high", ThinkValue::Text("minimal".into())))
+            )
+            .as_deref(),
+            Some("minimal")
+        );
+        assert_eq!(
+            OpenAiCompat::reasoning_effort(
+                ThinkLevel::High,
+                Some(&map("high", ThinkValue::Text(String::new())))
+            ),
+            None
+        );
+        // A token budget says nothing about effort levels.
+        assert_eq!(
+            OpenAiCompat::reasoning_effort(
+                ThinkLevel::Medium,
+                Some(&map("medium", ThinkValue::Number(2048)))
+            ),
+            None
+        );
+        // A level missing from the map sends no control.
+        assert_eq!(
+            OpenAiCompat::reasoning_effort(
+                ThinkLevel::High,
+                Some(&map("low", ThinkValue::Text("low".into())))
+            ),
+            None
+        );
     }
 }

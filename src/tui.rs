@@ -3,6 +3,7 @@ use crate::harness::Harness;
 use crate::provider::Progress;
 use crate::provider::Usage;
 use crate::splash::{self, LOGO};
+use crate::think::ThinkLevel;
 use crate::tools::PermissionRequest;
 use crate::{
     commands, project, provider,
@@ -527,6 +528,16 @@ struct Ui {
     session_id: String,
     category: String,
     thinking_level: u8,
+    /// The configured thinking mode: cycled by Ctrl+T / `[` `]`, set by
+    /// `/think`, seeded from `--think` → profile → config.
+    think: ThinkLevel,
+    /// A provider rejected our thinking control this session; the status bar
+    /// shows `think:… (ignored)` until the level is changed again.
+    think_ignored: bool,
+    /// Reasoning tokens and model time of the previous turn (dashboard's
+    /// per-turn reasoning line).
+    last_turn_reasoning: u64,
+    last_turn_model_ms: u64,
     usage: Usage,
     flags_found: usize,
     navigation_mode: bool,
@@ -771,6 +782,8 @@ pub(crate) struct DashStats {
     pub mode: String,
     pub category: String,
     pub thinking_level: u8,
+    /// Thinking label for the current level (`high`, `auto→medium`, …).
+    pub think: String,
     pub status: String,
     pub elapsed_s: u64,
     pub budget_usd: f64,
@@ -782,6 +795,10 @@ pub(crate) struct DashStats {
     pub errors: usize,
     pub turns: usize,
     pub model_ms: u64,
+    /// Reasoning tokens and model time of the previous (or live) turn —
+    /// the THINKING panel's per-turn line (spec phase 4).
+    pub turn_reasoning_tok: u64,
+    pub turn_model_ms: u64,
     pub tool_ms: u64,
     pub wait_ms: u64,
     pub max_parallel: usize,
@@ -811,6 +828,7 @@ struct UiMeta {
     verbosity: String,
     category: String,
     thinking_level: u8,
+    think: ThinkLevel,
     theme: usize,
     timeout_seconds: u64,
     budget_usd: f64,
@@ -833,6 +851,7 @@ impl From<&Agent> for UiMeta {
             verbosity: agent.config.verbosity.clone(),
             category: agent.ctf.category.clone(),
             thinking_level: agent.thinking_level,
+            think: agent.think,
             theme: theme_index(&agent.config.ui_theme),
             timeout_seconds: agent.config.shell_timeout_seconds,
             budget_usd: agent.config.budget_usd,
@@ -858,6 +877,7 @@ impl UiMeta {
             verbosity: "normal".into(),
             category: "misc".into(),
             thinking_level: 5,
+            think: ThinkLevel::Medium,
             theme: 0,
             timeout_seconds: 30,
             budget_usd: 0.0,
@@ -919,6 +939,10 @@ impl Ui {
             session_id,
             category: meta.category,
             thinking_level: meta.thinking_level,
+            think: meta.think,
+            think_ignored: false,
+            last_turn_reasoning: 0,
+            last_turn_model_ms: 0,
             usage: Usage::default(),
             flags_found: 0,
             navigation_mode: false,
@@ -1102,9 +1126,32 @@ impl Ui {
             // Wall time that no tool owned is model time (spec 3.3 split).
             let model_ms = wall_ms as u128 - self.turn_tool_ms.min(wall_ms as u128);
             self.model_ms_total += model_ms;
+            self.last_turn_model_ms = model_ms as u64;
         }
+        self.last_turn_reasoning = self.turn_usage.reasoning;
         self.turns_total += 1;
         self.turn_usage = Usage::default();
+    }
+
+    /// The thinking label for the status bar, splash, and dashboard: the
+    /// configured mode, the effective level while auto is driving it, and an
+    /// `ignored` marker when the last provider rejected the control.
+    fn think_label(&self) -> String {
+        let mut label = think_label(self.think, self.thinking_level);
+        if self.think_ignored {
+            label.push_str(" (ignored)");
+        }
+        label
+    }
+
+    /// Apply a thinking level (Ctrl+T cycle, `[`/`]`, `/think`) to both the
+    /// agent and the mirrored UI state.
+    fn apply_think(&mut self, agent: &mut Agent, level: ThinkLevel) {
+        agent.set_think(level);
+        self.think = level;
+        self.thinking_level = agent.thinking_level;
+        self.think_ignored = false;
+        self.status = format!("Think: {}", level.name());
     }
 
     fn record_error(&mut self, kind: &'static str) {
@@ -1679,6 +1726,22 @@ impl Ui {
                     ),
                 );
             }
+            Progress::Think {
+                from,
+                to,
+                to_level,
+                reason,
+            } => {
+                self.finalize_think();
+                self.thinking_level = to_level;
+                self.think_ignored = false;
+                self.push(Speaker::System, format!("think: {from} → {to} ({reason})"));
+            }
+            Progress::ThinkIgnored(note) => {
+                self.finalize_think();
+                self.think_ignored = true;
+                self.push(Speaker::System, format!("think control ignored: {note}"));
+            }
         }
     }
 
@@ -1869,6 +1932,7 @@ impl Ui {
             mode: self.mode.clone(),
             category: self.category.clone(),
             thinking_level: self.thinking_level,
+            think: self.think_label(),
             status: if self.busy { "busy" } else { "ready" }.into(),
             elapsed_s: elapsed.as_secs(),
             budget_usd: self.budget_usd,
@@ -1880,6 +1944,17 @@ impl Ui {
             errors: self.error_count,
             turns: self.turns_total,
             model_ms: model,
+            turn_reasoning_tok: if self.turn_started.is_some() {
+                self.turn_usage.reasoning
+            } else {
+                self.last_turn_reasoning
+            },
+            turn_model_ms: match self.turn_started {
+                Some(started) => {
+                    (started.elapsed().as_millis() as u64).saturating_sub(self.turn_tool_ms as u64)
+                }
+                None => self.last_turn_model_ms,
+            },
             tool_ms: tools,
             wait_ms: wall_ms.saturating_sub(model + tools),
             max_parallel: self.max_parallel,
@@ -2129,7 +2204,7 @@ impl Ui {
                             " {} / {} · think {} · {} · sandbox {} · {} · {}",
                             self.provider,
                             self.model,
-                            self.thinking_level,
+                            self.think_label(),
                             level_resources(self.thinking_level),
                             self.sandbox,
                             self.permission,
@@ -2220,7 +2295,7 @@ impl Ui {
                         self.harness,
                         self.permission,
                         self.category,
-                        self.thinking_level,
+                        self.think_label(),
                         level_resources(self.thinking_level)
                     ),
                     width_usize,
@@ -2454,9 +2529,9 @@ impl Ui {
                 format!(" SUBAGENT TREE  {} active", active.len())
             } else if row == 1 {
                 format!(
-                    " root [{}] think {}/20 · {}",
+                    " root [{}] think {} · {}",
                     self.category,
-                    self.thinking_level,
+                    self.think_label(),
                     level_resources(self.thinking_level)
                 )
             } else {
@@ -2549,7 +2624,7 @@ impl Ui {
                 self.status,
                 queue_note,
                 self.model,
-                self.thinking_level,
+                self.think_label(),
                 self.usage.input,
                 self.usage.output,
                 cache_percent(self.usage),
@@ -2573,7 +2648,7 @@ impl Ui {
                 self.status,
                 queue_note,
                 self.model,
-                self.thinking_level,
+                self.think_label(),
                 self.usage.input,
                 self.usage.output,
                 cache_percent(self.usage),
@@ -2776,7 +2851,7 @@ pub(crate) struct Theme {
     background: Color,
 }
 
-/// Every selectable palette. `Ctrl+T`, `/theme`, and `[ui] theme` in
+/// Every selectable palette. `/theme` (picker or `<name>`) and `[ui] theme` in
 /// config.toml all index this one list, so a theme cannot exist in one place
 /// and be missing from another.
 const THEMES: &[Theme] = &[
@@ -2845,14 +2920,13 @@ const THEMES: &[Theme] = &[
 /// render path.
 static USER_THEMES: std::sync::RwLock<Vec<&'static Theme>> = std::sync::RwLock::new(Vec::new());
 
-/// Built-in plus user palette count — what `Ctrl+T` and `/theme <name>`
-/// indices wrap over.
+/// Built-in plus user palette count — what `/theme <name>` indices wrap over.
 fn theme_total() -> usize {
     THEMES.len() + USER_THEMES.read().map(|extra| extra.len()).unwrap_or(0)
 }
 
 fn theme(index: usize) -> &'static Theme {
-    // The index is a live cursor (Ctrl+T cycles it), so it wraps rather than
+    // The index is a live cursor (`/theme` moves it), so it wraps rather than
     // panicking when a palette is removed.
     let index = index % theme_total();
     if index < THEMES.len() {
@@ -3534,11 +3608,13 @@ pub(crate) fn dashboard_panels(
         ));
     }
 
-    // 1 THINKING — speed tier, the model/tool/wait split, turn count.
+    // 1 THINKING — level and mode, speed tier, the model/tool/wait split,
+    // and the previous turn's model time and reasoning tokens (phase 4).
     let thinking = vec![
         format!(
-            " level {}/20 · {} · {} · {}",
+            " level {}/20 {} · {} · {} · {}",
             stats.thinking_level,
+            stats.think,
             speed_tier(stats.thinking_level),
             stats.status,
             if stats.inflight > 0 {
@@ -3557,6 +3633,11 @@ pub(crate) fn dashboard_panels(
             " turns {} · last turn {}",
             stats.turns,
             sparkline(&stats.turn_tokens, width.saturating_sub(14).max(4)),
+        ),
+        format!(
+            " last turn {} · reasoning {} tok",
+            secs_text(stats.turn_model_ms as u128),
+            stats.turn_reasoning_tok,
         ),
     ];
 
@@ -3909,10 +3990,23 @@ pub(crate) fn proc_stats() -> Vec<ProcStat> {
         .collect()
 }
 
+/// The thinking label for a configured mode plus its effective level:
+/// `high` for a concrete mode, `auto→medium` while auto drives the level.
+/// Shared by the live UI and the offline [`stats_from_agent`] snapshot.
+pub(crate) fn think_label(mode: ThinkLevel, level: u8) -> String {
+    let name = ThinkLevel::from_level(level).name();
+    if mode.is_auto() {
+        format!("auto→{name}")
+    } else {
+        name.to_string()
+    }
+}
+
 /// A [`DashStats`] snapshot straight from an [`Agent`]: what the web
 /// `/v1/status` endpoint serves and what `wrosecode exec --json` prints.
-/// Turn-split timings belong to the TUI's event stream, so those fields stay
-/// zero here rather than inventing numbers.
+/// Turn-split wall/tool timings belong to the TUI's event stream, so those
+/// fields stay zero here; the per-turn reasoning and last-call latency come
+/// from the agent's own counters.
 pub(crate) fn stats_from_agent(agent: &Agent, session_id: &str, status: &str) -> DashStats {
     let metrics = agent.metrics.snapshot();
     let usage = agent.usage;
@@ -3935,6 +4029,7 @@ pub(crate) fn stats_from_agent(agent: &Agent, session_id: &str, status: &str) ->
         mode: agent.mode.clone(),
         category: agent.ctf.category.clone(),
         thinking_level: agent.thinking_level,
+        think: think_label(agent.think, agent.thinking_level),
         status: status.into(),
         elapsed_s: agent.started_at.elapsed().as_secs(),
         budget_usd: agent.config.budget_usd,
@@ -3950,6 +4045,11 @@ pub(crate) fn stats_from_agent(agent: &Agent, session_id: &str, status: &str) ->
         flags_total,
         changed_files: git_changed_files(&agent.config.root.display().to_string()),
         procs: proc_stats(),
+        turn_reasoning_tok: agent.last_turn_reasoning,
+        turn_model_ms: agent
+            .last_api_latency
+            .map(|latency| latency.as_millis() as u64)
+            .unwrap_or(0),
         ..DashStats::default()
     }
 }
@@ -4230,8 +4330,9 @@ pub async fn run(
                 ui.status = "Command palette".into();
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.theme = (ui.theme + 1) % theme_total();
-                ui.status = format!("Theme: {}", theme(ui.theme).name);
+                // Cycle the thinking level: off → low → … → max → auto → off.
+                let level = agent.think.next();
+                ui.apply_think(&mut agent, level);
             }
             KeyCode::Char('e')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -4280,12 +4381,12 @@ pub async fn run(
                 }
             }
             KeyCode::Char('[') if ui.input.is_empty() => {
-                agent.thinking_level = agent.thinking_level.saturating_sub(1);
-                ui.thinking_level = agent.thinking_level;
+                let level = agent.think.prev();
+                ui.apply_think(&mut agent, level);
             }
             KeyCode::Char(']') if ui.input.is_empty() => {
-                agent.thinking_level = (agent.thinking_level + 1).min(20);
-                ui.thinking_level = agent.thinking_level;
+                let level = agent.think.next();
+                ui.apply_think(&mut agent, level);
             }
             KeyCode::Char('k') if ui.navigation_mode => ui.scroll_up(1),
             KeyCode::Char('j') if ui.navigation_mode => ui.scroll_down(1),
@@ -5304,6 +5405,27 @@ async fn run_command(
                 );
             }
         }
+        "/think" => {
+            let levels = ThinkLevel::ALL.map(|level| level.name()).join(", ");
+            if args.is_empty() {
+                ui.push(
+                    Speaker::System,
+                    format!(
+                        "Thinking level: {}\nAvailable: {levels}\n\
+                         Ctrl+T cycles · --think sets the startup default · auto escalates without progress",
+                        ui.think_label()
+                    ),
+                );
+            } else if let Some(level) = ThinkLevel::parse(args) {
+                ui.apply_think(agent, level);
+                ui.push(Speaker::System, format!("Think: {}", level.name()));
+            } else {
+                ui.push(
+                    Speaker::System,
+                    format!("Unknown thinking level `{args}`.\nAvailable: {levels}"),
+                );
+            }
+        }
         "/verbosity" => {
             let current = ui.verbosity.clone();
             let mode = if args.is_empty() {
@@ -5792,6 +5914,8 @@ async fn provider_form(
                 .as_ref()
                 .map(|p| p.headers.clone())
                 .unwrap_or_default(),
+            think: previous.as_ref().and_then(|p| p.think),
+            think_map: previous.as_ref().and_then(|p| p.think_map.clone()),
             builtin: Settings::builtin(&name),
         };
         if key.is_none() && !settings.no_key_needed(&profile) && !entered_key.starts_with("env:") {
@@ -6345,6 +6469,83 @@ mod tests {
         assert!(
             status.starts_with(&format!(" {}", ui.status)),
             "the state word opens the line: {status}"
+        );
+    }
+
+    #[test]
+    fn think_label_reports_mode_level_and_provider_rejection() {
+        let ui = shell();
+        assert_eq!(ui.think_label(), "medium", "the shipped default level");
+        assert_eq!(think_label(ThinkLevel::Auto, 10), "auto→high");
+        assert_eq!(think_label(ThinkLevel::Off, 0), "off");
+        assert_eq!(think_label(ThinkLevel::Max, 20), "max");
+        let mut ui = ui;
+        ui.think_ignored = true;
+        assert_eq!(ui.think_label(), "medium (ignored)");
+        ui.think = ThinkLevel::Auto;
+        ui.thinking_level = 3;
+        ui.think_ignored = false;
+        assert_eq!(ui.think_label(), "auto→low");
+    }
+
+    #[test]
+    fn think_transitions_land_in_the_transcript_and_status() {
+        let mut ui = shell();
+        ui.apply_progress(Progress::Think {
+            from: "medium".into(),
+            to: "high".into(),
+            to_level: 10,
+            reason: "no progress ×3".into(),
+        });
+        assert_eq!(
+            ui.thinking_level, 10,
+            "the live level follows the escalation"
+        );
+        let line = &ui.entries.last().expect("the transition is recorded").text;
+        assert_eq!(line, "think: medium → high (no progress ×3)");
+        ui.think = ThinkLevel::Auto;
+        assert_eq!(ui.think_label(), "auto→high");
+
+        ui.apply_progress(Progress::ThinkIgnored(
+            "provider rejected reasoning_effort".into(),
+        ));
+        assert!(ui.think_ignored, "a rejected control marks the status bar");
+        let line = &ui.entries.last().expect("the rejection is recorded").text;
+        assert!(line.contains("think control ignored"), "{line}");
+        assert!(
+            ui.think_label().ends_with("(ignored)"),
+            "{}",
+            ui.think_label()
+        );
+    }
+
+    #[test]
+    fn dashboard_thinking_panel_reports_the_label_and_reasoning_line() {
+        let mut ui = shell();
+        ui.think = ThinkLevel::Auto;
+        ui.thinking_level = 10;
+        ui.last_turn_reasoning = 1280;
+        ui.last_turn_model_ms = 4200;
+        let stats = ui.dash_stats();
+        assert_eq!(stats.think, "auto→high");
+        assert_eq!(stats.turn_reasoning_tok, 1280);
+        assert_eq!(stats.turn_model_ms, 4200);
+
+        let panels = dashboard_panels(&stats, 100);
+        let (_, thinking) = panels
+            .iter()
+            .find(|(title, _)| *title == "THINKING")
+            .expect("the THINKING panel");
+        assert!(
+            thinking[0].contains("level 10/20 auto→high"),
+            "{:?}",
+            thinking[0]
+        );
+        assert!(
+            thinking
+                .iter()
+                .any(|line| line.contains("last turn 4.2s · reasoning 1280 tok")),
+            "{thinking:?}"
         );
     }
 

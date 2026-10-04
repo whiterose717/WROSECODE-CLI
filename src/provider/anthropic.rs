@@ -1,4 +1,5 @@
 use super::{Content, Message, Progress, Provider, Response, ToolCall, Usage};
+use crate::think::{ThinkLevel, ThinkValue};
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -11,6 +12,9 @@ pub struct Anthropic {
     pub model: String,
     pub endpoint: String,
     pub headers: BTreeMap<String, String>,
+    /// Per-level thinking budgets from providers.toml; when set the map is
+    /// authoritative (a level missing from it sends no thinking control).
+    pub think_map: Option<BTreeMap<String, ThinkValue>>,
 }
 
 impl Anthropic {
@@ -24,40 +28,105 @@ impl Anthropic {
             json!({"role":m.role,"content":blocks})
         }).collect()
     }
-}
 
-#[async_trait]
-impl Provider for Anthropic {
-    async fn chat_stream(
+    /// The native extended-thinking control. A configured `think_map` wins;
+    /// otherwise these per-level defaults apply. Anthropic requires budgets
+    /// of at least 1024 tokens, and they must stay under `max_tokens` (8192).
+    fn thinking_param(
+        think: ThinkLevel,
+        map: Option<&BTreeMap<String, ThinkValue>>,
+    ) -> Option<Value> {
+        if think == ThinkLevel::Off {
+            return None;
+        }
+        let budget = match map {
+            Some(map) => match map.get(think.name())? {
+                ThinkValue::Number(number) => *number,
+                // A reasoning_effort-style string says nothing about budgets.
+                ThinkValue::Text(_) => return None,
+            },
+            None => match think.name() {
+                "low" => 1024,
+                "medium" => 2048,
+                "high" => 4096,
+                "max" => 6144,
+                _ => return None,
+            },
+        };
+        (budget >= 1024).then(|| json!({"type":"enabled","budget_tokens":budget.min(8191)}))
+    }
+
+    fn body(
         &self,
         system: &str,
         messages: &[Message],
         tools: &[Value],
         require_tool: bool,
-        progress: Option<&tokio::sync::mpsc::UnboundedSender<Progress>>,
-    ) -> anyhow::Result<Response> {
+        think: ThinkLevel,
+    ) -> Value {
         let mut body = json!({"model":self.model,"max_tokens":8192,"system":system,
             "messages":Self::messages(messages),"tools":tools,"stream":true});
         if require_tool && !tools.is_empty() {
             body["tool_choice"] = json!({"type":"any"});
         }
+        if let Some(thinking) = Self::thinking_param(think, self.think_map.as_ref()) {
+            body["thinking"] = thinking;
+        }
+        body
+    }
+
+    fn request(&self, body: &Value) -> reqwest::RequestBuilder {
         let mut request = self
             .client
             .post(&self.endpoint)
             .header("anthropic-version", "2023-06-01")
-            .json(&body);
+            .json(body);
         if !self.key.is_empty() {
             request = request.header("x-api-key", &self.key);
         }
         for (name, value) in &self.headers {
             request = request.header(name, value);
         }
-        let resp = super::send_retry(request)
+        request
+    }
+}
+
+#[async_trait]
+impl Provider for Anthropic {
+    async fn chat_stream_with_think(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Value],
+        require_tool: bool,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<Progress>>,
+        think: ThinkLevel,
+    ) -> anyhow::Result<Response> {
+        let body = self.body(system, messages, tools, require_tool, think);
+        let mut resp = super::send_retry(self.request(&body))
             .await
             .context("Anthropic request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            bail!("Anthropic {}", super::classify_status(status));
+        if resp.status().as_u16() == 400 && body.get("thinking").is_some() {
+            // This endpoint rejected extended thinking — retry once without
+            // it so the turn still goes through, and let the caller report
+            // that the level was ignored (spec PHASE 4).
+            let mut fallback = body.clone();
+            if let Some(object) = fallback.as_object_mut() {
+                object.remove("thinking");
+            }
+            resp = super::send_retry(self.request(&fallback))
+                .await
+                .context("Anthropic request failed")?;
+            if !resp.status().is_success() {
+                bail!("Anthropic {}", super::classify_status(resp.status()));
+            }
+            if let Some(tx) = progress {
+                let _ = tx.send(Progress::ThinkIgnored(
+                    "anthropic rejected extended thinking".into(),
+                ));
+            }
+        } else if !resp.status().is_success() {
+            bail!("Anthropic {}", super::classify_status(resp.status()));
         }
         let mut stream = resp.bytes_stream();
         let mut pending = Vec::new();
@@ -250,9 +319,10 @@ mod tests {
             model: "test".into(),
             endpoint,
             headers: BTreeMap::new(),
+            think_map: None,
         };
         let response = provider
-            .complete(
+            .chat_stream(
                 "system",
                 &[Message {
                     role: "user".into(),
@@ -292,10 +362,11 @@ mod tests {
             model: "test".into(),
             endpoint,
             headers: BTreeMap::new(),
+            think_map: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let response = provider
-            .complete(
+            .chat_stream(
                 "system",
                 &[Message {
                     role: "user".into(),
@@ -310,5 +381,68 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), Progress::TextDelta(text) if text == "hello"));
         assert!(matches!(&response.content[0], Content::Text(text) if text == "hello"));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn thinking_param_maps_each_level_to_a_budget() {
+        for (level, budget) in [
+            (ThinkLevel::Low, 1024),
+            (ThinkLevel::Medium, 2048),
+            (ThinkLevel::High, 4096),
+            (ThinkLevel::Max, 6144),
+        ] {
+            assert_eq!(
+                Anthropic::thinking_param(level, None),
+                Some(json!({"type":"enabled","budget_tokens":budget})),
+                "{level:?}"
+            );
+        }
+        assert_eq!(Anthropic::thinking_param(ThinkLevel::Off, None), None);
+        assert_eq!(Anthropic::thinking_param(ThinkLevel::Auto, None), None);
+    }
+
+    #[test]
+    fn thinking_param_map_wins_and_clamps() {
+        let map = |level: &str, value: ThinkValue| {
+            let mut map = BTreeMap::new();
+            map.insert(level.to_string(), value);
+            map
+        };
+        // Number budgets pass through and clamp under max_tokens.
+        assert_eq!(
+            Anthropic::thinking_param(
+                ThinkLevel::High,
+                Some(&map("high", ThinkValue::Number(3000)))
+            ),
+            Some(json!({"type":"enabled","budget_tokens":3000}))
+        );
+        assert_eq!(
+            Anthropic::thinking_param(
+                ThinkLevel::Max,
+                Some(&map("max", ThinkValue::Number(99_999)))
+            ),
+            Some(json!({"type":"enabled","budget_tokens":8191}))
+        );
+        // Below Anthropic's 1024 floor the control is dropped entirely.
+        assert_eq!(
+            Anthropic::thinking_param(ThinkLevel::Low, Some(&map("low", ThinkValue::Number(512)))),
+            None
+        );
+        // A reasoning_effort-style string is not a budget.
+        assert_eq!(
+            Anthropic::thinking_param(
+                ThinkLevel::Medium,
+                Some(&map("medium", ThinkValue::Text("medium".into())))
+            ),
+            None
+        );
+        // A level missing from the map sends no control.
+        assert_eq!(
+            Anthropic::thinking_param(
+                ThinkLevel::High,
+                Some(&map("low", ThinkValue::Number(1024)))
+            ),
+            None
+        );
     }
 }

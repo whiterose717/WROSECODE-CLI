@@ -48,6 +48,16 @@
     "agent": {
       "type": "object",
       "properties": {
+        "think": {
+          "enum": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "max",
+            "auto"
+          ]
+        },
         "thinking_level": {
           "type": "integer",
           "minimum": 0,

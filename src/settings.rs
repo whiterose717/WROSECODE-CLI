@@ -1,3 +1,4 @@
+use crate::think::{ThinkLevel, ThinkValue};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -13,6 +14,14 @@ pub struct ProviderProfile {
     pub model: String,
     pub key_ref: String,
     pub headers: BTreeMap<String, String>,
+    /// The profile's default thinking mode — takes precedence over
+    /// `[agent].think` from config.toml (but never over `--think`).
+    pub think: Option<ThinkLevel>,
+    /// Per-level native values this model expects (OpenAI-style
+    /// `reasoning_effort` strings, Anthropic thinking budgets). When set the
+    /// map is authoritative: a level missing from it has no provider-side
+    /// control. When unset the provider applies its built-in defaults.
+    pub think_map: Option<BTreeMap<String, ThinkValue>>,
     pub builtin: bool,
 }
 
@@ -143,6 +152,8 @@ impl Settings {
                                 .map(|env| format!("env:{env}"))
                                 .unwrap_or_default(),
                             headers: BTreeMap::new(),
+                            think: None,
+                            think_map: None,
                         })
                     })
                     .collect()
@@ -180,6 +191,8 @@ impl Settings {
                         format!("env:{env}")
                     },
                     headers: BTreeMap::new(),
+                    think: None,
+                    think_map: None,
                     builtin: true,
                 }));
                 changed = true;
@@ -475,6 +488,19 @@ fn update_table(table: &mut Table, profile: &ProviderProfile) {
     table["base_url"] = value(&profile.base_url);
     table["model"] = value(&profile.model);
     table["key_ref"] = value(&profile.key_ref);
+    if let Some(think) = profile.think {
+        table["think"] = value(think.name());
+    }
+    if let Some(map) = &profile.think_map {
+        let mut map_table = Table::new();
+        for (level, think_value) in map {
+            map_table[level] = value(match think_value {
+                ThinkValue::Text(text) => toml_edit::Value::from(text.as_str()),
+                ThinkValue::Number(number) => toml_edit::Value::from(*number as i64),
+            });
+        }
+        table["think_map"] = Item::Table(map_table);
+    }
     if !profile.headers.is_empty() {
         let mut headers = Table::new();
         for (key, value_text) in &profile.headers {
@@ -501,6 +527,34 @@ fn parse_profiles(doc: &DocumentMut) -> Result<Vec<ProviderProfile>> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let think =
+                match table.get("think").and_then(Item::as_str) {
+                    Some(text) => Some(ThinkLevel::parse(text).with_context(|| {
+                        format!("provider {name}: unknown think level {text:?}")
+                    })?),
+                    None => None,
+                };
+            let think_map = match table.get("think_map").and_then(Item::as_table) {
+                Some(map) => {
+                    let mut parsed = BTreeMap::new();
+                    for (level, item) in map.iter() {
+                        if ThinkLevel::parse(level).is_none() {
+                            bail!("provider {name}: think_map has unknown level {level:?}");
+                        }
+                        if let Some(text) = item.as_str() {
+                            parsed.insert(level.to_string(), ThinkValue::Text(text.into()));
+                        } else if let Some(number) = item.as_integer().filter(|n| *n >= 0) {
+                            parsed.insert(level.to_string(), ThinkValue::Number(number as u64));
+                        } else {
+                            bail!(
+                                "provider {name}: think_map.{level} must be a string or an integer"
+                            );
+                        }
+                    }
+                    Some(parsed)
+                }
+                None => None,
+            };
             profiles.push(ProviderProfile {
                 builtin: Settings::builtin(&name),
                 name,
@@ -509,6 +563,8 @@ fn parse_profiles(doc: &DocumentMut) -> Result<Vec<ProviderProfile>> {
                 model: table["model"].as_str().unwrap_or_default().into(),
                 key_ref: table["key_ref"].as_str().unwrap_or_default().into(),
                 headers,
+                think,
+                think_map,
             });
         }
     }
@@ -563,6 +619,8 @@ mod tests {
             model: "x".into(),
             key_ref: "env:TEST".into(),
             headers: BTreeMap::new(),
+            think: None,
+            think_map: None,
             builtin: false,
         })
         .unwrap();
@@ -607,6 +665,50 @@ mod tests {
         assert!(!std::fs::read_to_string(dir.join("providers.toml"))
             .unwrap()
             .contains("sk-private-1234"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn thinking_controls_round_trip_through_providers_toml() {
+        let dir = std::env::temp_dir().join(format!("wrose-think-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut settings = Settings::load_at(dir.clone()).unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("off".into(), ThinkValue::Number(0));
+        map.insert("low".into(), ThinkValue::Text("low".into()));
+        map.insert("medium".into(), ThinkValue::Text("medium".into()));
+        map.insert("high".into(), ThinkValue::Text("high".into()));
+        map.insert("max".into(), ThinkValue::Text("high".into()));
+        settings
+            .upsert_provider(ProviderProfile {
+                name: "thinkful".into(),
+                kind: "openai_compat".into(),
+                base_url: "https://example.com/v1".into(),
+                model: "x".into(),
+                key_ref: "env:TEST".into(),
+                headers: BTreeMap::new(),
+                think: Some(ThinkLevel::High),
+                think_map: Some(map.clone()),
+                builtin: false,
+            })
+            .unwrap();
+        let reloaded = Settings::load_at(dir.clone()).unwrap();
+        let profile = reloaded.profile("thinkful").expect("profile persists");
+        assert_eq!(profile.think, Some(ThinkLevel::High));
+        assert_eq!(profile.think_map, Some(map));
+
+        // An unknown level is a config error, not a silent default.
+        let path = dir.join("providers.toml");
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            source.replace("think = \"high\"", "think = \"deep\""),
+        )
+        .unwrap();
+        assert!(
+            Settings::load_at(dir.clone()).is_err(),
+            "unknown think level must fail the load"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

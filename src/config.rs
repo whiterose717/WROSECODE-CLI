@@ -1,3 +1,4 @@
+use crate::think::ThinkLevel;
 use clap::ValueEnum;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -20,6 +21,10 @@ pub struct Config {
     pub repair_retries: usize,
     pub check_command: Option<String>,
     pub skill_dirs: Vec<PathBuf>,
+    /// The configured thinking mode (`off | low | medium | high | max | auto`).
+    /// `thinking_level` below carries the live 0–20 strength this mode maps
+    /// to; `auto` rewrites it as the run progresses.
+    pub think: ThinkLevel,
     pub thinking_level: u8,
     pub max_parallel_tasks: usize,
     pub shell_timeout_seconds: u64,
@@ -99,6 +104,9 @@ impl Default for CacheRuntimeConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct AgentRuntimeConfig {
+    /// The `[agent] think` key from config.toml — the default thinking mode
+    /// when neither `--think` nor a providers.toml profile sets one.
+    pub think: Option<ThinkLevel>,
     pub thinking_level: u8,
     pub max_parallel_tasks: usize,
     pub shell_timeout_seconds: u64,
@@ -112,6 +120,7 @@ pub struct AgentRuntimeConfig {
 impl Default for AgentRuntimeConfig {
     fn default() -> Self {
         Self {
+            think: None,
             thinking_level: 5,
             max_parallel_tasks: 20,
             shell_timeout_seconds: 30,
@@ -239,6 +248,7 @@ mod tests {
         assert!(runtime.ui.alternate_screen);
         assert_eq!(runtime.ui.smooth_scroll_lines, 1);
 
+        assert_eq!(runtime.agent.think, Some(ThinkLevel::Medium));
         assert_eq!(runtime.agent.thinking_level, 5);
         assert_eq!(runtime.agent.max_parallel_tasks, 20);
         assert_eq!(runtime.agent.shell_timeout_seconds, 30);
@@ -276,6 +286,32 @@ mod tests {
         );
         assert_eq!(runtime.ui.theme, "dracula");
         assert_eq!(runtime.agent.thinking_level, 5);
+    }
+
+    #[test]
+    fn thinking_mode_parses_every_level_and_rejects_typos() {
+        for (name, level) in [
+            ("off", ThinkLevel::Off),
+            ("low", ThinkLevel::Low),
+            ("medium", ThinkLevel::Medium),
+            ("high", ThinkLevel::High),
+            ("max", ThinkLevel::Max),
+            ("auto", ThinkLevel::Auto),
+        ] {
+            let runtime = parse(&format!("[agent]\nthink = \"{name}\"\n"));
+            assert_eq!(runtime.agent.think, Some(level));
+        }
+        // An unknown level is a config error, not a silent default.
+        let source = "[agent]\nthink = \"deep\"\n";
+        assert!(toml::from_str::<RuntimeConfig>(source).is_err());
+        // Without the key, the legacy numeric level still decides the mode.
+        let runtime = parse("[agent]\nthinking_level = 17\n");
+        assert_eq!(runtime.agent.think, None);
+        assert_eq!(runtime.agent.thinking_level, 17);
+        assert_eq!(
+            ThinkLevel::from_level(runtime.agent.thinking_level),
+            ThinkLevel::High
+        );
     }
 
     #[test]

@@ -540,6 +540,7 @@ mod tests {
             repair_retries: 0,
             check_command: None,
             skill_dirs: Vec::new(),
+            think: crate::think::ThinkLevel::Medium,
             thinking_level: 5,
             max_parallel_tasks: 20,
             shell_timeout_seconds: 30,

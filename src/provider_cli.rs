@@ -93,6 +93,8 @@ pub async fn run(action: ProviderAction) -> Result<()> {
                 model: args.model.unwrap_or_default(),
                 key_ref: String::new(),
                 headers,
+                think: None,
+                think_map: None,
                 builtin: false,
             };
             if profile.base_url.is_empty() {

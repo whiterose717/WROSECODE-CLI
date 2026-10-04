@@ -6,6 +6,7 @@ use crate::metrics::Metrics;
 use crate::provider::{Content, Message, Progress, Provider, ToolCall, Usage};
 use crate::repo_map::RepoMap;
 use crate::skills::{self, Skill};
+use crate::think::{auto_think, AutoAction, ThinkLevel};
 use crate::tools::{self, Tools};
 use anyhow::{bail, Result};
 use futures::future::join_all;
@@ -29,7 +30,17 @@ pub struct Agent {
     pub active_skill: Option<String>,
     pub last_api_latency: Option<Duration>,
     pub ctf: CtfEngine,
+    /// The configured thinking mode (`off | low | medium | high | max | auto`).
+    pub think: ThinkLevel,
+    /// The live 0–20 strength this mode maps to — rewritten by the `auto`
+    /// controller (and by `/think`, `Ctrl+T`, `[`, `]`).
     pub thinking_level: u8,
+    /// Consecutive tool-failure steps in `auto` (escalates at 3).
+    think_fail_streak: u8,
+    /// An `auto` escalation is still awaiting its progress step.
+    auto_escalated: bool,
+    /// Reasoning tokens of the most recent model turn, for the dashboard.
+    pub last_turn_reasoning: u64,
     pub usage: Usage,
     pub model_turns: usize,
     pub started_at: Instant,
@@ -57,7 +68,7 @@ impl Agent {
         let started = Instant::now();
         let response = self
             .provider
-            .complete(system, &messages, &[], false, None)
+            .complete_with_think(system, &messages, &[], false, None, self.provider_think())
             .await?;
         self.last_api_latency = Some(started.elapsed());
         Ok(response
@@ -80,7 +91,7 @@ impl Agent {
         let started = Instant::now();
         let response = self
             .provider
-            .complete(system, &messages, &[], false, None)
+            .complete_with_think(system, &messages, &[], false, None, self.provider_think())
             .await?;
         self.last_api_latency = Some(started.elapsed());
         let subject = response
@@ -125,7 +136,11 @@ impl Agent {
             active_skill: None,
             last_api_latency: None,
             ctf: CtfEngine::new(&config.root).with_alert_bell(config.alert_bell),
+            think: config.think,
             thinking_level: config.thinking_level,
+            think_fail_streak: 0,
+            auto_escalated: false,
+            last_turn_reasoning: 0,
             usage: Usage::default(),
             model_turns: 0,
             started_at: Instant::now(),
@@ -181,7 +196,11 @@ impl Agent {
                 active_skill: None,
                 last_api_latency: None,
                 ctf: self.ctf.clone(),
+                think: self.think,
                 thinking_level: self.thinking_level,
+                think_fail_streak: 0,
+                auto_escalated: false,
+                last_turn_reasoning: 0,
                 usage: Usage::default(),
                 model_turns: 0,
                 started_at: Instant::now(),
@@ -199,6 +218,100 @@ impl Agent {
             });
         }
         self.run(text).await
+    }
+
+    /// The concrete level for the next provider call: `auto` resolves to its
+    /// live anchor, so providers only ever see a concrete level.
+    fn provider_think(&self) -> ThinkLevel {
+        ThinkLevel::from_level(self.thinking_level)
+    }
+
+    /// A manual level change (Ctrl+T, `[`/`]`, `/think`): set the mode, snap
+    /// the live level to its anchor, and reset any `auto` escalation state so
+    /// a fresh manual choice starts clean.
+    pub fn set_think(&mut self, level: ThinkLevel) {
+        self.think = level;
+        self.thinking_level = level.anchor();
+        self.think_fail_streak = 0;
+        self.auto_escalated = false;
+    }
+
+    /// One `auto` decision after a tool step: failing steps raise the streak,
+    /// clean steps clear it, three failures escalate, and the first clean
+    /// step after an escalation drops back one level (spec PHASE 4).
+    fn auto_step(&mut self, failures: usize) {
+        if !self.think.is_auto() {
+            return;
+        }
+        if failures > 0 {
+            self.think_fail_streak = self.think_fail_streak.saturating_add(1);
+        } else {
+            self.think_fail_streak = 0;
+        }
+        let action = auto_think(
+            self.think_fail_streak,
+            self.thinking_level,
+            self.auto_escalated,
+            failures == 0,
+        );
+        self.run_auto_action(action);
+    }
+
+    /// The `auto` decision at the end of a run: an answer-only task drops to
+    /// `low`, and a finished task releases any pending escalation.
+    fn auto_finish(&mut self, used_tools: bool) {
+        if !self.think.is_auto() {
+            return;
+        }
+        let action = if !used_tools {
+            self.think_fail_streak = 0;
+            self.auto_escalated = false;
+            AutoAction::Drop {
+                to: ThinkLevel::Low,
+                reason: "trivial task".into(),
+            }
+        } else if self.auto_escalated {
+            let mut action = AutoAction::None;
+            if let Some(to) = ThinkLevel::from_level(self.thinking_level).relax() {
+                action = AutoAction::Drop {
+                    to,
+                    reason: "progress".into(),
+                };
+            }
+            self.think_fail_streak = 0;
+            self.auto_escalated = false;
+            action
+        } else {
+            AutoAction::None
+        };
+        self.run_auto_action(action);
+    }
+
+    /// Apply one `auto` action: rewrite the live level and report the
+    /// transition to the transcript as `think: medium → high (…)`.
+    fn run_auto_action(&mut self, action: AutoAction) {
+        let (to, reason) = match action {
+            AutoAction::None => return,
+            AutoAction::Escalate { to, reason } => {
+                self.think_fail_streak = 0;
+                self.auto_escalated = true;
+                (to, reason)
+            }
+            AutoAction::Drop { to, reason } => (to, reason),
+        };
+        let from = ThinkLevel::from_level(self.thinking_level);
+        if to.anchor() == self.thinking_level {
+            return;
+        }
+        self.thinking_level = to.anchor();
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(Progress::Think {
+                from: from.name().into(),
+                to: to.name().into(),
+                to_level: to.anchor(),
+                reason,
+            });
+        }
     }
 
     async fn run(&mut self, query: &str) -> Result<String> {
@@ -233,12 +346,13 @@ impl Agent {
                 })
                 .unwrap_or_default();
             let system = format!(
-                "{}\nProject: {}\nMode: {}\nCTF category: {}\nThinking level: {}/20. At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
+                "{}\nProject: {}\nMode: {}\nCTF category: {}\nThinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
                 self.harness.prompt(),
                 self.config.root.display(),
                 self.mode,
                 self.ctf.category,
                 self.thinking_level,
+                self.think.name(),
                 memory,
                 map,
                 skill_text
@@ -262,12 +376,13 @@ impl Agent {
                     system.clone()
                 };
                 match selected_provider
-                    .complete(
+                    .complete_with_think(
                         &prompt,
                         &self.messages,
                         &schemas,
                         false,
                         self.event_tx.as_ref(),
+                        self.provider_think(),
                     )
                     .await
                 {
@@ -306,12 +421,13 @@ impl Agent {
                 }
                 let first_usage = response.usage;
                 let mut forced = selected_provider
-                    .complete(
+                    .complete_with_think(
                         &system,
                         &self.messages,
                         &schemas,
                         true,
                         self.event_tx.as_ref(),
+                        self.provider_think(),
                     )
                     .await?;
                 forced.usage.add(first_usage);
@@ -320,6 +436,7 @@ impl Agent {
             self.last_api_latency = Some(started.elapsed());
             self.model_turns += 1;
             self.usage.add(response.usage);
+            self.last_turn_reasoning = response.usage.reasoning;
             self.metrics.record_model(
                 &self.config.model,
                 response.usage,
@@ -362,6 +479,9 @@ impl Agent {
                 content: response.content,
             });
             if calls.is_empty() {
+                // Answer-only runs leave `auto` at low so trivial reads and
+                // short replies never sit above it (spec PHASE 4).
+                self.auto_finish(used_tools_this_turn);
                 return Ok(last_text);
             }
             used_tools_this_turn = true;
@@ -397,7 +517,11 @@ impl Agent {
             let harness = self.harness;
             let map = self.repo_map.clone();
             let event_tx = self.event_tx.clone();
-            let dynamic_parallel = match self.thinking_level {
+            // Delegate children inherit the live thinking state, not the
+            // startup defaults, so `auto` escalations reach them too.
+            let think = self.think;
+            let live_level = self.thinking_level;
+            let dynamic_parallel = match live_level {
                 0..=3 => 1,
                 4..=7 => 3,
                 8..=12 => 5,
@@ -510,7 +634,11 @@ impl Agent {
                                 last_api_latency: None,
                                 ctf: CtfEngine::new(&config.root)
                                     .with_alert_bell(config.alert_bell),
-                                thinking_level: config.thinking_level,
+                                think,
+                                thinking_level: live_level,
+                                think_fail_streak: 0,
+                                auto_escalated: false,
+                                last_turn_reasoning: 0,
                                 usage: Usage::default(),
                                 model_turns: 0,
                                 started_at: Instant::now(),
@@ -579,6 +707,12 @@ impl Agent {
                     }
                 }
             }
+            // Failures drive the `auto` thinking controller: three
+            // consecutive failing steps escalate the level.
+            let failures = results
+                .iter()
+                .filter(|(_, result, _)| result.is_err())
+                .count();
             let mut blocks: Vec<Content> = results
                 .into_iter()
                 .map(|(id, result, _)| match result {
@@ -630,6 +764,7 @@ impl Agent {
                 role: "user".into(),
                 content: blocks,
             });
+            self.auto_step(failures);
         }
     }
 

@@ -35,6 +35,7 @@ fn help_documents_the_operating_surface() {
         "--max-wall-time",
         "--race",
         "--session",
+        "--think",
     ] {
         assert!(stdout.contains(flag), "--help is missing {flag}");
     }
