@@ -10,7 +10,7 @@ it a poor fit.
 | Item | Status | Note |
 | --- | --- | --- |
 | Submission/event protocol | Partial | `Progress` events plus `--summary json` / `exec --json` emit one `TaskComplete`. **TODO** a framed submission stream (start/step/result) for embedding clients. |
-| `apply_patch` | Not implemented | **TODO** — `edit_file` does exact-match replacement; a unified-diff apply tool is the missing multi-hunk path. |
+| `apply_patch` | Adopted | `tools::patch` parses `*** Begin Patch` documents (`Update`/`Add`/`Delete`, `*** Move to:`), applies every hunk with an exactly-once match, and validates the whole document before writing anything. Scope-checked per touched path, requires a prior read, blocked in plan mode, and feeds the check loop (`tests/e2e_headless.rs::apply_patch_adds_a_file_and_the_model_sees_the_result`). |
 | Sandbox + approval as independent knobs | Adopted | `[sandbox] engine = none\|docker` is separate from `Permission::Ask\|AutoSafe\|Yolo`; both are read from config and overridable per run. |
 | AGENTS.md chain | Adopted | `project::instruction_chain` walks `AGENTS.md` from the filesystem root down to the project, appends `WROSECODE.md`, caps each file at 8 KB and the chain at 32 KB, and injects it into every system prompt (`tests/e2e_headless.rs::agents_md_chain_reaches_the_system_prompt`). |
 | Auto-compaction | Not implemented | **TODO** — long sessions grow without bound; `/compact` does not exist yet. |
@@ -46,7 +46,7 @@ it a poor fit.
 | --- | --- | --- |
 | Repo map ranked by relevance | Partial | `repo_map.rs` extracts symbols (syn for Rust) and keyword-ranks them. **TODO** PageRank over references and a token budget. |
 | Git auto-commit + `/undo` | Partial | `/commit` proposes messages and confirms; auto-commit and `/undo` are missing. |
-| Lint/test auto-loop after edits | Not implemented | **TODO** — verify step after `edit_file`. |
+| Lint/test auto-loop after edits | Adopted | `config.check_command()` (`.wrosecode/project.toml`, written by `/init`) runs after every successful `write_file`/`edit_file`/`apply_patch` in `agent.rs`, feeding failures back as a repair turn. |
 | `/add` `/drop` explicit context | Not implemented | **TODO**. |
 | Architect/editor two-model mode | Not implemented | Not applicable — `delegate_task` already lets a caller name a cheaper model per child; a global two-model toggle adds a second configuration axis for the same effect. |
 | Multiple edit formats per model | Not implemented | Not applicable — one exact-match `edit_file` plus `apply_patch` covers the space without per-model format negotiation. |

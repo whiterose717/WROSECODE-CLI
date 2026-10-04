@@ -315,3 +315,30 @@ fn agents_md_chain_reaches_the_system_prompt() {
         first.body
     );
 }
+
+#[test]
+fn apply_patch_adds_a_file_and_the_model_sees_the_result() {
+    let server = spawn(vec![
+        tool_call(
+            "apply_patch",
+            r#"{"patch":"*** Begin Patch\n*** Add File: notes/hello.txt\n+from patch\n*** End Patch"}"#,
+        ),
+        completion("PATCH-OK"),
+    ]);
+    let sandbox = Sandbox::new("patch", &server.url(""));
+
+    let output = headless(&sandbox, "add a note", &["--permission", "auto-safe"]);
+    assert_task_complete(&output, "PATCH-OK");
+
+    assert_eq!(
+        std::fs::read_to_string(sandbox.root.join("notes/hello.txt")).unwrap(),
+        "from patch\n"
+    );
+    let requests = server.requests();
+    assert!(requests.len() >= 2, "no tool round trip");
+    assert!(
+        requests.last().unwrap().body.contains("applied patch"),
+        "model never saw the patch result: {}",
+        requests.last().unwrap().body
+    );
+}

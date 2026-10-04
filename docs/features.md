@@ -57,8 +57,10 @@ everything not marked is implemented and covered by tests.
 ## Editing and git
 
 - `/init`, `/diff`, `/review`, `/commit`, `/rmslop`, `/issues`, `/skills`.
-- **TODO** `apply_patch`, `/undo` + `/redo` on git snapshots, lint/test
-  auto-loop after edits, explicit `/add` + `/drop` context.
+- Lint/test auto-loop: `check_command` (`.wrosecode/project.toml`) runs after
+  every successful `write_file`/`edit_file`/`apply_patch`, and a failed check
+  triggers a repair pass.
+- **TODO** `/undo` + `/redo` on git snapshots, explicit `/add` + `/drop` context.
 
 ## Agents and subagents
 
@@ -78,7 +80,7 @@ everything not marked is implemented and covered by tests.
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding
-items there: Codex submission/event protocol, `apply_patch`, auto-compaction; opencode markdown agents/commands, `/undo` `/redo`, LSP
+items there: Codex submission/event protocol, auto-compaction; opencode markdown agents/commands, `/undo` `/redo`, LSP
 feedback, session tree; goose recipes + HTTP MCP + planner/worker models;
 aider repo-map ranking, auto-commit loop, `/add` `/drop`, two-model mode,
 edit formats; open-interpreter multi-language runner and opt-in OS tools;

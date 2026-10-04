@@ -724,6 +724,10 @@ pub fn violation(
                 Some(format!("write {path} is outside the allowed files"))
             }
         }
+        "apply_patch" => crate::tools::patch::paths(input.get("patch")?.as_str()?)
+            .into_iter()
+            .find(|path| !scope.allows_path(root, Path::new(path)))
+            .map(|path| format!("write {path} is outside the allowed files")),
         "shell" => shell_violation(scope, root, input.get("command")?.as_str()?),
         "http" | "web_fetch" | "browser_capture" => {
             let url = input.get("url").and_then(|value| value.as_str()).or(path)?;

@@ -690,7 +690,7 @@ impl Agent {
                 }
             }))
             .await;
-            let edited_paths: Vec<String> = calls
+            let mut edited_paths: Vec<String> = calls
                 .iter()
                 .zip(results.iter())
                 .filter(|(call, (_, result, _))| {
@@ -698,6 +698,14 @@ impl Agent {
                 })
                 .filter_map(|(call, _)| call.input["path"].as_str().map(str::to_owned))
                 .collect();
+            edited_paths.extend(
+                calls
+                    .iter()
+                    .zip(results.iter())
+                    .filter(|(call, (_, result, _))| call.name == "apply_patch" && result.is_ok())
+                    .filter_map(|(call, _)| call.input["patch"].as_str())
+                    .flat_map(crate::tools::patch::paths),
+            );
             for (call, (_, result, elapsed_ms)) in calls.iter().zip(results.iter()) {
                 self.metrics.record_tool(result.is_ok());
                 if let Ok(output) = result {
@@ -845,6 +853,7 @@ fn format_tool_title(name: &str, detail: &str) -> String {
         "read_file" => "Read",
         "grep" | "glob" => "Searched",
         "edit_file" | "write_file" => "Edited",
+        "apply_patch" => "Patched",
         "web_fetch" | "web_search" => "Fetched",
         "delegate_task" => "Delegated",
         _ => "Ran",

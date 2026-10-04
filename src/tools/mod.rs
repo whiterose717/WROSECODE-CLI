@@ -5,6 +5,7 @@ pub mod decode;
 pub mod fs;
 pub mod http;
 pub mod mcp;
+pub mod patch;
 pub mod search;
 pub mod shell;
 pub mod vector;
@@ -98,6 +99,11 @@ impl Tools {
                 "edit_file",
                 "Replace text matching exactly once",
                 json!({"path":"string","old":"string","new":"string"}),
+            ),
+            schema(
+                "apply_patch",
+                "Apply a multi-file patch document (*** Begin Patch ... *** End Patch) with @@ hunks, adds, deletes, and moves",
+                json!({"patch":"string"}),
             ),
             schema(
                 "grep",
@@ -272,6 +278,25 @@ impl Tools {
                 self.forget_read(path)?;
                 result
             }
+            "apply_patch" => {
+                self.authorize(&call.name, None).await?;
+                let patch = arg(input, "patch")?;
+                for path in patch::paths(patch) {
+                    self.require_read(&path)?;
+                }
+                let (result, created) = patch::apply(&self.config.root, patch).await?;
+                for path in patch::paths(patch) {
+                    self.forget_read(&path)?;
+                }
+                if !created.is_empty() {
+                    let mut tracked = self
+                        .created_files
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("file tracking lock poisoned"))?;
+                    tracked.extend(created);
+                }
+                result
+            }
             "grep" => search::grep(&self.config.root, arg(input, "pattern")?)?,
             "glob" => search::glob(&self.config.root, arg(input, "pattern")?)?,
             "decode" => {
@@ -386,7 +411,10 @@ impl Tools {
             if let Some(address) = &self.redis_addr {
                 let _ = cache::redis_set(address, &key, &output).await;
             }
-        } else if matches!(call.name.as_str(), "write_file" | "edit_file" | "shell") {
+        } else if matches!(
+            call.name.as_str(),
+            "write_file" | "edit_file" | "apply_patch" | "shell"
+        ) {
             self.result_cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("result cache lock poisoned"))?
@@ -460,7 +488,13 @@ impl Tools {
         let destructive = command.is_some_and(shell::destructive);
         let mutating = matches!(
             name,
-            "write_file" | "edit_file" | "http" | "mcp" | "browser_capture" | "burp_export"
+            "write_file"
+                | "edit_file"
+                | "apply_patch"
+                | "http"
+                | "mcp"
+                | "browser_capture"
+                | "burp_export"
         ) || command.is_some_and(|c| !shell::read_only(c));
         if self.plan && mutating {
             bail!("plan mode is read-only");
@@ -646,6 +680,73 @@ mod tests {
             })
             .await
             .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_patch_honors_reads_and_plan_mode() {
+        let dir =
+            std::env::temp_dir().join(format!("wrosecode-patchtools-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "alpha\nbeta\n").unwrap();
+        let config = Arc::new(Config {
+            root: dir.clone(),
+            permission: Permission::Yolo,
+            model: "test".into(),
+            provider: "test".into(),
+            harness: "minimal".into(),
+            repair_retries: 0,
+            check_command: None,
+            skill_dirs: Vec::new(),
+            think: crate::think::ThinkLevel::Medium,
+            thinking_level: 5,
+            max_parallel_tasks: 20,
+            shell_timeout_seconds: 30,
+            tool_retries: 3,
+            fallback_provider: String::new(),
+            fallback_model: String::new(),
+            redis_url: None,
+            budget_usd: 0.0,
+            qdrant_url: None,
+            ui_theme: "dark".into(),
+            verbosity: "normal".into(),
+            alternate_screen: true,
+            mouse_capture: Some("auto".into()),
+            alert_bell: true,
+            smooth_scroll_lines: 1,
+            sandbox: crate::sandbox::SandboxPolicy::default(),
+        });
+        let tools = Tools::new(config, reqwest::Client::new());
+        let patch = ToolCall {
+            id: "1".into(),
+            name: "apply_patch".into(),
+            input: json!({"patch":"*** Begin Patch\n*** Update File: main.rs\n@@\n alpha\n-beta\n+bravo\n*** End Patch"}),
+        };
+        assert!(
+            tools.execute(&patch).await.is_err(),
+            "editing must require a prior read"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("main.rs")).unwrap(),
+            "alpha\nbeta\n"
+        );
+        tools
+            .execute(&ToolCall {
+                id: "2".into(),
+                name: "read_file".into(),
+                input: json!({"path":"main.rs"}),
+            })
+            .await
+            .unwrap();
+        let summary = tools.execute(&patch).await.unwrap();
+        assert!(summary.contains("updated main.rs (1 hunks)"), "{summary}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("main.rs")).unwrap(),
+            "alpha\nbravo\n"
+        );
+        let mut plan_mode = Tools::new(tools.config.clone(), reqwest::Client::new());
+        plan_mode.plan = true;
+        assert!(plan_mode.execute(&patch).await.is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
