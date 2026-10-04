@@ -13,6 +13,16 @@ const DONE_RETAIN_BYTES: usize = 256 * 1024;
 /// Registry capacity: the oldest finished entries are dropped first.
 const PROC_CAP: usize = 50;
 
+/// Keep only the newest `cap` bytes. Applied while the command still runs
+/// (see [`spawn_reader`]) so a `yes`-style flood cannot pin gigabytes before
+/// its timeout hits, and again at exit by [`ProcEntry::retain_tail`].
+fn keep_tail(buffer: &mut Vec<u8>, cap: usize) {
+    if buffer.len() > cap {
+        let excess = buffer.len() - cap;
+        buffer.drain(..excess);
+    }
+}
+
 /// One tracked shell command. Shared between the reader tasks that stream
 /// its output and the dashboard that samples it.
 pub struct ProcEntry {
@@ -71,10 +81,7 @@ impl ProcEntry {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if guard.len() > DONE_RETAIN_BYTES {
-                let excess = guard.len() - DONE_RETAIN_BYTES;
-                guard.drain(..excess);
-            }
+            keep_tail(&mut guard, DONE_RETAIN_BYTES);
         }
     }
 }
@@ -159,12 +166,26 @@ pub fn proc_snapshots() -> Vec<ProcSnapshot> {
 }
 
 /// Send SIGINT (or SIGTERM when `kill` is set) to a tracked process.
+///
+/// Tracked commands run as process-group leaders (see [`run_with_timeout`]),
+/// so the signal goes to the whole group first: grandchildren must not
+/// outlive a dashboard kill. A plain-pid delivery is the fallback when the
+/// group signal is refused (foreign pid, platform without group signalling).
 pub fn signal(pid: u32, kill: bool) -> Result<String> {
     let flag = if kill { "-TERM" } else { "-INT" };
-    let output = std::process::Command::new("kill")
-        .arg(flag)
-        .arg(pid.to_string())
+    if pid == 0 {
+        return Err(anyhow::anyhow!("cannot signal an unknown pid"));
+    }
+    let group = format!("-{pid}");
+    let mut output = std::process::Command::new("kill")
+        .args([flag, "--", &group])
         .output()?;
+    if !output.status.success() {
+        output = std::process::Command::new("kill")
+            .arg(flag)
+            .arg(pid.to_string())
+            .output()?;
+    }
     if output.status.success() {
         Ok(format!(
             "SIG{} sent to pid {pid}",
@@ -294,6 +315,55 @@ pub async fn run(command: &str, cwd: &Path) -> Result<String> {
     run_with_timeout(command, cwd, 30).await
 }
 
+/// SIGKILL an entire process group; a no-op once nothing remains (ESRCH is
+/// ignored). `pid` is a group leader's id (see `process_group`), never 0 —
+/// `kill(-0)` would target our *own* group, so 0 is refused outright.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .status();
+}
+
+/// Kills the command's whole process group on drop unless disarmed.
+///
+/// Spawned commands are group leaders, so this covers the grandchildren a
+/// plain kill of `sh` would leave behind — both on a timeout *and* on a
+/// cancelled turn (the future is dropped mid-await and `kill_on_drop` only
+/// reaches the shell itself). Disarmed after a normal exit: a background
+/// daemon the model started on purpose (`cmd &`, exit 0) keeps running,
+/// exactly as before this guard existed.
+struct GroupGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            #[cfg(unix)]
+            kill_group(self.pid);
+            #[cfg(not(unix))]
+            let _ = self.pid;
+        }
+    }
+}
+
+/// Await a reader without risking a hang: after the shell exits, a
+/// background grandchild may still hold the pipe open. Give it a second to
+/// flush what is already buffered, then abort the reader task.
+async fn reap(mut reader: tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_secs(1), &mut reader)
+        .await
+        .is_err()
+    {
+        reader.abort();
+    }
+}
+
 pub async fn run_with_timeout(command: &str, cwd: &Path, timeout_seconds: u64) -> Result<String> {
     let mut process = tokio::process::Command::new("sh");
     process
@@ -303,8 +373,19 @@ pub async fn run_with_timeout(command: &str, cwd: &Path, timeout_seconds: u64) -
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // Own process group: one id for the whole tree, so a timeout or the
+    // dashboard kill button can take the tree down together.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        process.as_std_mut().process_group(0);
+    }
     let mut child = process.spawn()?;
     let pid = child.id().unwrap_or(0);
+    let mut group = GroupGuard {
+        pid,
+        armed: pid != 0,
+    };
     let entry = Arc::new(ProcEntry::new(pid, command, &cwd.display().to_string()));
     register(entry.clone());
     let stdout_pipe = child.stdout.take();
@@ -317,24 +398,28 @@ pub async fn run_with_timeout(command: &str, cwd: &Path, timeout_seconds: u64) -
         Ok(Ok(status)) => status.code(),
         Ok(Err(error)) => {
             entry.finish(None, false);
-            let _ = stdout_reader.await;
-            let _ = stderr_reader.await;
+            reap(stdout_reader).await;
+            reap(stderr_reader).await;
             return Err(error.into());
         }
         Err(_) => {
+            // Kill the whole tree *before* awaiting the readers: grandchildren
+            // inheriting the pipes would otherwise keep them open forever.
+            #[cfg(unix)]
+            kill_group(pid);
             let _ = child.start_kill();
             let _ = child.wait().await;
             entry.finish(None, true);
-            let _ = stdout_reader.await;
-            let _ = stderr_reader.await;
+            reap(stdout_reader).await;
+            reap(stderr_reader).await;
             entry.retain_tail();
             return Err(anyhow::anyhow!(
                 "command timed out after {timeout_seconds} seconds and was terminated"
             ));
         }
     };
-    let _ = stdout_reader.await;
-    let _ = stderr_reader.await;
+    reap(stdout_reader).await;
+    reap(stderr_reader).await;
     let text = {
         let stdout = entry
             .stdout
@@ -350,6 +435,7 @@ pub async fn run_with_timeout(command: &str, cwd: &Path, timeout_seconds: u64) -
     };
     entry.finish(exit_code, timed_out);
     entry.retain_tail();
+    group.armed = false;
     Ok(text)
 }
 
@@ -375,6 +461,9 @@ fn spawn_reader(
                     };
                     if let Ok(mut guard) = buffer.lock() {
                         guard.extend_from_slice(bytes);
+                        // Cap while the command runs: flooding output must
+                        // not pin memory for the whole timeout window.
+                        keep_tail(&mut guard, DONE_RETAIN_BYTES);
                     }
                 }
             }
@@ -453,5 +542,81 @@ mod tests {
         }
         assert!(proc_snapshots().len() <= PROC_CAP);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_kills_the_whole_process_group() {
+        let dir = tmp();
+        let marker = dir.join("heartbeat");
+        // A grandchild that keeps writing: if the timeout killed only `sh`,
+        // this loop would outlive the command and the marker would grow.
+        let command = format!(
+            "(while true; do echo x >> '{}'; sleep 0.1; done) & sleep 60",
+            marker.display()
+        );
+        let error = run_with_timeout(&command, &dir, 1).await.unwrap_err();
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected: {error}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let first = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let second = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(first, second, "grandchild survived the timeout");
+        assert!(first > 0, "heartbeat never started");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_background_daemon_does_not_hold_the_result_open() {
+        let dir = tmp();
+        let started = Instant::now();
+        // The daemon inherits the stdout pipe; a plain `reader.await` would
+        // block until it exits instead of returning the command's output.
+        let text = run_with_timeout("(sleep 6 &) ; echo ok", &dir, 30)
+            .await
+            .unwrap();
+        assert!(text.contains("ok"));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "reader awaited the daemon's pipe for {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_flooding_command_keeps_only_the_newest_output() {
+        let dir = tmp();
+        let text = run_with_timeout("yes | head -c 4000000", &dir, 30)
+            .await
+            .unwrap();
+        assert!(
+            text.len() < 600 * 1024,
+            "buffers were not capped: {} bytes",
+            text.len()
+        );
+        assert!(text.contains('y'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signalling_pid_zero_is_refused() {
+        // `kill(-0)` would signal our own process group — the terminal
+        // session running the tests. The guard must reject it outright.
+        assert!(signal(0, true).is_err());
+        assert!(signal(0, false).is_err());
+    }
+
+    #[test]
+    fn keep_tail_drops_only_the_oldest_bytes() {
+        let mut buffer = b"hello world".to_vec();
+        keep_tail(&mut buffer, 5);
+        assert_eq!(buffer, b"world");
+        keep_tail(&mut buffer, 100);
+        assert_eq!(buffer, b"world");
+        keep_tail(&mut buffer, 3);
+        assert_eq!(buffer, b"rld");
     }
 }

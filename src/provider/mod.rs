@@ -473,4 +473,102 @@ mod sse_event_tests {
         assert_eq!(take_sse_event(&mut pending).as_deref(), Some(""));
         assert!(pending.is_empty());
     }
+
+    /// Deterministic xorshift: the fuzz corpus is identical on every run, so
+    /// a stream that ever misbehaves reproduces forever.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.max(1))
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// Separator-heavy alphabet: random buffers frequently contain `\n\n`,
+    /// `\r\n\r\n`, and boundary-overlapping mixes of the two.
+    const FUZZ_ALPHABET: &[u8] = b"data: {\n\n\r\n,}01 x";
+
+    fn fuzz_buffer(rng: &mut Rng, max_len: usize) -> Vec<u8> {
+        (0..rng.below(max_len + 1))
+            .map(|_| FUZZ_ALPHABET[rng.below(FUZZ_ALPHABET.len())])
+            .collect()
+    }
+
+    fn feed(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+        pending.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(event) = take_sse_event(pending) {
+            events.push(event);
+        }
+        events
+    }
+
+    #[test]
+    fn fuzzed_streams_never_panic() {
+        let mut rng = Rng::new(0x5eed);
+        for case in 0..400 {
+            let buffer = fuzz_buffer(&mut rng, 96);
+            let mut pending = Vec::new();
+            feed(&mut pending, &buffer);
+            // Byte-by-byte delivery must be safe too.
+            let mut pending = Vec::new();
+            for chunk in buffer.chunks(1) {
+                feed(&mut pending, chunk);
+            }
+            let _ = case;
+        }
+    }
+
+    #[test]
+    fn any_chunking_delivers_the_same_events() {
+        let mut rng = Rng::new(0xbeef);
+        for _ in 0..150 {
+            let buffer = fuzz_buffer(&mut rng, 40);
+            let mut pending = Vec::new();
+            let expected = feed(&mut pending, &buffer);
+
+            // Every two-way split.
+            for split in 0..=buffer.len() {
+                let mut pending = Vec::new();
+                let mut got = feed(&mut pending, &buffer[..split]);
+                got.extend(feed(&mut pending, &buffer[split..]));
+                assert_eq!(
+                    got,
+                    expected,
+                    "split {split} of {:?}",
+                    String::from_utf8_lossy(&buffer)
+                );
+            }
+
+            // One random three-way partition.
+            let first = rng.below(buffer.len() + 1);
+            let second = rng.below(buffer.len() + 1);
+            let (low, high) = if first <= second {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let mut pending = Vec::new();
+            let mut got = feed(&mut pending, &buffer[..low]);
+            got.extend(feed(&mut pending, &buffer[low..high]));
+            got.extend(feed(&mut pending, &buffer[high..]));
+            assert_eq!(
+                got,
+                expected,
+                "partition {low}/{high} of {:?}",
+                String::from_utf8_lossy(&buffer)
+            );
+        }
+    }
 }

@@ -179,19 +179,34 @@ impl Sandbox {
                 self.policy.image
             );
         }
+        // In-container deadline: the host-side timeout kills only the docker
+        // *client*, which would leave an ephemeral container running (or an
+        // exec'd process straggling inside the persistent one). `command -v`
+        // degrades to a plain `sh -c` on custom images without coreutils.
+        // The command travels as `$1` (an extra argv slot), so it is never
+        // interpolated into the script text.
+        let shell: Vec<String> = vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "if command -v timeout >/dev/null 2>&1; then \
+                 timeout -k 5 {timeout_seconds}s sh -c \"$1\"; else sh -c \"$1\"; fi"
+            ),
+            "sh".into(),
+            command.to_string(),
+        ];
         let args: Vec<String> = if self.policy.persistent {
-            vec![
+            let mut args = vec![
                 "exec".into(),
                 "-w".into(),
                 "/workspace".into(),
                 self.policy.name.clone(),
-                "sh".into(),
-                "-c".into(),
-                command.to_string(),
-            ]
+            ];
+            args.extend(shell);
+            args
         } else {
             let root = self.root.to_string_lossy();
-            vec![
+            let mut args = vec![
                 "run".into(),
                 "--rm".into(),
                 "-v".into(),
@@ -205,10 +220,9 @@ impl Sandbox {
                 "--cpus".into(),
                 self.policy.cpus.clone(),
                 self.policy.image.clone(),
-                "sh".into(),
-                "-c".into(),
-                command.to_string(),
-            ]
+            ];
+            args.extend(shell);
+            args
         };
         exec("docker", &as_refs(&args), timeout_seconds).await
     }

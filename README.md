@@ -18,6 +18,29 @@ x86_64-unknown-linux-musl` and `musl-tools` for `musl-gcc`) and install
 
 Rust was chosen for low input latency, predictable memory use, a single native binary, and direct terminal control. The architecture combines a differential TUI, streamed provider adapters, durable sessions, MCP tools, repository maps, skills, permission tiers, and parallel tool execution.
 
+## Quick start
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...      # or a local server: WROSECODE_OPENAI_URL + --provider openai-compat
+wrosecode                                # interactive session in the current directory
+wrosecode 'inventory the attack surface' # one turn, then exit
+wrosecode --permission yolo              # skip approval prompts (see Permissions)
+```
+
+Worth touching in the first session:
+
+```text
+/ctf        point the agent at a challenge file, URL, or CTFd task
+/providers  add, key, and health-check models without editing files
+Ctrl+T      cycle thinking levels (off → max)     Ctrl+D   eight-panel dashboard
+/help       every command, every keybinding
+/resume     pick a past session (the start screen lists the three most recent)
+```
+
+Sessions persist under `~/.wrosecode/sessions`; model profiles and keys live
+in `~/.wrosecode/providers.toml` (keys display as `••••last4` and are typed
+through a masked prompt).
+
 ## CTF dashboard
 
 The first view is an opencode-style start screen: a large `WROSECODE` wordmark
@@ -344,6 +367,14 @@ docker build -f Dockerfile.sandbox -t wrosecode-sandbox:latest .
 the image is missing, the tool call fails with a message that tells you which of
 the three to fix. `persistent = true` keeps one `sleep infinity` container alive
 and `docker exec`s into it, so there is no per-call cold start.
+
+Whatever the engine, `shell` is resource-boxed: the host path runs the command
+in its own process group, so a timeout or a cancelled turn kills the whole
+group — grandchildren included — stdout and stderr are tail-capped at 256 KiB
+while the command runs so a flooding pipe cannot pin memory, and a background
+daemon cannot hold the result open. The container path adds an in-container
+`timeout -k 5` (skipped automatically on images without coreutils) so killing
+the docker client on timeout cannot strand the workload inside the container.
 
 ```bash
 /sandbox        # status: engine, container, image

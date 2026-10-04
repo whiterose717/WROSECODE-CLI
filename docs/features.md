@@ -202,6 +202,46 @@ tests unless a line says otherwise.
   the moment the response completes and dispatching mid-stream would race
   tool ordering, permissions, and the snapshot step for a marginal win.
 
+## Hardening (Phase 8)
+
+- Secrets never leave a surface they belong on: crash reports mask
+  env vars whose names look like credentials (`KEY`/`TOKEN`/`SECRET`/… →
+  `***`) and run argv, detail, and backtrace through a credential pattern
+  set (AWS/GitHub/Slack/OpenAI keys, JWTs, `password=`/`Bearer `
+  assignments); memory facts are redacted before they hit disk; provider
+  keys display as `••••last4`, are typed through a masked prompt, and are
+  blocked from plain auth-header fields. Keys travel in HTTP headers, never
+  in URLs, so provider error strings cannot echo them; events NDJSON,
+  telemetry batches, and the session store carry no key material.
+- Tool output, web pages, and file contents are untrusted *data*: they are
+  only ever rendered into model context (repo map, memory recall, skill
+  text, web results). Policy decisions — permission tiers, approval
+  prompts, scope violations, plan-mode refusal — read exclusively from
+  operator config, the user channel, and the structured tool-call
+  arguments, so no injected instruction inside a fetched page or tool
+  result can widen approvals or scope.
+- Child processes are time-boxed and group-owned: `shell` commands run as
+  their own process-group leaders; a timeout (or a cancelled turn, via the
+  drop guard) SIGKILLs the whole group instead of just `sh`, so
+  grandchildren cannot outlive the call. The dashboard Ctrl+C/Ctrl+K
+  signal the group with a plain-pid fallback (and refuse pid 0, which
+  would target the terminal's own group). stdout/stderr are tail-capped at
+  256 KiB *while the command runs*, reader tasks get a one-second flush
+  window before being aborted (a background daemon cannot hold the result
+  open), and the docker engine runs an in-container `timeout -k 5` around
+  the command — argv-safe (`$1` slot, no string interpolation) with a
+  `command -v timeout` fallback for images without coreutils.
+- Fuzzing with deterministic corpora (xorshift-seeded, identical on every
+  run and in CI — a crash reproduces): the patch parser takes 400
+  line-vocabulary patches through `paths`/`parse` plus 60 patches through
+  `apply`, where an error must leave the target file byte-identical
+  (atomicity holds under fuzz, not just in the hand-written cases); the
+  SSE drain takes 400 separator-heavy byte streams and enforces a
+  chunk-invariance property — every two-way split and a random three-way
+  partition of each stream deliver exactly the events one whole feed
+  does. Both sit in the normal test suite, so the standard gate fuzzes on
+  every commit.
+
 ## Reference-project gap list
 
 See `docs/ref-notes.md` for the per-project adoption record. Outstanding

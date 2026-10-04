@@ -486,4 +486,111 @@ mod tests {
         assert_eq!(paths(patch), vec!["a.txt", "b.txt", "c.txt", "d.txt"]);
         assert!(paths("garbage").is_empty());
     }
+
+    /// Deterministic xorshift: the corpus is identical on every run and in
+    /// CI, so a patch that ever crashes the parser reproduces forever.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.max(1))
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// Well-formed patch vocabulary plus near-miss lines: random draws land
+    /// both inside valid structure (reaching hunk/section logic) and on
+    /// malformed combinations (reaching the error paths).
+    const FUZZ_LINES: &[&str] = &[
+        "*** Begin Patch",
+        "*** End Patch",
+        "*** Update File: fuzz.txt",
+        "*** Add File: fuzz.txt",
+        "*** Delete File: fuzz.txt",
+        "*** Move to: moved.txt",
+        "@@",
+        "@@ -1,3 +1,3 @@",
+        " alpha",
+        " beta",
+        "-beta",
+        "+bravo",
+        " gamma",
+        "",
+        "garbage",
+        "*** Update File:",
+        "*** Begin Patch extra",
+    ];
+
+    fn fuzz_patch(rng: &mut Rng) -> String {
+        let line_count = 1 + rng.below(14);
+        let mut patch = String::new();
+        for index in 0..line_count {
+            if rng.below(5) == 0 {
+                for _ in 0..rng.below(12) {
+                    patch.push((b'a' + rng.below(26) as u8) as char);
+                }
+            } else {
+                patch.push_str(FUZZ_LINES[rng.below(FUZZ_LINES.len())]);
+            }
+            if index + 1 < line_count {
+                patch.push('\n');
+            }
+        }
+        patch
+    }
+
+    #[test]
+    fn fuzzed_patches_never_panic_the_parser() {
+        let mut rng = Rng::new(0xdead);
+        for _ in 0..400 {
+            let patch = fuzz_patch(&mut rng);
+            let _ = paths(&patch);
+            let _ = parse(&patch);
+        }
+    }
+
+    #[tokio::test]
+    async fn fuzzed_patches_apply_without_panicking_or_corrupting() {
+        let base = "*** Begin Patch\n*** Update File: fuzz.txt\n@@\n alpha\n-beta\n+bravo\n gamma\n*** End Patch";
+        let base_lines: Vec<&str> = base.lines().collect();
+        let original = "alpha\nbeta\ngamma\n";
+        let mut rng = Rng::new(0xbeef);
+        for case in 0..60 {
+            // Half pure-vocabulary draws, half single-line mutations of a
+            // valid patch (delete or duplicate one line).
+            let patch = if case % 2 == 0 {
+                fuzz_patch(&mut rng)
+            } else {
+                let mut lines = base_lines.clone();
+                let victim = rng.below(lines.len());
+                if rng.below(2) == 0 {
+                    lines.remove(victim);
+                } else {
+                    let extra = base_lines[rng.below(base_lines.len())];
+                    lines.insert(victim, extra);
+                }
+                lines.join("\n")
+            };
+            let dir = scratch(&format!("fuzz{case}"));
+            std::fs::write(dir.join("fuzz.txt"), original).unwrap();
+            if let Err(error) = apply(&dir, &patch).await {
+                let after = std::fs::read_to_string(dir.join("fuzz.txt")).unwrap();
+                assert_eq!(
+                    original, after,
+                    "case {case} corrupted the file on error: {error}\n{patch}"
+                );
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
 }
