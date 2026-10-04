@@ -94,6 +94,10 @@
           "type": ["string", "null"],
           "description": "Planner model for the read-only plan mode, as \"provider/model\" or a bare model on the main provider."
         },
+        "auto_commit": {
+          "type": "boolean",
+          "description": "Commit the agent's edited paths after each check-passed turn (aider-style autocommit). Default true."
+        },
         "budget_usd": {
           "type": "number",
           "minimum": 0

@@ -1073,11 +1073,13 @@ impl Agent {
                 }
                 if checks_passed {
                     self.emit("checks passed".into());
-                    let commit = auto_commit(&self.config.root, &edited_paths, &last_text).await;
-                    if let Err(error) = commit {
-                        blocks.push(Content::Text(format!(
-                            "Automatic git commit failed: {error}"
-                        )));
+                    if self.config.auto_commit {
+                        if let Err(error) = self.auto_commit_paths(&edited_paths, &last_text).await
+                        {
+                            blocks.push(Content::Text(format!(
+                                "Automatic git commit failed: {error}"
+                            )));
+                        }
                     }
                 }
             }
@@ -1087,6 +1089,92 @@ impl Agent {
             });
             self.auto_step(failures);
         }
+    }
+
+    /// aider-style autocommit: stage exactly the paths this turn edited and
+    /// commit them with a model-written subject drawn from the staged diff,
+    /// falling back to a `wrosecode: <last reply line>` heuristic when the
+    /// model has nothing better. `git commit --only` pins the commit to
+    /// `paths`, so unrelated dirty files in the tree are never swept in.
+    async fn auto_commit_paths(&mut self, paths: &[String], summary: &str) -> Result<()> {
+        let root = self.config.root.clone();
+        let probe = tokio::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(&root)
+            .output()
+            .await?;
+        if !probe.status.success() || probe.stdout != b"true\n" {
+            return Ok(());
+        }
+        let output = tokio::process::Command::new("git")
+            .arg("add")
+            .arg("--")
+            .args(paths)
+            .current_dir(&root)
+            .output()
+            .await?;
+        if !output.status.success() {
+            bail!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // The staged diff — now including newly added files — is what the
+        // commit message has to describe. A failed diff just drops us to
+        // the heuristic; it must not fail the commit itself.
+        let diff = tokio::process::Command::new("git")
+            .args(["diff", "--no-ext-diff", "--cached", "--"])
+            .args(paths)
+            .current_dir(&root)
+            .output()
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        let subject = if diff.trim().is_empty() {
+            None
+        } else {
+            // The subject call is not part of the turn's API timing.
+            let saved_latency = self.last_api_latency;
+            let subject = self.commit_message(&diff).await.ok();
+            self.last_api_latency = saved_latency;
+            subject
+        };
+        let message = match subject.filter(|subject| !subject.trim().is_empty()) {
+            Some(subject) => format!("wrosecode: {}", subject.trim())
+                .chars()
+                .take(72)
+                .collect::<String>(),
+            None => format!(
+                "wrosecode: {}",
+                summary
+                    .lines()
+                    .next()
+                    .unwrap_or("update files")
+                    .chars()
+                    .take(70)
+                    .collect::<String>()
+            ),
+        };
+        let output = tokio::process::Command::new("git")
+            .arg("commit")
+            .arg("--only")
+            .arg("-m")
+            .arg(&message)
+            .arg("--")
+            .args(paths)
+            .current_dir(&root)
+            .output()
+            .await?;
+        if !output.status.success() {
+            bail!(
+                "git commit failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        self.emit(format!("auto-commit {message}"));
+        Ok(())
     }
 
     fn emit(&self, message: String) {
@@ -1176,57 +1264,6 @@ fn task_requires_tool(query: &str) -> bool {
     ]
     .iter()
     .any(|needle| query.contains(needle))
-}
-
-async fn auto_commit(root: &std::path::Path, paths: &[String], summary: &str) -> Result<()> {
-    let probe = tokio::process::Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(root)
-        .output()
-        .await?;
-    if !probe.status.success() || probe.stdout != b"true\n" {
-        return Ok(());
-    }
-    let message = format!(
-        "wrosecode: {}",
-        summary
-            .lines()
-            .next()
-            .unwrap_or("update files")
-            .chars()
-            .take(70)
-            .collect::<String>()
-    );
-    let output = tokio::process::Command::new("git")
-        .arg("add")
-        .arg("--")
-        .args(paths)
-        .current_dir(root)
-        .output()
-        .await?;
-    if !output.status.success() {
-        bail!(
-            "git add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let output = tokio::process::Command::new("git")
-        .arg("commit")
-        .arg("--only")
-        .arg("-m")
-        .arg(message)
-        .arg("--")
-        .args(paths)
-        .current_dir(root)
-        .output()
-        .await?;
-    if !output.status.success() {
-        bail!(
-            "git commit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
 }
 
 /// The summarizer's instructions (Codex compaction, clai's state-preserving
@@ -1434,6 +1471,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A provider that plays back a fixed script of responses, then keeps
+    /// answering with a plain "done" once the script runs out.
+    struct ScriptedProvider {
+        script: Mutex<std::collections::VecDeque<Response>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(script: Vec<Response>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script.into_iter().collect()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn chat_stream_with_think(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[serde_json::Value],
+            _require_tool: bool,
+            _progress: Option<&mpsc::UnboundedSender<Progress>>,
+            _think: ThinkLevel,
+        ) -> anyhow::Result<Response> {
+            let next = self.script.lock().expect("script lock").pop_front();
+            Ok(next.unwrap_or(Response {
+                content: vec![Content::Text("done".into())],
+                usage: Usage::default(),
+            }))
+        }
+
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec!["mock-model".into()])
+        }
+    }
+
+    fn said(text: &str) -> Response {
+        Response {
+            content: vec![Content::Text(text.into())],
+            usage: Usage::default(),
+        }
+    }
+
+    fn writes(path: &str) -> Response {
+        Response {
+            content: vec![Content::Call(ToolCall {
+                id: "call-1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": path, "content": "hello from the agent"}),
+            })],
+            usage: Usage::default(),
+        }
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git must be on PATH for this test");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A one-commit repo whose `unrelated.txt` is dirty, ready for an agent
+    /// to edit something else.
+    fn git_repo_with_dirty_file(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("temp repo dir");
+        std::fs::write(dir.join("unrelated.txt"), "v1").expect("seed file");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "wrose@local"],
+            vec!["config", "user.name", "wrose test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            git_out(dir, &args);
+        }
+        std::fs::write(dir.join("unrelated.txt"), "v2 dirty").expect("dirty file");
+    }
+
+    #[tokio::test]
+    async fn autocommit_commits_only_the_paths_the_agent_edited() {
+        let dir = std::env::temp_dir().join(format!("wrose-autocommit-{}", std::process::id()));
+        git_repo_with_dirty_file(&dir);
+
+        let (mut agent, _mock) = agent_with_mock(&dir);
+        agent.config = Arc::new(Config {
+            auto_commit: true,
+            ..(*agent.config).clone()
+        });
+        agent.provider = ScriptedProvider::new(vec![
+            writes("note.txt"),
+            said("Write the note file with the parser output"),
+            said("done"),
+        ]) as Arc<dyn Provider>;
+
+        let reply = agent.turn("write note.txt").await.expect("turn");
+        assert!(!reply.is_empty());
+
+        assert_eq!(
+            git_out(&dir, &["log", "--format=%s", "-1"]).trim(),
+            "wrosecode: Write the note file with the parser output",
+            "the commit subject comes from the model, not the heuristic"
+        );
+        let files = git_out(&dir, &["show", "--name-only", "--format=", "-1"]);
+        assert!(files.lines().any(|line| line == "note.txt"), "{files}");
+        assert!(
+            !files.lines().any(|line| line == "unrelated.txt"),
+            "the pre-existing dirty file must stay out: {files}"
+        );
+        let status = git_out(&dir, &["status", "--porcelain"]);
+        assert!(status.contains("unrelated.txt"), "still dirty: {status}");
+        assert!(!status.contains("note.txt"), "note.txt committed: {status}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn autocommit_can_be_switched_off() {
+        let dir = std::env::temp_dir().join(format!("wrose-no-autocommit-{}", std::process::id()));
+        git_repo_with_dirty_file(&dir);
+
+        let (mut agent, _mock) = agent_with_mock(&dir);
+        assert!(!agent.config.auto_commit, "the test config ships it off");
+        agent.provider = ScriptedProvider::new(vec![
+            writes("note.txt"),
+            said("Write the note file"),
+            said("done"),
+        ]) as Arc<dyn Provider>;
+
+        agent.turn("write note.txt").await.expect("turn");
+
+        assert_eq!(
+            git_out(&dir, &["rev-list", "--count", "HEAD"]).trim(),
+            "1",
+            "no automatic commit was made"
+        );
+        let status = git_out(&dir, &["status", "--porcelain"]);
+        assert!(
+            status.contains("note.txt"),
+            "edit left for /commit: {status}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn agent_with_mock(root: &Path) -> (Agent, Arc<MockProvider>) {
         let config = Arc::new(Config {
             root: root.to_path_buf(),
@@ -1453,6 +1641,7 @@ mod tests {
             fallback_model: String::new(),
             planner_provider: String::new(),
             planner_model: String::new(),
+            auto_commit: false,
             redis_url: None,
             budget_usd: 0.0,
             qdrant_url: None,

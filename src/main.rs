@@ -341,6 +341,7 @@ async fn main() -> Result<()> {
         fallback_model: runtime.agent.fallback_model,
         planner_provider,
         planner_model,
+        auto_commit: runtime.agent.auto_commit,
         redis_url: runtime
             .cache
             .redis_url

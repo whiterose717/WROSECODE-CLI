@@ -36,6 +36,9 @@ pub struct Config {
     /// worker (main provider) runs every mode.
     pub planner_provider: String,
     pub planner_model: String,
+    /// aider-style git auto-commit: after an edit turn that passed its
+    /// checks, commit exactly the paths the agent touched.
+    pub auto_commit: bool,
     pub redis_url: Option<String>,
     pub budget_usd: f64,
     pub qdrant_url: Option<String>,
@@ -125,6 +128,10 @@ pub struct AgentRuntimeConfig {
     /// `planner = "provider/model"` (or just `"model"` for the main
     /// provider) in `[agent]`: the model that thinks in `plan` mode.
     pub planner: Option<String>,
+    /// Commit the agent's edits after each checked turn (aider's
+    /// autocommit). Default on, matching aider; `[agent] auto_commit = false`
+    /// keeps commits manual via `/commit`.
+    pub auto_commit: bool,
     pub budget_usd: f64,
     pub permission: Permission,
 }
@@ -140,6 +147,7 @@ impl Default for AgentRuntimeConfig {
             fallback_provider: String::new(),
             fallback_model: String::new(),
             planner: None,
+            auto_commit: true,
             budget_usd: 0.0,
             permission: Permission::Ask,
         }
@@ -379,6 +387,10 @@ mod tests {
         // until the user names a planner.
         assert_eq!(runtime.agent.planner, None);
         assert!(runtime.agent.planner_split("openai").is_none());
+        assert!(
+            runtime.agent.auto_commit,
+            "aider-style auto-commit ships on"
+        );
 
         assert_eq!(runtime.cache.backend, "memory");
         assert!(runtime.cache.redis_url.is_some());
@@ -456,6 +468,16 @@ mod tests {
         );
         assert_eq!(runtime.ui.theme, "dracula");
         assert_eq!(runtime.agent.thinking_level, 5);
+    }
+
+    #[test]
+    fn auto_commit_defaults_on_and_can_be_disabled() {
+        let runtime = parse("[ui]\n");
+        assert!(runtime.agent.auto_commit, "absent key defaults to on");
+        let runtime = parse("[agent]\nauto_commit = false\n");
+        assert!(!runtime.agent.auto_commit, "the gate turns it off");
+        // A wrong type is an error, not a silent default.
+        assert!(toml::from_str::<RuntimeConfig>("[agent]\nauto_commit = \"yes\"\n").is_err());
     }
 
     #[test]

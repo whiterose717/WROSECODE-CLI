@@ -36,6 +36,11 @@ fallback_model = ""
 # mode, as "provider/model" or a bare model on the main provider. Empty (or
 # commented out) keeps one model for every mode.
 # planner = "anthropic/claude-haiku"
+# aider-style auto-commit: after an edit turn whose checks pass, commit
+# exactly the paths the agent touched (never the rest of the working tree)
+# with a model-written subject from the staged diff. false = every commit
+# stays manual via /commit.
+auto_commit = true
 budget_usd = 0.0 # zero means unlimited
 # ask = prompt before every risky tool call, auto-safe = allow only read-only
 # commands, yolo = allow everything. Overridden by --permission.
