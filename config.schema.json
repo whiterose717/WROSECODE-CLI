@@ -171,6 +171,28 @@
         }
       },
       "additionalProperties": false
+    },
+    "lsp": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "wait_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "commands": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

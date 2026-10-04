@@ -381,6 +381,7 @@ built-in defaults rather than failing to start. CLI flags always win.
 | `[ctf]` | Flag regexes, clipboard copy, CTFd auto-submit. |
 | `[cache]` | `memory` or `redis`, plus Redis and Qdrant URLs. |
 | `[sandbox]` | Where `shell` calls run (`none` or `docker`) and the container settings. |
+| `[lsp]` | Language-server diagnostics appended to file edits (`enabled`, `wait_ms`, per-language `commands`). |
 
 `cargo test` parses the shipped `config.toml` and asserts every key lands where
 it should, so a section cannot silently stop being read again.

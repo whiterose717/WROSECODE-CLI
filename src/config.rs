@@ -42,6 +42,8 @@ pub struct Config {
     pub alert_bell: bool,
     pub smooth_scroll_lines: usize,
     pub sandbox: crate::sandbox::SandboxPolicy,
+    /// Language-server feedback after edits (`[lsp]` in config.toml).
+    pub lsp: crate::lsp::LspSettings,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -54,6 +56,8 @@ pub struct RuntimeConfig {
     pub cache: CacheRuntimeConfig,
     #[serde(default)]
     pub sandbox: SandboxRuntimeConfig,
+    #[serde(default)]
+    pub lsp: LspRuntimeConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -177,6 +181,47 @@ impl SandboxRuntimeConfig {
     }
 }
 
+/// `[lsp]` in config.toml. Only the keys a user actually sets are listed here;
+/// `into_settings` folds them over the built-in per-language defaults, so
+/// `[lsp.commands] rs = ["rust-analyzer", "--log-file", "ra.log"]` replaces
+/// just the Rust entry while the other languages keep theirs.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct LspRuntimeConfig {
+    pub enabled: bool,
+    pub wait_ms: u64,
+    /// extension → server argv; each entry overrides the built-in one.
+    pub commands: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl Default for LspRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            wait_ms: 1_200,
+            commands: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl LspRuntimeConfig {
+    pub fn into_settings(self) -> crate::lsp::LspSettings {
+        let mut settings = crate::lsp::LspSettings {
+            enabled: self.enabled,
+            wait_ms: self.wait_ms,
+            ..Default::default()
+        };
+        for (extension, argv) in self.commands {
+            if argv.is_empty() {
+                settings.commands.remove(&extension);
+            } else {
+                settings.commands.insert(extension, argv);
+            }
+        }
+        settings
+    }
+}
+
 impl RuntimeConfig {
     pub fn load(root: &std::path::Path) -> Self {
         std::fs::read_to_string(root.join("config.toml"))
@@ -187,6 +232,7 @@ impl RuntimeConfig {
                 agent: AgentRuntimeConfig::default(),
                 cache: CacheRuntimeConfig::default(),
                 sandbox: SandboxRuntimeConfig::default(),
+                lsp: LspRuntimeConfig::default(),
             })
     }
 }
@@ -271,6 +317,52 @@ mod tests {
 
         let policy = runtime.sandbox.policy();
         assert!(!policy.engine.is_empty());
+
+        assert!(runtime.lsp.enabled);
+        assert_eq!(runtime.lsp.wait_ms, 1200);
+        let settings = runtime.lsp.into_settings();
+        assert!(settings.enabled, "the shipped file keeps diagnostics on");
+        assert_eq!(settings.wait_ms, 1200);
+        assert_eq!(
+            settings.command_for("rs"),
+            Some(["rust-analyzer".to_string()].as_slice()),
+            "an untouched extension keeps its built-in server"
+        );
+    }
+
+    #[test]
+    fn lsp_commands_override_one_language_and_empty_removes_it() {
+        let runtime = parse(
+            r#"
+            [lsp]
+            enabled = false
+            wait_ms = 50
+            [lsp.commands]
+            rs = ["rust-analyzer", "--log-file", "ra.log"]
+            py = []
+            "#,
+        );
+        assert!(!runtime.lsp.enabled);
+        assert_eq!(runtime.lsp.wait_ms, 50);
+        let settings = runtime.lsp.into_settings();
+        assert_eq!(
+            settings.command_for("rs"),
+            Some(
+                [
+                    "rust-analyzer".to_string(),
+                    "--log-file".to_string(),
+                    "ra.log".to_string()
+                ]
+                .as_slice()
+            ),
+            "the configured argv replaces the built-in for that language"
+        );
+        assert_eq!(settings.command_for("py"), None, "empty list removes it");
+        assert_eq!(
+            settings.command_for("go"),
+            Some(["gopls".to_string()].as_slice()),
+            "languages nobody configured keep their defaults"
+        );
     }
 
     #[test]

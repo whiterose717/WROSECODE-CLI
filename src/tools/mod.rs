@@ -48,6 +48,10 @@ pub struct Tools {
     /// (writes and network outside it need approval; in-scope mutations are
     /// auto-approved per spec 4).
     pub scope: Option<Arc<crate::autopilot::Scope>>,
+    /// Language servers for this workspace; each file write appends whatever
+    /// the file's server says about the change (opencode parity). A tokio
+    /// lock because diagnostics wait on the server across await points.
+    pub lsp: Arc<tokio::sync::Mutex<crate::lsp::Lsp>>,
 }
 
 impl Tools {
@@ -57,6 +61,10 @@ impl Tools {
             config.sandbox.clone(),
             config.root.clone(),
         ));
+        let lsp = Arc::new(tokio::sync::Mutex::new(crate::lsp::Lsp::new(
+            config.root.clone(),
+            config.lsp.clone(),
+        )));
         Self {
             config,
             client,
@@ -74,6 +82,7 @@ impl Tools {
             redis_addr,
             sandbox,
             scope: None,
+            lsp,
         }
     }
 
@@ -235,6 +244,9 @@ impl Tools {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("reference tracking lock poisoned"))?
                     .insert(resolved.clone());
+                // Reading a file is usually the step before editing it, so
+                // this is where its language server gets started.
+                self.lsp.lock().await.spawn_for(&resolved).await;
                 self.read_files
                     .lock()
                     .map_err(|_| anyhow::anyhow!("read tracking lock poisoned"))?
@@ -442,6 +454,20 @@ impl Tools {
             }
             _ => bail!("unknown tool: {}", call.name),
         };
+        // Whatever the file's language server makes of the change comes
+        // back with the write itself, so the agent can fix its mistake
+        // before the next turn instead of after the run fails.
+        let output = if matches!(
+            call.name.as_str(),
+            "write_file" | "edit_file" | "apply_patch"
+        ) {
+            match self.lsp_diagnostics(&call.name, input).await {
+                Some(feedback) => format!("{output}\n\n{feedback}"),
+                None => output,
+            }
+        } else {
+            output
+        };
         let output = truncate(output, 32_000);
         if let Some(key) = cache_key {
             self.result_cache
@@ -461,6 +487,38 @@ impl Tools {
                 .clear();
         }
         Ok(output)
+    }
+
+    /// The diagnostics for the files a write just touched, joined for the
+    /// tool result. Silent when no server runs for them, none answers in
+    /// time, or nothing is wrong — a clean edit reads exactly as before.
+    async fn lsp_diagnostics(&self, name: &str, input: &Value) -> Option<String> {
+        let paths: Vec<String> = match name {
+            "write_file" | "edit_file" => input["path"]
+                .as_str()
+                .map(|path| vec![path.to_string()])
+                .unwrap_or_default(),
+            "apply_patch" => {
+                let patch = input["patch"].as_str()?;
+                patch::paths(patch)
+            }
+            _ => return None,
+        };
+        let mut lsp = self.lsp.lock().await;
+        let mut sections = Vec::new();
+        for path in paths.iter().take(3) {
+            let Ok(resolved) = fs::resolve(&self.config.root, path) else {
+                continue;
+            };
+            if let Some(section) = lsp.diagnostics_after_edit(&resolved).await {
+                sections.push(section);
+            }
+        }
+        if sections.is_empty() {
+            None
+        } else {
+            Some(sections.join("\n"))
+        }
     }
 
     pub fn cache_stats(&self) -> (usize, usize) {
@@ -677,6 +735,152 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn a_write_hands_the_agent_what_the_language_server_said() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: python3 is not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("wrosecode-lsp-tool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        let script = dir.join("fake_server.py");
+        std::fs::write(&script, crate::lsp::FAKE_SERVER).unwrap();
+
+        let mut settings = crate::lsp::LspSettings {
+            wait_ms: 4_000,
+            ..Default::default()
+        };
+        settings.commands.insert(
+            "rs".to_string(),
+            vec!["python3".to_string(), script.display().to_string()],
+        );
+        let active_config = Config {
+            root: dir.clone(),
+            permission: Permission::Yolo,
+            model: "test".into(),
+            provider: "test".into(),
+            harness: "minimal".into(),
+            repair_retries: 0,
+            check_command: None,
+            skill_dirs: Vec::new(),
+            think: crate::think::ThinkLevel::Medium,
+            thinking_level: 5,
+            max_parallel_tasks: 20,
+            shell_timeout_seconds: 30,
+            tool_retries: 3,
+            fallback_provider: String::new(),
+            fallback_model: String::new(),
+            redis_url: None,
+            budget_usd: 0.0,
+            qdrant_url: None,
+            ui_theme: "dark".into(),
+            verbosity: "normal".into(),
+            alternate_screen: true,
+            mouse_capture: Some("auto".into()),
+            alert_bell: true,
+            smooth_scroll_lines: 1,
+            sandbox: crate::sandbox::SandboxPolicy::default(),
+            lsp: settings.clone(),
+        };
+        let tools = Tools::new(Arc::new(active_config), reqwest::Client::new());
+
+        // Reading warms the server; the edit's result carries its verdict.
+        let read = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            input: json!({"path": "main.rs"}),
+        };
+        tools.execute(&read).await.expect("read");
+
+        let edit = ToolCall {
+            id: "2".into(),
+            name: "edit_file".into(),
+            input: json!({
+                "path": "main.rs",
+                "old": "fn main() {}",
+                "new": "fn main() { let value = 1; }",
+            }),
+        };
+        let output = tools.execute(&edit).await.expect("edit");
+        assert!(
+            output.contains("LSP diagnostics (python3) in"),
+            "diagnostics should ride along with the edit: {output}"
+        );
+        assert!(
+            output.contains("[error] 4:8 fake error from the stub server"),
+            "{output}"
+        );
+
+        // With the client switched off the very same edit reads as before.
+        settings.enabled = false;
+        let quiet = Config {
+            lsp: settings,
+            ..active_config_for(&dir)
+        };
+        let tools = Tools::new(Arc::new(quiet), reqwest::Client::new());
+        let read = ToolCall {
+            id: "3".into(),
+            name: "read_file".into(),
+            input: json!({"path": "main.rs"}),
+        };
+        tools.execute(&read).await.expect("read");
+        let edit = ToolCall {
+            id: "4".into(),
+            name: "edit_file".into(),
+            input: json!({
+                "path": "main.rs",
+                "old": "fn main() { let value = 1; }",
+                "new": "fn main() { let other = 2; }",
+            }),
+        };
+        let output = tools.execute(&edit).await.expect("edit");
+        assert!(!output.contains("LSP diagnostics"), "{output}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A default test configuration rooted somewhere else, for the struct
+    /// update in the test above.
+    fn active_config_for(root: &std::path::Path) -> Config {
+        Config {
+            root: root.to_path_buf(),
+            permission: Permission::Yolo,
+            model: "test".into(),
+            provider: "test".into(),
+            harness: "minimal".into(),
+            repair_retries: 0,
+            check_command: None,
+            skill_dirs: Vec::new(),
+            think: crate::think::ThinkLevel::Medium,
+            thinking_level: 5,
+            max_parallel_tasks: 20,
+            shell_timeout_seconds: 30,
+            tool_retries: 3,
+            fallback_provider: String::new(),
+            fallback_model: String::new(),
+            redis_url: None,
+            budget_usd: 0.0,
+            qdrant_url: None,
+            ui_theme: "dark".into(),
+            verbosity: "normal".into(),
+            alternate_screen: true,
+            mouse_capture: Some("auto".into()),
+            alert_bell: true,
+            smooth_scroll_lines: 1,
+            sandbox: crate::sandbox::SandboxPolicy::default(),
+            lsp: crate::lsp::LspSettings {
+                enabled: false,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
     async fn editing_requires_a_prior_read() {
         let dir = std::env::temp_dir().join(format!("wrosecode-tools-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -707,6 +911,10 @@ mod tests {
             alert_bell: true,
             smooth_scroll_lines: 1,
             sandbox: crate::sandbox::SandboxPolicy::default(),
+            lsp: crate::lsp::LspSettings {
+                enabled: false,
+                ..Default::default()
+            },
         });
         let tools = Tools::new(config, reqwest::Client::new());
         let edit = ToolCall {
@@ -769,6 +977,10 @@ mod tests {
             alert_bell: true,
             smooth_scroll_lines: 1,
             sandbox: crate::sandbox::SandboxPolicy::default(),
+            lsp: crate::lsp::LspSettings {
+                enabled: false,
+                ..Default::default()
+            },
         });
         let tools = Tools::new(config, reqwest::Client::new());
         let patch = ToolCall {
@@ -835,6 +1047,10 @@ mod tests {
             alert_bell: true,
             smooth_scroll_lines: 1,
             sandbox: crate::sandbox::SandboxPolicy::default(),
+            lsp: crate::lsp::LspSettings {
+                enabled: false,
+                ..Default::default()
+            },
         });
         let tools = Tools::new(config, reqwest::Client::new());
         let call = |action: &str, item: Option<&str>| ToolCall {

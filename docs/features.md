@@ -44,6 +44,17 @@ everything not marked is implemented and covered by tests.
   `done`, `undone`, unique-substring matching) lets the agent tick items off
   during a run, and `/coverage` shows the list, adds items, or opens an
   interactive picker to toggle them — persisted across sessions.
+- Language-server diagnostics (`src/lsp.rs`, opencode parity): the result of
+  `write_file`/`edit_file`/`apply_patch` carries what the file's language
+  server says about the change — `LSP diagnostics (<server>) in <path>` with
+  one-based `[severity] line:col message` lines — so a bad edit is corrected
+  in the same turn. A dependency-free JSON-RPC client (Content-Length framing
+  over tokio pipes) spawns servers lazily, one process per server command,
+  warm-started when the file is read; `[lsp]` in `config.toml` sets
+  `enabled`, `wait_ms`, and per-extension `commands` over the built-ins
+  (rust-analyzer, typescript-language-server, pylsp, gopls, clangd). Missing
+  binaries, hung handshakes, and protocol garbage all degrade to silence —
+  never a failed edit.
 - Metrics: counters, per-model totals, latency histogram, `metrics.json`/csv.
 - Repo map (`src/repo_map.rs`): per-file symbols (syn for Rust, regex for
   other languages), mtime-cached, ranked by query relevance blended with a

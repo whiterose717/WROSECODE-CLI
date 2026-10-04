@@ -68,3 +68,17 @@ memory = "2g"
 cpus = "2.0"
 # Run `docker build -t <image> . -f Dockerfile.sandbox` when the image is missing.
 auto_build = false
+
+[lsp]
+# Language-server diagnostics appended to write_file / edit_file /
+# apply_patch results (opencode parity). `enabled = false` turns the whole
+# thing off; an edit then reads exactly as it did without a checker.
+enabled = true
+# How long an edit waits for the file's diagnostics before giving up.
+wait_ms = 1200
+# Per-extension server commands replace the built-ins entry by entry
+# (rust-analyzer, typescript-language-server, pylsp, gopls, clangd);
+# an empty list removes a language's server. Servers are started on demand
+# — reading a file warms its server up before the first edit.
+# [lsp.commands]
+# rs = ["rust-analyzer", "--log-file", "rust-analyzer.log"]

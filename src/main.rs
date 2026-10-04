@@ -11,6 +11,7 @@ mod ctf;
 mod ctfd;
 mod events;
 mod harness;
+mod lsp;
 mod markdown;
 mod memory;
 mod metrics;
@@ -345,6 +346,7 @@ async fn main() -> Result<()> {
         alert_bell: runtime.ui.alert_bell,
         smooth_scroll_lines: runtime.ui.smooth_scroll_lines.clamp(1, 20),
         sandbox: runtime.sandbox.policy(),
+        lsp: runtime.lsp.into_settings(),
     });
     // Take the terminal and paint the splash before provider setup, skill
     // discovery, metrics, MCP servers, and session restore: those are what

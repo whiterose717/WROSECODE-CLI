@@ -1389,6 +1389,10 @@ mod tests {
             alert_bell: false,
             smooth_scroll_lines: 1,
             sandbox: SandboxPolicy::default(),
+            lsp: crate::lsp::LspSettings {
+                enabled: false,
+                ..Default::default()
+            },
         });
         let provider = MockProvider::new();
         let client = reqwest::Client::new();
