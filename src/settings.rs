@@ -319,6 +319,12 @@ impl Settings {
         Ok(())
     }
     pub fn key(&self, profile: &ProviderProfile) -> Option<String> {
+        let key = self.lookup_key(profile)?;
+        crate::crash::register_secret(&key);
+        Some(key)
+    }
+
+    fn lookup_key(&self, profile: &ProviderProfile) -> Option<String> {
         let custom_env = format!(
             "WROSECODE_{}_API_KEY",
             profile.name.to_ascii_uppercase().replace('-', "_")

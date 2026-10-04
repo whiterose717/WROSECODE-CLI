@@ -1,5 +1,4 @@
 use anyhow::Result;
-use regex::Regex;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
@@ -19,18 +18,7 @@ impl Memory {
         }
     }
     pub fn redact(text: &str) -> String {
-        let mut out = text.to_string();
-        for pattern in [
-            r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*\S+",
-            r"sk-[A-Za-z0-9_-]{16,}",
-            r"ghp_[A-Za-z0-9]{20,}",
-            r"AKIA[A-Z0-9]{16}",
-        ] {
-            if let Ok(re) = Regex::new(pattern) {
-                out = re.replace_all(&out, "[REDACTED]").to_string();
-            }
-        }
-        out
+        crate::crash::redact(text).replace("***", "[REDACTED]")
     }
     pub fn save(&self, text: &str, personal: bool) -> Result<String> {
         let fact = Self::redact(text.trim());
@@ -112,7 +100,17 @@ mod tests {
     fn redacts_common_secret_assignments() {
         assert_eq!(
             Memory::redact("api_key=abc123 password: hunter2"),
-            "[REDACTED] [REDACTED]"
+            "api_key=[REDACTED] password: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redacts_registered_values_without_a_label() {
+        let secret = "memory-known-test-secret-value";
+        crate::crash::register_secret(secret);
+        assert_eq!(
+            Memory::redact(&format!("remember {secret} for later")),
+            "remember [REDACTED] for later"
         );
     }
 }

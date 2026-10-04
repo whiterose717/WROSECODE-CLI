@@ -505,6 +505,8 @@ records test-suite latency and corpus size to `.ctf/reports/benchmark.json`.
 
 `--permission ask` prompts for mutating tool calls. `auto-safe` runs them automatically except risky shell commands. `yolo` removes normal prompts. A destructive shell-command blocklist prompts in every tier. `/plan` changes to read-only mode; `/build` returns to edit mode. The shell blocklist is a convenience guard, not an isolation boundary — for real isolation set `[sandbox] engine = "docker"` below, which moves every `shell` call into a container.
 
+Tool output, web content, and file text are untrusted data: scope and approval checks inspect structured tool-call arguments before dispatch, so result prose cannot change policy, approvals, or scope. Credential-shaped values and configured provider keys are redacted from displayed and persisted copies — transcript cells, streamed text, dashboard processes, events NDJSON, session JSON/SQLite payloads, crash reports, and memory facts — while the live model context keeps full fidelity.
+
 ## Skills and memory
 
 Skills are `SKILL.md` files with YAML frontmatter:

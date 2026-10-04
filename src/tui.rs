@@ -771,7 +771,7 @@ impl From<&crate::tools::shell::ProcSnapshot> for ProcStat {
     fn from(snapshot: &crate::tools::shell::ProcSnapshot) -> Self {
         Self {
             pid: snapshot.pid,
-            command: snapshot.command.clone(),
+            command: crate::crash::redact(&snapshot.command),
             cwd: snapshot.cwd.clone(),
             age_s: snapshot.started.elapsed().as_secs(),
             running: snapshot.running,
@@ -779,7 +779,7 @@ impl From<&crate::tools::shell::ProcSnapshot> for ProcStat {
             timed_out: snapshot.timed_out,
             cpu_pct: snapshot.cpu_pct,
             rss_kb: snapshot.rss_kb,
-            tail: snapshot.tail.clone(),
+            tail: crate::crash::redact(&snapshot.tail),
         }
     }
 }
@@ -1725,7 +1725,7 @@ impl Ui {
             }
             Progress::TextDelta(piece) => {
                 self.finalize_think();
-                self.draft.push_str(&piece);
+                self.draft.push_str(&crate::crash::redact(&piece));
             }
             Progress::Usage(usage) => {
                 self.turn_usage.add(usage);
@@ -2032,7 +2032,7 @@ impl Ui {
                     let mut body = format!(
                         "pid {}\ncommand {}\ncwd {}\nage {}s\nstatus {}\ncpu {} · rss {}\n\nOUTPUT (live tail)\n",
                         proc.pid,
-                        proc.command,
+                        crate::crash::redact(&proc.command),
                         proc.cwd,
                         proc.started.elapsed().as_secs(),
                         if proc.running {
@@ -2054,7 +2054,7 @@ impl Ui {
                     let tail = if proc.tail.trim().is_empty() {
                         "(no output yet)".to_string()
                     } else {
-                        proc.tail.clone()
+                        crate::crash::redact(&proc.tail)
                     };
                     body.push_str(&tail);
                     self.dash_detail = Some((format!("PROCESS {pid}", pid = proc.pid), body));
@@ -8169,6 +8169,38 @@ mod tests {
         ui.push_result_block();
         let text = &ui.entries.last().expect("a result block was pushed").text;
         assert!(text.contains("── RESULT ─ ⚠ unverified"), "{text}");
+    }
+
+    #[test]
+    fn streamed_text_and_process_snapshots_are_redacted_for_display() {
+        let mut ui = shell();
+        ui.apply_progress(Progress::TextDelta("api_key=display-test-secret".into()));
+        assert_eq!(ui.draft, "api_key=***", "draft was {:?}", ui.draft);
+
+        let snapshot = crate::tools::shell::ProcSnapshot {
+            pid: 4242,
+            command: "curl --token display-test-bearer-secret https://example.test".into(),
+            cwd: std::env::temp_dir().display().to_string(),
+            started: std::time::Instant::now(),
+            running: true,
+            exit_code: None,
+            timed_out: false,
+            cpu_pct: None,
+            rss_kb: None,
+            tail: "password=display-test-password".into(),
+        };
+        let stats = ProcStat::from(&snapshot);
+        assert!(
+            !stats.command.contains("display-test-bearer-secret"),
+            "{}",
+            stats.command
+        );
+        assert!(stats.command.contains("--token ***"), "{}", stats.command);
+        assert!(
+            !stats.tail.contains("display-test-password"),
+            "{}",
+            stats.tail
+        );
     }
 
     /// The dashboard's Ctrl+K path: a selected tracked process is really

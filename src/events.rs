@@ -63,21 +63,24 @@ impl EventWriter {
     }
 }
 
-/// The session opening a turn.
+/// The session opening a turn. The user prompt is redacted before it reaches
+/// the NDJSON stream: prompts may paste credentials, and the events file can
+/// be consumed by another application.
 pub fn start_frame(prompt: &str, session: &str) -> Value {
     json!({
         "type": "start",
         "session": session,
-        "prompt": prompt,
+        "prompt": crate::crash::redact(prompt),
         "ts": now_ms(),
     })
 }
 
-/// The session closing a turn.
+/// The session closing a turn. Answers can quote tool output, so they use
+/// the same credential filter as every other outward-facing frame.
 pub fn result_frame(answer: &str, verified: bool, usage: &Usage, model_turns: usize) -> Value {
     json!({
         "type": "result",
-        "answer": answer,
+        "answer": crate::crash::redact(answer),
         "verified": verified,
         "usage": {
             "input": usage.input,
@@ -97,7 +100,7 @@ pub fn result_frame(answer: &str, verified: bool, usage: &Usage, model_turns: us
 pub fn frame(event: &Progress) -> Option<Value> {
     let value = match event {
         Progress::ToolBegin { id, title } => {
-            json!({"type": "step", "phase": "begin", "id": id, "title": title, "ts": now_ms()})
+            json!({"type": "step", "phase": "begin", "id": id, "title": crate::crash::redact(title), "ts": now_ms()})
         }
         Progress::ToolEnd {
             id,
@@ -110,11 +113,13 @@ pub fn frame(event: &Progress) -> Option<Value> {
             "id": id,
             "ok": ok,
             "elapsed_ms": elapsed_ms,
-            "output": preview(output),
+            "output": preview(&crate::crash::redact(output)),
             "ts": now_ms(),
         }),
-        Progress::Tool(title) => json!({"type": "step", "phase": "tool", "title": title}),
-        Progress::TextDelta(delta) => json!({"type": "text", "delta": delta}),
+        Progress::Tool(title) => {
+            json!({"type": "step", "phase": "tool", "title": crate::crash::redact(title)})
+        }
+        Progress::TextDelta(delta) => json!({"type": "text", "delta": crate::crash::redact(delta)}),
         Progress::Think {
             from,
             to,
@@ -246,6 +251,43 @@ mod tests {
             crate::metrics::MetricsSnapshot::default()
         ))
         .is_none());
+    }
+
+    #[test]
+    fn frames_redact_secrets_but_keep_flags() {
+        let secret = "events-sink-test-secret-value";
+        crate::crash::register_secret(secret);
+        let begin = frame(&Progress::ToolBegin {
+            id: "call_1".into(),
+            title: format!("Ran shell echo {secret}"),
+        })
+        .expect("begin frame");
+        assert!(!begin["title"].as_str().unwrap_or_default().contains(secret));
+
+        let end = frame(&Progress::ToolEnd {
+            id: "call_1".into(),
+            ok: true,
+            output: format!("api_key={secret}\nflag{{events_ok}}"),
+            elapsed_ms: 3,
+        })
+        .expect("end frame");
+        let output = end["output"].as_str().expect("output");
+        assert!(!output.contains(secret), "{output}");
+        assert!(output.contains("flag{events_ok}"), "{output}");
+
+        let delta = frame(&Progress::TextDelta(format!("password={secret}"))).expect("delta frame");
+        assert!(!delta["delta"].as_str().unwrap_or_default().contains(secret));
+
+        let start = start_frame(&format!("use {secret}"), "session-1");
+        assert!(!start["prompt"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(secret));
+        let result = result_frame(&format!("used {secret}"), true, &Usage::default(), 1);
+        assert!(!result["answer"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(secret));
     }
 
     #[test]

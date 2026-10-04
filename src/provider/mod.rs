@@ -519,14 +519,28 @@ mod sse_event_tests {
         let mut rng = Rng::new(0x5eed);
         for case in 0..400 {
             let buffer = fuzz_buffer(&mut rng, 96);
-            let mut pending = Vec::new();
-            feed(&mut pending, &buffer);
-            // Byte-by-byte delivery must be safe too.
-            let mut pending = Vec::new();
+            let mut whole = Vec::new();
+            let whole_events = feed(&mut whole, &buffer);
+
+            // Byte-by-byte delivery must produce the same event sequence and
+            // leave the same incomplete remainder buffered.
+            let mut incremental = Vec::new();
+            let mut incremental_events = Vec::new();
             for chunk in buffer.chunks(1) {
-                feed(&mut pending, chunk);
+                incremental_events.extend(feed(&mut incremental, chunk));
             }
-            let _ = case;
+            assert_eq!(
+                incremental_events,
+                whole_events,
+                "byte delivery changed case {case}: {:?}",
+                String::from_utf8_lossy(&buffer)
+            );
+            assert_eq!(
+                incremental,
+                whole,
+                "byte delivery changed the remainder in case {case}: {:?}",
+                String::from_utf8_lossy(&buffer)
+            );
         }
     }
 

@@ -93,6 +93,13 @@ it a poor fit.
 | Coverage-tracking checklists | Adopted | `.wrosecode/coverage.json` holds the durable checklist (separate from `/plan`, which stays transient). The `coverage` tool — `list`/`add`/`done`/`undone` with exact-then-unique-substring matching — lets the model check items off mid-run, and `/coverage` renders the list, appends items from the command line, or opens a picker loop that toggles entries on Enter until Esc; both paths write the same file. |
 | Scope allowlists | Adopted | `Scope::for_target`, printed at start, enforced in `tools::execute` before dispatch. |
 
+## Phase 8 hardening audit
+
+- Secret boundaries: credential-pattern plus configured-key-value redaction applies to crash reports, `.ctf/errors.log`, streamed text, tool titles/results, dashboard process commands/tails, `live.json`, events NDJSON, session JSON/SQLite payloads, and memory facts. Live model context is not redacted.
+- Untrusted data is checked before execution: `tools::execute` runs the scope guard and approval policy on tool-call metadata; output text cannot subsequently rewrite those decisions.
+- Child-process controls: configured shell timeout, process-group kill on timeout/cancel, 256 KiB tail caps, 50-entry registry cap, one-second reader flush, Docker in-container `timeout -k 5`.
+- Parser checks use deterministic xorshift corpora: patch `paths`/`parse`, atomic apply, path-extraction agreement; SSE no-panic plus byte-wise and split-invariant event/remainder properties.
+
 ## clai (`pentoshi007/clai`)
 
 Inspected 2026-10-04 (README + tree).

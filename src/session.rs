@@ -1,6 +1,7 @@
 use crate::provider::{Content, Message};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +27,28 @@ pub struct Session {
     /// The session this one was forked from — the edge `/tree` draws.
     #[serde(default)]
     pub parent: Option<String>,
+}
+
+fn redact_json(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            let redacted = crate::crash::redact(text);
+            if redacted != *text {
+                *text = redacted;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json(item);
+            }
+        }
+        Value::Object(fields) => {
+            for field in fields.values_mut() {
+                redact_json(field);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl Session {
@@ -63,9 +86,58 @@ impl Session {
         std::fs::create_dir_all(dir)?;
         let path = self.path(dir);
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec_pretty(&self.redacted_for_storage())?,
+        )?;
         std::fs::rename(tmp, path)?;
         Ok(())
+    }
+
+    /// Copy this session for disk and database storage with credential-shaped
+    /// values removed. The in-memory conversation keeps full fidelity for the
+    /// running turn and resume; only the persisted copy is redacted.
+    pub fn redacted_for_storage(&self) -> Session {
+        let mut redacted = self.clone();
+        redacted.summary = crate::crash::redact(&self.summary);
+        redacted.transcript = self
+            .transcript
+            .iter()
+            .map(|(speaker, text)| (speaker.clone(), crate::crash::redact(text)))
+            .collect();
+        redacted.messages = self
+            .messages
+            .iter()
+            .map(|message| Message {
+                role: message.role.clone(),
+                content: message
+                    .content
+                    .iter()
+                    .map(|content| match content {
+                        Content::Text(text) => Content::Text(crate::crash::redact(text)),
+                        Content::Call(call) => {
+                            let mut input = call.input.clone();
+                            redact_json(&mut input);
+                            Content::Call(crate::provider::ToolCall {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                input,
+                            })
+                        }
+                        Content::Result {
+                            id,
+                            output,
+                            is_error,
+                        } => Content::Result {
+                            id: id.clone(),
+                            output: crate::crash::redact(output),
+                            is_error: *is_error,
+                        },
+                    })
+                    .collect(),
+            })
+            .collect();
+        redacted
     }
     pub fn load(path: &Path) -> Result<Self> {
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
@@ -527,6 +599,40 @@ mod tests {
             "the rebuilt transcript shows the tool result: {:?}",
             forked.transcript
         );
+    }
+
+    #[test]
+    fn persisted_sessions_redact_secrets_but_keep_live_fidelity() {
+        let secret = "session-storage-test-secret-value";
+        crate::crash::register_secret(secret);
+        let mut session = Session::fresh();
+        session.name = format!("redacted-{}", std::process::id());
+        session.summary = format!("use api_key={secret}");
+        session.messages = vec![
+            text_message("user", &format!("please use {secret}")),
+            Message {
+                role: "assistant".into(),
+                content: vec![Content::Call(ToolCall {
+                    id: "call-1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": format!("echo {secret}")}),
+                })],
+            },
+            result_message(&format!("api_key={secret}")),
+        ];
+        session.transcript = vec![("tool".into(), format!("api_key={secret}"))];
+
+        let dir = std::env::temp_dir().join(format!("wrose-secret-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        session.save(&dir).expect("save session");
+        let saved = std::fs::read_to_string(session.path(&dir)).expect("read session");
+        assert!(!saved.contains(secret), "secret persisted: {saved}");
+        assert!(saved.contains("api_key=***"), "{saved}");
+
+        // Redaction is a persistence boundary, not a mutation of the live turn.
+        assert!(session.summary.contains(secret));
+        assert!(session.transcript[0].1.contains(secret));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

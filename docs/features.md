@@ -208,11 +208,14 @@ tests unless a line says otherwise.
   env vars whose names look like credentials (`KEY`/`TOKEN`/`SECRET`/… →
   `***`) and run argv, detail, and backtrace through a credential pattern
   set (AWS/GitHub/Slack/OpenAI keys, JWTs, `password=`/`Bearer `
-  assignments); memory facts are redacted before they hit disk; provider
-  keys display as `••••last4`, are typed through a masked prompt, and are
+  assignments). Configured provider-key values are registered when retrieved
+  and removed even as bare strings. Tool titles/output, streamed text,
+  dashboard process commands/tails, events NDJSON, session files/database
+  payloads, and memory facts use the same filter; the live model context
+  keeps full fidelity, while every persisted or displayed copy is redacted.
+  Provider keys display as `••••last4`, are typed through a masked prompt, and are
   blocked from plain auth-header fields. Keys travel in HTTP headers, never
-  in URLs, so provider error strings cannot echo them; events NDJSON,
-  telemetry batches, and the session store carry no key material.
+  in URLs, so provider error strings cannot echo them.
 - Tool output, web pages, and file contents are untrusted *data*: they are
   only ever rendered into model context (repo map, memory recall, skill
   text, web results). Policy decisions — permission tiers, approval

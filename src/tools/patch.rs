@@ -559,6 +559,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fuzzed_path_extraction_matches_the_parser() {
+        let mut rng = Rng::new(0xbeef);
+        for case in 0..200 {
+            let patch = fuzz_patch(&mut rng);
+            match parse(&patch) {
+                Ok(sections) => {
+                    let mut expected = Vec::new();
+                    for section in &sections {
+                        expected.push(section.path.clone());
+                        expected.extend(section.move_to.clone());
+                    }
+                    assert_eq!(
+                        paths(&patch),
+                        expected,
+                        "scope extraction diverged in case {case}: {patch}"
+                    );
+                }
+                Err(_) => {
+                    assert!(
+                        paths(&patch).is_empty(),
+                        "unparsable patch exposed paths in case {case}: {patch}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn fuzzed_patches_apply_without_panicking_or_corrupting() {
         let base = "*** Begin Patch\n*** Update File: fuzz.txt\n@@\n alpha\n-beta\n+bravo\n gamma\n*** End Patch";

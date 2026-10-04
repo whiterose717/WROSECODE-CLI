@@ -16,7 +16,7 @@ use crossterm::{
 use regex::Regex;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Put the terminal back into cooked mode on the primary screen.
@@ -191,6 +191,31 @@ pub fn secret_name(name: &str) -> bool {
         || upper.starts_with("WROSECODE_") && upper.ends_with("API_KEY")
 }
 
+/// Exact credential values already seen by this process (provider API keys
+/// and other configured secrets). Patterns catch credential shapes; this
+/// registry catches a bare key that carries no `api_key=`-style label.
+static KNOWN_SECRETS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn known_secrets() -> &'static Mutex<Vec<String>> {
+    KNOWN_SECRETS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Remember one configured secret for every later redaction pass. Short
+/// values are ignored so ordinary words are never treated as credentials.
+pub fn register_secret(value: &str) {
+    let value = value.trim();
+    if value.len() < 8 {
+        return;
+    }
+    let mut known = known_secrets()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !known.iter().any(|known| known == value) {
+        known.push(value.to_string());
+        known.sort_by_key(|known| std::cmp::Reverse(known.len()));
+    }
+}
+
 fn redactor() -> &'static Regex {
     static REDACTOR: OnceLock<Regex> = OnceLock::new();
     REDACTOR.get_or_init(|| {
@@ -210,20 +235,32 @@ fn redactor() -> &'static Regex {
 }
 
 /// Replace credential-shaped substrings with `***` so crash reports, logs, and
-/// the error log never carry a usable secret.
+/// the error log never carry a usable secret. Exact values previously passed
+/// to [`register_secret`] are removed too, even when they appear without a
+/// credential-shaped label.
 pub fn redact(text: &str) -> String {
     let pattern = redactor();
-    let out = pattern.replace_all(text, |captures: &regex::Captures| {
-        // Keyed groups keep the `name=` so reports stay readable; everything
-        // that *is* a credential disappears entirely.
-        for name in ["prefix", "directive"] {
-            if let Some(matched) = captures.name(name) {
-                return format!("{}***", matched.as_str());
+    let mut out = pattern
+        .replace_all(text, |captures: &regex::Captures| {
+            // Keyed groups keep the `name=` so reports stay readable; everything
+            // that *is* a credential disappears entirely.
+            for name in ["prefix", "directive"] {
+                if let Some(matched) = captures.name(name) {
+                    return format!("{}***", matched.as_str());
+                }
             }
+            "***".to_string()
+        })
+        .into_owned();
+    let known = known_secrets()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for secret in known.iter() {
+        if !secret.is_empty() {
+            out = out.replace(secret, "***");
         }
-        "***".to_string()
-    });
-    out.into_owned()
+    }
+    out
 }
 
 fn timestamp_millis() -> u128 {
@@ -283,6 +320,18 @@ mod tests {
         assert!(secret_name("DB_PASSWORD"));
         assert!(!secret_name("PATH"));
         assert!(!secret_name("WROSECODE_THEME"));
+    }
+
+    #[test]
+    fn registered_secret_values_are_removed_without_a_label() {
+        let secret = "registered-bare-test-secret-value";
+        register_secret(secret);
+        let redacted = redact(&format!("the token is {secret} in plain text"));
+        assert!(!redacted.contains(secret), "leaked: {redacted}");
+        assert!(redacted.contains("***"), "{redacted}");
+        // Short values are not treated as secrets.
+        register_secret("short");
+        assert_eq!(redact("a short word"), "a short word");
     }
 
     #[test]

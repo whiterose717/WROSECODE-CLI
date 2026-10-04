@@ -829,7 +829,7 @@ impl Agent {
                 if let Some(tx) = &self.event_tx {
                     let _ = tx.send(Progress::ToolBegin {
                         id: call.id.clone(),
-                        title: format_tool_title(&call.name, &detail),
+                        title: crate::crash::redact(&format_tool_title(&call.name, &detail)),
                     });
                 }
             }
@@ -1076,10 +1076,10 @@ impl Agent {
                     let _ = tx.send(Progress::ToolEnd {
                         id: call.id.clone(),
                         ok: result.is_ok(),
-                        output: match result {
+                        output: crate::crash::redact(&match result {
                             Ok(text) => text.clone(),
                             Err(error) => error.to_string(),
-                        },
+                        }),
                         elapsed_ms: *elapsed_ms,
                     });
                     if call.name == "update_plan" && result.is_ok() {

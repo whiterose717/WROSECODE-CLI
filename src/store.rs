@@ -52,7 +52,7 @@ impl Store {
     }
 
     pub fn save_session(&self, session: &Session) -> Result<()> {
-        let payload = serde_json::to_string(session)?;
+        let payload = serde_json::to_string(&session.redacted_for_storage())?;
         let updated = now();
         self.connection
             .lock()
