@@ -366,18 +366,28 @@ impl Agent {
             }
             used_tools_this_turn = true;
             for call in &calls {
-                let detail = call.input["path"]
-                    .as_str()
-                    .or_else(|| call.input["pattern"].as_str())
-                    .or_else(|| call.input["command"].as_str())
-                    .or_else(|| call.input["url"].as_str())
-                    .or_else(|| call.input["query"].as_str())
-                    .or_else(|| call.input["task"].as_str())
-                    .unwrap_or("");
+                let detail = if call.name == "update_plan" {
+                    format!(
+                        "{} items",
+                        call.input["items"]
+                            .as_array()
+                            .map_or(0, |items| items.len())
+                    )
+                } else {
+                    call.input["path"]
+                        .as_str()
+                        .or_else(|| call.input["pattern"].as_str())
+                        .or_else(|| call.input["command"].as_str())
+                        .or_else(|| call.input["url"].as_str())
+                        .or_else(|| call.input["query"].as_str())
+                        .or_else(|| call.input["task"].as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
                 if let Some(tx) = &self.event_tx {
                     let _ = tx.send(Progress::ToolBegin {
                         id: call.id.clone(),
-                        title: format_tool_title(&call.name, detail),
+                        title: format_tool_title(&call.name, &detail),
                     });
                 }
             }
@@ -447,6 +457,40 @@ impl Agent {
                             } else {
                                 provider
                             };
+                            // The child streams through an id-prefixed view of
+                            // the parent channel so the UI can nest its tool
+                            // cells under this delegate cell.
+                            let child_tx = event_tx.clone().map(|forward| {
+                                let (child_tx, mut child_rx) =
+                                    tokio::sync::mpsc::unbounded_channel();
+                                let parent_id = call.id.clone();
+                                tokio::spawn(async move {
+                                    while let Some(message) = child_rx.recv().await {
+                                        let message = match message {
+                                            Progress::ToolBegin { id, title } => {
+                                                Progress::ToolBegin {
+                                                    id: format!("{parent_id}/{id}"),
+                                                    title,
+                                                }
+                                            }
+                                            Progress::ToolEnd {
+                                                id,
+                                                ok,
+                                                output,
+                                                elapsed_ms,
+                                            } => Progress::ToolEnd {
+                                                id: format!("{parent_id}/{id}"),
+                                                ok,
+                                                output,
+                                                elapsed_ms,
+                                            },
+                                            other => other,
+                                        };
+                                        let _ = forward.send(message);
+                                    }
+                                });
+                                child_tx
+                            });
                             let mut child = Agent {
                                 config: config.clone(),
                                 provider: selected_provider,
@@ -460,7 +504,7 @@ impl Agent {
                                 memory: Memory::new(&config.root),
                                 skills: skills::discover(&config.root, &config.skill_dirs)
                                     .unwrap_or_default(),
-                                event_tx,
+                                event_tx: child_tx,
                                 mode: "build".into(),
                                 active_skill: None,
                                 last_api_latency: None,
@@ -524,6 +568,15 @@ impl Agent {
                         },
                         elapsed_ms: *elapsed_ms,
                     });
+                    if call.name == "update_plan" && result.is_ok() {
+                        let plan = self
+                            .tools
+                            .checklist
+                            .lock()
+                            .map(|plan| plan.clone())
+                            .unwrap_or_default();
+                        let _ = tx.send(Progress::Plan(plan));
+                    }
                 }
             }
             let mut blocks: Vec<Content> = results
@@ -631,6 +684,9 @@ impl Agent {
 }
 
 fn format_tool_title(name: &str, detail: &str) -> String {
+    if name == "update_plan" {
+        return format!("Plan {detail}").trim().to_string();
+    }
     let verb = match name {
         "shell" => "Ran",
         "read_file" => "Read",

@@ -57,14 +57,12 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn status(State(state): State<ApiState>) -> Json<serde_json::Value> {
     let agent = state.agent.lock().await;
-    Json(serde_json::json!({
-        "provider": agent.config.provider,
-        "model": agent.config.model,
-        "mode": agent.mode,
-        "thinking_level": agent.thinking_level,
-        "category": agent.ctf.category,
-        "metrics": agent.metrics.snapshot(),
-    }))
+    // Phase 3.2: the same `DashStats` shape the attach dashboard and
+    // `exec --json` consume, plus `metrics` for the legacy web page.
+    let mut value = serde_json::to_value(crate::tui::stats_from_agent(&agent, "web", "web"))
+        .unwrap_or_else(|_| serde_json::json!({}));
+    value["metrics"] = serde_json::to_value(agent.metrics.snapshot()).unwrap_or_default();
+    Json(value)
 }
 
 async fn chat(

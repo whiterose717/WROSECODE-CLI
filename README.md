@@ -119,7 +119,7 @@ CTF skills cover recon, web, pwn, crypto, reverse engineering, forensics, stego,
 | `Enter` | Submit the prompt or selected command; during a turn it queues the message for after the reply |
 | `Ctrl+K` | Clear input |
 | `Ctrl+U` | Clear input when there is text, otherwise scroll half a page up |
-| `Ctrl+D` | Delete the character under the caret when there is text, otherwise scroll half a page down |
+| `Ctrl+D` | Delete the character under the caret when there is text; with an empty prompt, open the live eight-panel dashboard (`Esc` or `Ctrl+D` closes it) |
 | `Ctrl+W` | Delete the word before the caret |
 | `Ctrl+A` / `Ctrl+E` | Jump to the start / end of the line |
 | `Alt+←` / `Alt+→` (also `Alt+B` / `Alt+F`) | Jump a word left / right |
@@ -155,6 +155,46 @@ Token counts, model latency percentiles, cache traffic, and costs come from prov
 Rate-limited provider replies (HTTP 429 / quota errors) are classified separately
 from other failures, counted in the dashboard (`WARN 429s n`), and exported with
 the rest of the metrics.
+
+## Live dashboard and transcript
+
+With an empty prompt, `Ctrl+D` (or `/dashboard`) replaces the split view with
+the live eight-panel dashboard: Processes, Thinking, Timeline, Plan, Tokens &
+Cost, Files, CTF, and Budget. `←`/`→` move between panels, `↑`/`↓` (or
+`j`/`k`) move the selection inside Processes and Files, `Enter` opens the
+focused panel as full output (a selected process shows its live tail, a
+selected file its `git diff`), `Ctrl+C` / `Ctrl+K` send SIGINT / SIGKILL to the
+selected process, and `Esc` / `Ctrl+D` returns to the shell. `/stats` prints
+the same eight panels as plain text.
+
+Transcript rows are cells rather than raw lines: each tool shows a one-line
+header with its elapsed time and a preview of the first three and last two
+output lines, failed cells auto-expand with their exit code, nested subagent
+calls draw as a `├─` / `└─` tree, and reasoning opens as a dimmed
+`Thinking… 2.1s` cell that freezes into `Thought n.ns` when the model answers.
+Press `Enter` (or `Ctrl+O`) to expand the cell at the top of the viewport;
+explorations group under a collapsed `▸ Explored  3 files · 1 search` line.
+Every finished task ends with a `── RESULT ─ {status}` block: verification
+state, answer, proof, the model/tools/wait time split, steps, tokens, cache
+rate, and cost.
+
+The same dashboard runs outside the TUI:
+
+```bash
+# Attach to a running session: fresh live.json (≤10s) → /v1/status → offline
+wrosecode dashboard
+
+# One plain frame, no ANSI — pipe-friendly
+wrosecode dashboard --once --offline
+
+# Headless run whose final JSON is the dashboard snapshot
+wrosecode exec --json 'enumerate the challenge'
+```
+
+While idle, a running TUI rewrites `~/.wrosecode/live.json` about once a
+second (schema `wrosecode/live-v1`) — that file is what the attach client
+reads when no web server is up, and `GET /v1/status` serves the identical
+snapshot when the session runs `--web`.
 
 ## Terminal compatibility
 
@@ -344,7 +384,7 @@ Skills load from bundled `skills/`, project `skills/`, `~/.wrosecode/skills/`, a
 | --- | --- |
 | Agents | `/agents`, `/build`, `/plan`, `/harness`, `/skills` |
 | Providers | `/connect`, `/providers`, `/models`, `/model`, `/mcps` |
-| Session | `/new`, `/sessions`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/verbosity`, `/theme`, `/export`, `/help`, `/exit`, `/quit` |
+| Session | `/new`, `/sessions`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/dashboard`, `/verbosity`, `/theme`, `/export`, `/help`, `/exit`, `/quit` |
 | Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/flags`, `/writeup`, `/sandbox` |
 
 `/providers` opens a searchable provider screen with twelve built-in entries and their connection status. Enter configures or selects a provider; `a` adds, `e` edits, `d` deletes a custom provider, and `t` tests a connection. `/connect` opens the custom provider form directly. The API key field is masked. `/models` searches models across connected providers; `/model MODEL` switches the current provider's model.

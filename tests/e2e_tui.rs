@@ -125,7 +125,11 @@ fn drive(binary: &str, home: &std::path::Path) -> (bool, String) {
     pty.send(b"\x1b[H", 250); // Home with an empty input
     pty.send(b"\x1b[F", 250); // End with an empty input
     pty.send(b"\x1b[6~", 250); // PageDown
-    pty.send(b"\x04", 250); // Ctrl+D → half a page down while input is empty
+                               // Ctrl+D with an empty prompt opens the live dashboard (spec 3.2); the
+                               // dashboard owns every key while it is up, so Esc closes it again before
+                               // anything below is typed.
+    pty.send(b"\x04", 250);
+    pty.send(b"\x1b", 250);
 
     // Input editing: type, delete the word, clear the line, clear the screen.
     pty.send_text("half-typed", 150);
@@ -216,6 +220,14 @@ fn tui_survives_scroll_editing_and_clearing_in_a_real_terminal() {
     assert!(
         transcript.contains("TRANSCRIPT"),
         "the transcript pane header renders\n{transcript}"
+    );
+    assert!(
+        transcript.contains("DASHBOARD · "),
+        "Ctrl+D opens the live dashboard (spec 3.2)\n{transcript}"
+    );
+    assert!(
+        transcript.contains("←→ panel · ↑↓/jk select"),
+        "the dashboard paints its footer key-hints\n{transcript}"
     );
     assert!(
         !transcript.contains("Search transcript"),
@@ -370,6 +382,53 @@ fn no_color_session_emits_no_palette_codes() {
     assert!(
         transcript.contains("WROSECODE v"),
         "the splash still paints its wordmark\n{transcript}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Spec 3.2: Ctrl+D opens the live dashboard, → moves the panel focus, Enter
+/// opens the focused panel as a detail body, Esc backs out twice, and the
+/// shell takes keys again — proven by /quit actually exiting.
+#[test]
+fn pty_dashboard_focus_detail_and_close() {
+    if !pty_helper() {
+        eprintln!("skipping: util-linux script(1) is not available");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("wrosecode-dash-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("temp HOME");
+    let binary = env!("CARGO_BIN_EXE_wrosecode").to_string();
+
+    let mut pty = Pty::start(&binary, &home);
+    std::thread::sleep(Duration::from_millis(900));
+    pty.send(b"\x04", 300); // Ctrl+D with an empty prompt → dashboard
+    pty.send(b"\x1b[C", 250); // → focus the THINKING panel
+    pty.send(b"\r", 300); // Enter → the panel opens as detail
+    pty.send(b"\x1b", 250); // Esc → back to the grid
+    pty.send(b"\x1b", 250); // Esc → close the dashboard
+    pty.send_text("/quit", 250);
+    pty.send(b"\r", 600);
+    let (exited_cleanly, transcript) = pty.finish();
+
+    assert!(
+        exited_cleanly,
+        "the dashboard must return to the shell where /quit works\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("panicked at"),
+        "no panic may escape into the terminal\n{transcript}"
+    );
+    assert!(
+        transcript.contains("DASHBOARD · "),
+        "Ctrl+D opens the live dashboard\n{transcript}"
+    );
+    assert!(
+        transcript.contains("── THINKING"),
+        "Enter opens the focused panel as a detail body\n{transcript}"
+    );
+    assert!(
+        transcript.contains(" Esc back"),
+        "the detail view paints its back hint\n{transcript}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

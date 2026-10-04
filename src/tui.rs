@@ -18,20 +18,20 @@ use crossterm::event::{
 use crossterm::style::{Color, Print, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[derive(Clone, PartialEq)]
-struct Row {
-    text: String,
-    fg: Color,
-    bg: Color,
+pub(crate) struct Row {
+    pub(crate) text: String,
+    pub(crate) fg: Color,
+    pub(crate) bg: Color,
     /// Per-character colours for the wordmark gradient. `None` keeps the
     /// single-`fg` fast path every other row uses.
-    colors: Option<Vec<Color>>,
+    pub(crate) colors: Option<Vec<Color>>,
 }
 
 impl Row {
@@ -588,6 +588,66 @@ struct Ui {
     tip_index: usize,
     /// Tool calls in the current turn — the status bar's `step n`.
     turn_steps: usize,
+    // ---- Phase 3: transcript cells ----
+    /// Finished and in-flight tool cells, keyed by tool-call id.
+    tool_cells: HashMap<String, ToolCell>,
+    /// Entry rows rendered expanded (full output instead of a preview).
+    expanded: HashSet<usize>,
+    /// Nested delegate children keyed by their full id path (`parent/child`),
+    /// rendered under the root cell of the chain.
+    child_cells: HashMap<String, ToolCell>,
+    /// Read-only call ids in the active group: id -> (group row, file read).
+    ro_ids: HashMap<String, (usize, bool)>,
+    /// Group counters keyed by the group entry's row.
+    groups: HashMap<usize, GroupCell>,
+    /// The group new read-only calls may join; `None` while any other kind
+    /// of entry owns the transcript tail.
+    active_group: Option<usize>,
+    /// Cumulative coverage for the CTF panel: files read, searches, shells.
+    files_total: usize,
+    searches_total: usize,
+    shell_calls: usize,
+    /// This turn's reasoning cell: its row, and whether it has been
+    /// finalized into a static `Thought  n.ns` line.
+    think_row: Option<usize>,
+    think_finished: bool,
+    /// Transcript geometry from the last compose (click-to-expand).
+    view: TranscriptView,
+    /// Entry at the top of the viewport — the `Ctrl+O` / Enter target.
+    top_entry: Option<usize>,
+    /// Entry index per transcript line, rebuilt with the wrapped lines.
+    line_origin: Vec<usize>,
+    // ---- Phase 3: dashboard ----
+    dashboard: bool,
+    /// Focused panel, 0..8 (see [`DASH_PANELS`]).
+    dash_focus: usize,
+    /// Selection within the focused panel (a process or file row).
+    dash_sel: usize,
+    /// Open detail view: (title, body) for a process tail or a file diff.
+    dash_detail: Option<(String, String)>,
+    dash_procs: Vec<crate::tools::shell::ProcSnapshot>,
+    dash_files: Vec<(String, i64, i64)>,
+    dash_data_at: Option<std::time::Instant>,
+    dash_files_at: Option<std::time::Instant>,
+    /// Last `~/.wrosecode/live.json` write, rate-limited to one per second.
+    live_written_at: Option<std::time::Instant>,
+    /// The live checklist the model maintains through `update_plan`.
+    plan: Vec<(String, bool)>,
+    /// Recent flag hits: (flag, source), capped.
+    flag_log: Vec<(String, String)>,
+    /// Files edited or written this session (first seen order).
+    changed_files: Vec<String>,
+    /// A `Checker VERIFIED` line landed during the current task.
+    verified: bool,
+    // ---- Phase 3: result block accounting ----
+    tool_ms_total: u128,
+    model_ms_total: u128,
+    turns_total: usize,
+    max_parallel: usize,
+    inflight_tools: usize,
+    turn_tool_ms: u128,
+    task_started: Option<std::time::Instant>,
+    task_base: Option<TaskBase>,
 }
 
 /// State for cycling through Tab completions with the same token.
@@ -596,6 +656,147 @@ struct CompletionState {
     token_start: usize,
     matches: Vec<String>,
     index: usize,
+}
+
+/// A tool call's transcript cell, kept by id so the row can re-render when
+/// output lands, when the row expands, or when a child tool reports in.
+#[derive(Clone, Debug)]
+struct ToolCell {
+    title: String,
+    running: bool,
+    ok: bool,
+    /// Full tool output (capped): expansion renders this, not the entry.
+    output: String,
+    elapsed_ms: u128,
+    /// `exit=N` parsed from the result, when present.
+    exit_code: Option<i32>,
+    row: usize,
+}
+
+/// State behind a `▸ Explored …` group: completed counts plus what is still
+/// in flight, so the cell grows live and finalizes when the last call ends.
+#[derive(Clone, Debug, Default)]
+struct GroupCell {
+    files: usize,
+    searches: usize,
+    inflight: usize,
+}
+
+/// Where the transcript viewport sat at the last compose, so a click can map
+/// a terminal row back to a transcript line (and then to its entry).
+#[derive(Clone, Copy, Debug, Default)]
+struct TranscriptView {
+    body_start: usize,
+    transcript_start: usize,
+    height: usize,
+}
+
+/// Session counters captured when a task (a prompt plus anything queued
+/// behind it) starts, so the result block reports deltas, not totals.
+#[derive(Clone, Copy, Debug, Default)]
+struct TaskBase {
+    tool_calls: usize,
+    tokens_in: u64,
+    tokens_out: u64,
+    tokens_reason: u64,
+    cache_read: u64,
+    cost: f64,
+    has_cost: bool,
+    flags: usize,
+    errors: usize,
+    tool_ms: u128,
+    model_ms: u128,
+    files: usize,
+}
+
+/// The eight dashboard panels, in grid order (spec 3.2).
+const DASH_PANELS: [&str; 8] = [
+    "PROCESSES",
+    "THINKING",
+    "TIMELINE",
+    "PLAN",
+    "TOKENS & COST",
+    "FILES",
+    "CTF",
+    "BUDGET",
+];
+
+/// One tracked shell process as it appears in the dashboard and in
+/// `~/.wrosecode/live.json` (a plain serializable view of the registry).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ProcStat {
+    pub pid: u32,
+    pub command: String,
+    pub cwd: String,
+    pub age_s: u64,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub cpu_pct: Option<f64>,
+    pub rss_kb: Option<u64>,
+    pub tail: String,
+}
+
+impl From<&crate::tools::shell::ProcSnapshot> for ProcStat {
+    fn from(snapshot: &crate::tools::shell::ProcSnapshot) -> Self {
+        Self {
+            pid: snapshot.pid,
+            command: snapshot.command.clone(),
+            cwd: snapshot.cwd.clone(),
+            age_s: snapshot.started.elapsed().as_secs(),
+            running: snapshot.running,
+            exit_code: snapshot.exit_code,
+            timed_out: snapshot.timed_out,
+            cpu_pct: snapshot.cpu_pct,
+            rss_kb: snapshot.rss_kb,
+            tail: snapshot.tail.clone(),
+        }
+    }
+}
+
+/// Everything a dashboard render, `/stats`, `wrosecode dashboard`, and
+/// `exec --json` need, as one serializable snapshot (spec 3.2). Field-level
+/// defaults let the attach client parse both `live.json` and the smaller
+/// `/v1/status` payload.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct DashStats {
+    pub schema: String,
+    pub live_at_ms: u64,
+    pub session_id: String,
+    pub root: String,
+    pub provider: String,
+    pub model: String,
+    pub mode: String,
+    pub category: String,
+    pub thinking_level: u8,
+    pub status: String,
+    pub elapsed_s: u64,
+    pub budget_usd: f64,
+    pub cost_usd: Option<f64>,
+    pub usage: Usage,
+    pub cache_hit_pct: u64,
+    pub tool_calls: usize,
+    pub tool_failures: usize,
+    pub errors: usize,
+    pub turns: usize,
+    pub model_ms: u64,
+    pub tool_ms: u64,
+    pub wait_ms: u64,
+    pub max_parallel: usize,
+    pub inflight: usize,
+    pub plan: Vec<(String, bool)>,
+    pub flags: Vec<(String, String)>,
+    pub flags_total: usize,
+    pub files_read: usize,
+    pub searches: usize,
+    pub shells: usize,
+    pub changed_files: Vec<(String, i64, i64)>,
+    pub procs: Vec<ProcStat>,
+    pub turn_tokens: Vec<u64>,
+    pub verified: bool,
+    pub last_error: String,
 }
 
 /// The handful of agent facts the shell paints. Split from `Ui::new` so tests
@@ -756,6 +957,41 @@ impl Ui {
             recent: meta.recent,
             tip_index: 0,
             turn_steps: 0,
+            tool_cells: HashMap::new(),
+            expanded: HashSet::new(),
+            child_cells: HashMap::new(),
+            ro_ids: HashMap::new(),
+            groups: HashMap::new(),
+            active_group: None,
+            files_total: 0,
+            searches_total: 0,
+            shell_calls: 0,
+            think_row: None,
+            think_finished: true,
+            view: TranscriptView::default(),
+            top_entry: None,
+            line_origin: Vec::new(),
+            dashboard: false,
+            dash_focus: 0,
+            dash_sel: 0,
+            dash_detail: None,
+            dash_procs: Vec::new(),
+            dash_files: Vec::new(),
+            dash_data_at: None,
+            dash_files_at: None,
+            live_written_at: None,
+            plan: Vec::new(),
+            flag_log: Vec::new(),
+            changed_files: Vec::new(),
+            verified: false,
+            tool_ms_total: 0,
+            model_ms_total: 0,
+            turns_total: 0,
+            max_parallel: 0,
+            inflight_tools: 0,
+            turn_tool_ms: 0,
+            task_started: None,
+            task_base: None,
         }
     }
 
@@ -763,6 +999,88 @@ impl Ui {
         self.turn_usage = Usage::default();
         self.turn_started = Some(std::time::Instant::now());
         self.turn_steps = 0;
+        self.turn_tool_ms = 0;
+        // A dimmed reasoning cell opens each turn; the first model activity
+        // freezes it into `Thought  n.ns` (spec 3.1).
+        self.think_finished = false;
+        self.active_group = None;
+        let row = self.entries.len();
+        self.push_scrolled(
+            Entry {
+                speaker: Speaker::System,
+                text: format!("{} Thinking…", SPINNER[0]),
+            },
+            1,
+        );
+        self.think_row = Some(row);
+    }
+
+    /// Freeze the live reasoning cell with its elapsed time. Safe to call
+    /// repeatedly: only the first call rewrites the row.
+    fn finalize_think(&mut self) {
+        if self.think_finished {
+            return;
+        }
+        self.think_finished = true;
+        let Some(row) = self.think_row else { return };
+        let secs = self
+            .turn_started
+            .map(|started| started.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        self.set_entry_text(row, format!("  Thought  {secs:.1}s"));
+    }
+
+    /// Tick the live `Thinking… 2.1s` cell from the render ticker.
+    fn tick_thinking(&mut self) {
+        if self.think_finished {
+            return;
+        }
+        let Some(started) = self.turn_started else {
+            return;
+        };
+        let secs = started.elapsed().as_secs_f64();
+        let Some(row) = self.think_row else { return };
+        let next = format!(
+            "{} Thinking… {secs:.1}s",
+            SPINNER[self.spinner % SPINNER.len()]
+        );
+        if self.entries[row].text != next {
+            self.set_entry_text(row, next);
+        }
+    }
+
+    /// Rewrite one entry's text, keeping a scrolled-up viewport anchored to
+    /// the same content as the line count changes.
+    fn set_entry_text(&mut self, row: usize, text: String) {
+        let old_lines = self.entries[row].text.lines().count().max(1);
+        self.entries[row].text = text;
+        let new_lines = self.entries[row].text.lines().count().max(1);
+        if self.scroll > 0 {
+            self.scroll = self
+                .scroll
+                .saturating_add(new_lines.saturating_sub(old_lines));
+        }
+    }
+
+    /// Mark the start of a task: everything the result block (spec 3.3)
+    /// reports is measured against these baselines.
+    fn task_begin(&mut self) {
+        self.task_started = Some(std::time::Instant::now());
+        self.verified = false;
+        self.task_base = Some(TaskBase {
+            tool_calls: self.tool_calls,
+            tokens_in: self.usage.input,
+            tokens_out: self.usage.output,
+            tokens_reason: self.usage.reasoning,
+            cache_read: self.usage.cache_read,
+            cost: self.metrics.cost_usd.unwrap_or(0.0),
+            has_cost: self.metrics.cost_usd.is_some(),
+            flags: self.flags_found,
+            errors: self.error_count,
+            tool_ms: self.tool_ms_total,
+            model_ms: self.model_ms_total,
+            files: self.changed_files.len(),
+        });
     }
 
     /// Advance the rotating splash tip (called from the spinner tick).
@@ -771,19 +1089,102 @@ impl Ui {
     }
 
     fn end_turn(&mut self) {
+        // Freeze the reasoning cell before the clock is taken, so a turn that
+        // produced no activity still reports its full thinking time.
+        self.finalize_think();
         if let Some(started) = self.turn_started.take() {
-            self.last_turn_ms = started.elapsed().as_millis() as u64;
+            let wall_ms = started.elapsed().as_millis() as u64;
+            self.last_turn_ms = wall_ms;
             self.turn_tokens.push(self.turn_usage.output.max(1));
             if self.turn_tokens.len() > 64 {
                 self.turn_tokens.remove(0);
             }
+            // Wall time that no tool owned is model time (spec 3.3 split).
+            let model_ms = wall_ms as u128 - self.turn_tool_ms.min(wall_ms as u128);
+            self.model_ms_total += model_ms;
         }
+        self.turns_total += 1;
         self.turn_usage = Usage::default();
     }
 
     fn record_error(&mut self, kind: &'static str) {
         self.error_count += 1;
         self.last_error_kind = kind;
+    }
+
+    /// The end-of-task summary block (spec 3.3): verification status,
+    /// answer, proof, time split, steps, tokens, cache rate, cost, savings.
+    fn push_result_block(&mut self) {
+        let base = self.task_base.take().unwrap_or_default();
+        let wall = self
+            .task_started
+            .take()
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or(0);
+        let model = self.model_ms_total.saturating_sub(base.model_ms);
+        let tools = self.tool_ms_total.saturating_sub(base.tool_ms);
+        let wait = wall.saturating_sub(model + tools);
+        let flags_delta = self.flags_found.saturating_sub(base.flags);
+        let errors_delta = self.error_count.saturating_sub(base.errors);
+        let status = if self.verified {
+            "✔ verified"
+        } else if errors_delta > 0 {
+            "✗ failed"
+        } else {
+            "⚠ unverified"
+        };
+        let answer = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.speaker, Speaker::Agent))
+            .and_then(|entry| entry.text.lines().next())
+            .map(|line| clip(line, 70))
+            .unwrap_or_else(|| "—".to_string());
+        let proof = self
+            .flag_log
+            .last()
+            .map(|(flag, source)| format!("{} ({})", clip(flag, 40), clip(source, 18)))
+            .unwrap_or_else(|| "none".into());
+        let tokens_in = self.usage.input.saturating_sub(base.tokens_in);
+        let tokens_out = self.usage.output.saturating_sub(base.tokens_out);
+        let tokens_reason = self.usage.reasoning.saturating_sub(base.tokens_reason);
+        let cache_read = self.usage.cache_read.saturating_sub(base.cache_read);
+        let hit = hit_percent(&Usage {
+            input: tokens_in,
+            cache_read,
+            ..Usage::default()
+        });
+        let steps = self.tool_calls.saturating_sub(base.tool_calls);
+        let cost = if base.has_cost || self.metrics.cost_usd.is_some() {
+            Some(self.metrics.cost_usd.unwrap_or(0.0) - base.cost)
+        } else {
+            None
+        };
+        let mut text = format!(
+            " {status}\n answer: {answer}\n proof: {proof}\n time {} (model {} · tools {} · wait {})\n steps {steps} · tokens {} ({hit}% cache) · cost {} · saved ~{} tok",
+            secs_text(wall),
+            secs_text(model),
+            secs_text(tools),
+            secs_text(wait),
+            compact_number(tokens_in + tokens_out + tokens_reason),
+            cost.map(|cost| format!("${cost:.5}")).unwrap_or_else(|| "n/a".into()),
+            compact_number(cache_read),
+        );
+        let files: Vec<&str> = self
+            .changed_files
+            .iter()
+            .skip(base.files)
+            .map(String::as_str)
+            .collect();
+        if !files.is_empty() {
+            text.push_str(&format!("\n files {} {}", files.len(), files.join(", ")));
+        }
+        if flags_delta > 0 {
+            text.push_str(&format!("\n flags found {flags_delta}"));
+        }
+        let header = format!("── RESULT ─ {status} ──────────────");
+        self.push(Speaker::System, format!("{header}\n{text}"));
     }
 
     fn transcript_key(&self, left_width: usize, verbose: bool) -> (usize, usize, usize, bool) {
@@ -803,11 +1204,17 @@ impl Ui {
             return false;
         }
         let mut lines = Vec::new();
-        for entry in &self.entries {
-            lines.extend(entry_lines(entry, left_width, verbose));
+        let mut origin = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let wrapped = entry_lines(entry, left_width, verbose);
+            let count = wrapped.len();
+            lines.extend(wrapped);
+            origin.extend(std::iter::repeat_n(index, count));
             lines.push(String::new());
+            origin.push(index);
         }
         self.transcript_lines = lines;
+        self.line_origin = origin;
         self.transcript_key = Some(key);
         self.transcript_rebuilds += 1;
         true
@@ -944,6 +1351,15 @@ impl Ui {
     fn clear_transcript(&mut self) {
         self.entries.clear();
         self.tool_rows.clear();
+        self.tool_cells.clear();
+        self.child_cells.clear();
+        self.expanded.clear();
+        self.groups.clear();
+        self.ro_ids.clear();
+        self.active_group = None;
+        self.think_row = None;
+        self.top_entry = None;
+        self.line_origin.clear();
         self.tool_timeline.clear();
         self.last_flag.clear();
         self.search_query.clear();
@@ -1000,6 +1416,12 @@ impl Ui {
 
     fn push(&mut self, speaker: Speaker, text: impl Into<String>) {
         let text = text.into();
+        // Any plain entry takes over the transcript tail: the next read-only
+        // call starts a fresh exploration group instead of joining a stale one.
+        self.active_group = None;
+        if text.starts_with("Checker VERIFIED") {
+            self.verified = true;
+        }
         if self.scroll > 0 {
             let added = text.lines().count() + 1;
             self.scroll = self.scroll.saturating_add(added);
@@ -1013,6 +1435,75 @@ impl Ui {
             Progress::ToolBegin { id, title } => {
                 self.tool_calls += 1;
                 self.turn_steps += 1;
+                self.inflight_tools += 1;
+                self.max_parallel = self.max_parallel.max(self.inflight_tools);
+                self.finalize_think();
+                if title.starts_with("Ran shell") {
+                    self.shell_calls += 1;
+                }
+                // A nested delegate child never gets its own row: it renders
+                // under the root cell of its delegate chain (spec 3.1).
+                if id.contains('/') {
+                    let cell = ToolCell {
+                        title: title.clone(),
+                        running: true,
+                        ok: false,
+                        output: String::new(),
+                        elapsed_ms: 0,
+                        exit_code: None,
+                        row: usize::MAX,
+                    };
+                    self.child_cells.insert(id.clone(), cell);
+                    let root = id.split('/').next().unwrap_or(&id).to_string();
+                    self.refresh_cell(&root);
+                    return;
+                }
+                // Read-only calls collect into one `▸ Explored …` group cell
+                // instead of one row per file or search (spec 3.1).
+                if title.starts_with("Read ") || title.starts_with("Searched ") {
+                    let is_read = title.starts_with("Read ");
+                    let row = match self.active_group {
+                        Some(row) => row,
+                        None => {
+                            let row = self.entries.len();
+                            let group = GroupCell {
+                                inflight: 1,
+                                ..GroupCell::default()
+                            };
+                            let text = group_text(&group);
+                            self.push_scrolled(
+                                Entry {
+                                    speaker: Speaker::Tool,
+                                    text,
+                                },
+                                1,
+                            );
+                            self.groups.insert(row, group);
+                            self.active_group = Some(row);
+                            row
+                        }
+                    };
+                    if let Some(group) = self.groups.get_mut(&row) {
+                        group.inflight += 1;
+                    }
+                    self.ro_ids.insert(id.clone(), (row, is_read));
+                    // The cell tracks the title for a failure; it has no row
+                    // of its own unless the call fails.
+                    self.tool_cells.insert(
+                        id,
+                        ToolCell {
+                            title,
+                            running: true,
+                            ok: false,
+                            output: String::new(),
+                            elapsed_ms: 0,
+                            exit_code: None,
+                            row: usize::MAX,
+                        },
+                    );
+                    return;
+                }
+                self.active_group = None;
                 let row = self.entries.len();
                 self.push_scrolled(
                     Entry {
@@ -1021,7 +1512,19 @@ impl Ui {
                     },
                     1,
                 );
-                self.tool_rows.insert(id, row);
+                self.tool_rows.insert(id.clone(), row);
+                self.tool_cells.insert(
+                    id.clone(),
+                    ToolCell {
+                        title,
+                        running: true,
+                        ok: false,
+                        output: String::new(),
+                        elapsed_ms: 0,
+                        exit_code: None,
+                        row,
+                    },
+                );
             }
             Progress::ToolEnd {
                 id,
@@ -1032,55 +1535,143 @@ impl Ui {
                 if !ok {
                     self.tool_failures += 1;
                 }
-                if let Some(index) = self.tool_rows.remove(&id) {
-                    let preview = shape_preview(&output, if ok { 3 } else { 15 });
-                    let icon = if ok { "✓" } else { "✗" };
-                    let old_lines = self.entries[index].text.lines().count().max(1);
-                    self.entries[index].text = format!(
-                        " {icon} {}  {:.1}s{}",
-                        self.entries[index]
-                            .text
-                            .trim_start_matches(" ⠋ ")
-                            .trim_end_matches("  …"),
-                        elapsed_ms as f64 / 1000.0,
-                        if preview.is_empty() {
-                            String::new()
-                        } else {
-                            format!("\n   └ {preview}")
+                self.inflight_tools = self.inflight_tools.saturating_sub(1);
+                self.turn_tool_ms += elapsed_ms;
+                self.tool_ms_total += elapsed_ms;
+                // Nested child: update its row under the root cell.
+                if id.contains('/') {
+                    if let Some(cell) = self.child_cells.get_mut(&id) {
+                        cell.running = false;
+                        cell.ok = ok;
+                        cell.elapsed_ms = elapsed_ms;
+                    }
+                    let root = id.split('/').next().unwrap_or(&id).to_string();
+                    self.refresh_cell(&root);
+                    return;
+                }
+                let exit_code = parse_exit_code(&output);
+                let output = cap_output(&output);
+                // A grouped read-only call: bump the group's counts; a
+                // failure surfaces as its own expanded cell after the group.
+                if let Some((group_row, is_read)) = self.ro_ids.remove(&id) {
+                    let mut finished = false;
+                    let mut text = None;
+                    if let Some(group) = self.groups.get_mut(&group_row) {
+                        group.inflight = group.inflight.saturating_sub(1);
+                        if ok {
+                            if is_read {
+                                group.files += 1;
+                                self.files_total += 1;
+                            } else {
+                                group.searches += 1;
+                                self.searches_total += 1;
+                            }
                         }
-                    );
-                    let new_lines = self.entries[index].text.lines().count().max(1);
-                    if self.scroll > 0 {
-                        self.scroll = self
-                            .scroll
-                            .saturating_add(new_lines.saturating_sub(old_lines));
+                        finished = group.inflight == 0;
+                        text = Some(group_text(group));
                     }
-                    self.tool_timeline.push(format!(
-                        "{icon} {} · {:.1}s",
-                        self.entries[index].text.lines().next().unwrap_or("tool"),
-                        elapsed_ms as f64 / 1000.0
-                    ));
-                    if self.tool_timeline.len() > 200 {
-                        self.tool_timeline.remove(0);
+                    if let Some(text) = text {
+                        self.set_entry_text(group_row, text);
                     }
+                    if finished && self.active_group == Some(group_row) {
+                        self.active_group = None;
+                    }
+                    let cell = self.tool_cells.remove(&id);
+                    if !ok {
+                        let title = cell
+                            .map(|cell| cell.title)
+                            .unwrap_or_else(|| "failed call".into());
+                        let row = self.entries.len();
+                        let cell = ToolCell {
+                            title: title.clone(),
+                            running: false,
+                            ok: false,
+                            output,
+                            elapsed_ms,
+                            exit_code,
+                            row,
+                        };
+                        // Failures auto-expand (spec 3.1).
+                        self.expanded.insert(row);
+                        let text = self.cell_text(&id, &cell);
+                        self.tool_rows.insert(id.clone(), row);
+                        self.tool_cells.insert(id.clone(), cell);
+                        let added = text.lines().count().max(1);
+                        self.push_scrolled(
+                            Entry {
+                                speaker: Speaker::Tool,
+                                text,
+                            },
+                            added,
+                        );
+                        self.push_timeline(&title, false, elapsed_ms);
+                    }
+                    return;
+                }
+                if let Some(row) = self.tool_rows.get(&id).copied() {
+                    let title = self
+                        .tool_cells
+                        .get(&id)
+                        .map(|cell| cell.title.clone())
+                        .unwrap_or_else(|| "tool".into());
+                    if title.starts_with("Edited ") {
+                        // "Edited <name> <path> …" — keep the path for the
+                        // result block's changed-files line.
+                        if let Some(path) = title.split_whitespace().nth(2) {
+                            if !self.changed_files.iter().any(|file| file == path) {
+                                self.changed_files.push(path.to_string());
+                            }
+                        }
+                    }
+                    let mut cell = ToolCell {
+                        title: title.clone(),
+                        running: false,
+                        ok,
+                        output,
+                        elapsed_ms,
+                        exit_code,
+                        row,
+                    };
+                    cell.running = false;
+                    if !ok {
+                        // Failures auto-expand (spec 3.1).
+                        self.expanded.insert(row);
+                    }
+                    let text = self.cell_text(&id, &cell);
+                    self.tool_cells.insert(id.clone(), cell);
+                    self.set_entry_text(row, text);
+                    self.push_timeline(&title, ok, elapsed_ms);
                 }
             }
-            Progress::Tool(message) => self.push(Speaker::Tool, message),
+            Progress::Plan(items) => self.plan = items,
+            Progress::Tool(message) => {
+                self.finalize_think();
+                self.push(Speaker::Tool, message);
+            }
             Progress::ResetText => {
+                self.finalize_think();
                 if !self.draft.is_empty() {
                     let completed = std::mem::take(&mut self.draft);
                     self.push(Speaker::Agent, completed);
                 }
             }
-            Progress::TextDelta(piece) => self.draft.push_str(&piece),
+            Progress::TextDelta(piece) => {
+                self.finalize_think();
+                self.draft.push_str(&piece);
+            }
             Progress::Usage(usage) => {
                 self.turn_usage.add(usage);
                 self.usage.add(usage);
             }
             Progress::Metrics(metrics) => self.metrics = metrics,
             Progress::FlagFound { flag, source } => {
+                self.finalize_think();
                 self.flags_found += 1;
                 self.last_flag = flag.clone();
+                self.flag_log.push((flag.clone(), source.clone()));
+                if self.flag_log.len() > 32 {
+                    self.flag_log.remove(0);
+                }
                 self.push(
                     Speaker::System,
                     format!(
@@ -1088,6 +1679,374 @@ impl Ui {
                     ),
                 );
             }
+        }
+    }
+
+    /// Re-render a tool cell's row from its stored cell (child changes, etc).
+    fn refresh_cell(&mut self, id: &str) {
+        let Some(cell) = self.tool_cells.get(id).cloned() else {
+            return;
+        };
+        if cell.row == usize::MAX {
+            return;
+        }
+        let text = self.cell_text(id, &cell);
+        self.set_entry_text(cell.row, text);
+    }
+
+    /// One timeline line per finished tool, capped like the session itself.
+    fn push_timeline(&mut self, title: &str, ok: bool, elapsed_ms: u128) {
+        let icon = if ok { "✓" } else { "✗" };
+        self.tool_timeline.push(format!(
+            "{icon} {title} · {:.1}s",
+            elapsed_ms as f64 / 1000.0
+        ));
+        if self.tool_timeline.len() > 200 {
+            self.tool_timeline.remove(0);
+        }
+    }
+
+    /// Full text for a tool cell: header, nested child tools, and either the
+    /// collapsed preview or the expanded output.
+    fn cell_text(&self, id: &str, cell: &ToolCell) -> String {
+        let mut out = if cell.running {
+            format!(" ⠋ {}  …", cell.title)
+        } else {
+            let icon = if cell.ok { "✓" } else { "✗" };
+            format!(
+                " {icon} {}  {:.1}s",
+                cell.title,
+                cell.elapsed_ms as f64 / 1000.0
+            )
+        };
+        if !id.contains('/') {
+            out.push_str(&self.child_lines(id, 1));
+        }
+        if cell.running {
+            return out;
+        }
+        let expanded = self.expanded.contains(&cell.row);
+        if !cell.ok || expanded {
+            out.push_str(&expanded_block(&cell.output, cell.exit_code));
+        } else {
+            out.push_str(&preview_block(&cell.output, 3, 2));
+        }
+        out
+    }
+
+    /// Direct children of `parent` (recursive, depth-capped), one line each.
+    fn child_lines(&self, parent: &str, depth: usize) -> String {
+        if depth > 4 {
+            return String::new();
+        }
+        let prefix = format!("{parent}/");
+        let mut children: Vec<&String> = self
+            .child_cells
+            .keys()
+            .filter_map(|id| {
+                id.strip_prefix(&prefix)
+                    .and_then(|rest| (!rest.contains('/')).then_some(id))
+            })
+            .collect();
+        if children.is_empty() {
+            return String::new();
+        }
+        children.sort();
+        let mut out = String::new();
+        let last = children.len() - 1;
+        let indent = "   ".repeat(depth);
+        for (index, child_id) in children.iter().enumerate() {
+            let Some(child) = self.child_cells.get(*child_id) else {
+                continue;
+            };
+            let icon = if child.running {
+                "⠋"
+            } else if child.ok {
+                "✓"
+            } else {
+                "✗"
+            };
+            let tail = if child.running {
+                "  …".to_string()
+            } else {
+                format!("  {:.1}s", child.elapsed_ms as f64 / 1000.0)
+            };
+            let connector = if index == last { "└─" } else { "├─" };
+            out.push_str(&format!(
+                "\n{indent}{connector} {icon} {}{tail}",
+                child.title
+            ));
+            out.push_str(&self.child_lines(child_id, depth + 1));
+        }
+        out
+    }
+
+    /// Toggle the expanded state of the entry at `row` (Ctrl+O / Enter).
+    fn toggle_entry(&mut self, row: usize) {
+        let id = self
+            .tool_cells
+            .iter()
+            .find(|(_, cell)| cell.row == row && !cell.running)
+            .map(|(id, _)| id.clone());
+        let Some(id) = id else {
+            return;
+        };
+        if self.expanded.contains(&row) {
+            self.expanded.remove(&row);
+        } else {
+            self.expanded.insert(row);
+        }
+        let Some(cell) = self.tool_cells.get(&id).cloned() else {
+            return;
+        };
+        let text = self.cell_text(&id, &cell);
+        self.set_entry_text(row, text);
+    }
+
+    /// Expand/collapse the entry at the top of the viewport.
+    fn toggle_top_entry(&mut self) {
+        if let Some(row) = self.top_entry {
+            self.toggle_entry(row);
+        }
+    }
+
+    /// Refresh dashboard data on its own clocks: processes at 10 Hz, git
+    /// files at ~1.5 Hz so a large diff cannot stall the frame (spec 3.2).
+    fn refresh_dash(&mut self) {
+        let now = std::time::Instant::now();
+        if self
+            .dash_data_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_millis(100))
+        {
+            self.dash_procs = crate::tools::shell::proc_snapshots();
+            self.dash_data_at = Some(now);
+        }
+        if self
+            .dash_files_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_millis(1500))
+        {
+            self.dash_files = git_changed_files(&self.root);
+            self.dash_files_at = Some(now);
+        }
+    }
+
+    /// Write `~/.wrosecode/live.json` at most once per second: the attach
+    /// dashboard (`wrosecode dashboard`) reads this file, and the write runs
+    /// from both the idle loop and the busy-turn ticker so a live session
+    /// always looks fresh (spec 3.2).
+    fn maybe_write_live(&mut self) {
+        if self
+            .live_written_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.live_written_at = Some(std::time::Instant::now());
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path = PathBuf::from(home).join(".wrosecode").join("live.json");
+        let stats = self.dash_stats();
+        if let Ok(json) = serde_json::to_string_pretty(&stats) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// The serializable dashboard snapshot (panels, live.json, /v1/status).
+    fn dash_stats(&mut self) -> DashStats {
+        self.refresh_dash();
+        let elapsed = self.session_started.elapsed();
+        let wall_ms = elapsed.as_millis() as u64;
+        let model = self.model_ms_total as u64;
+        let tools = self.tool_ms_total as u64;
+        DashStats {
+            schema: "wrosecode/live-v1".into(),
+            live_at_ms: unix_ms(),
+            session_id: self.session_id.clone(),
+            root: self.root.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            mode: self.mode.clone(),
+            category: self.category.clone(),
+            thinking_level: self.thinking_level,
+            status: if self.busy { "busy" } else { "ready" }.into(),
+            elapsed_s: elapsed.as_secs(),
+            budget_usd: self.budget_usd,
+            cost_usd: self.metrics.cost_usd,
+            usage: self.usage,
+            cache_hit_pct: hit_percent(&self.usage),
+            tool_calls: self.tool_calls,
+            tool_failures: self.tool_failures,
+            errors: self.error_count,
+            turns: self.turns_total,
+            model_ms: model,
+            tool_ms: tools,
+            wait_ms: wall_ms.saturating_sub(model + tools),
+            max_parallel: self.max_parallel,
+            inflight: self.inflight_tools,
+            plan: self.plan.clone(),
+            flags: self.flag_log.clone(),
+            flags_total: self.flags_found,
+            files_read: self.files_total,
+            searches: self.searches_total,
+            shells: self.shell_calls,
+            changed_files: self.dash_files.clone(),
+            // Newest first: the panel and the selection both index this order.
+            procs: self.dash_procs.iter().rev().map(ProcStat::from).collect(),
+            turn_tokens: self.turn_tokens.clone(),
+            verified: self.verified,
+            last_error: self.last_error_kind.to_string(),
+        }
+    }
+
+    /// Move focus between the eight panels (←/→).
+    fn dash_panel(&mut self, delta: i32) {
+        self.dash_focus = (self.dash_focus as i32 + delta).rem_euclid(8) as usize;
+        self.dash_sel = 0;
+        self.dash_detail = None;
+    }
+
+    /// Move the selection inside a selectable panel (↑/↓ or j/k).
+    fn dash_move(&mut self, delta: i32) {
+        if self.dash_detail.is_some() {
+            return;
+        }
+        let count = match self.dash_focus {
+            0 => self.dash_procs.len(),
+            5 => self.dash_files.len(),
+            _ => return,
+        };
+        if count == 0 {
+            return;
+        }
+        let selected = self.dash_sel as i32 + delta;
+        self.dash_sel = selected.clamp(0, count as i32 - 1) as usize;
+    }
+
+    /// Open the selected process (full tail) or file (git diff).
+    fn dash_open(&mut self) {
+        self.refresh_dash();
+        if self.dash_detail.is_some() {
+            return;
+        }
+        match self.dash_focus {
+            0 => {
+                let selected = self.dash_procs.iter().rev().nth(self.dash_sel).cloned();
+                if let Some(proc) = selected {
+                    let mut body = format!(
+                        "pid {}\ncommand {}\ncwd {}\nage {}s\nstatus {}\ncpu {} · rss {}\n\nOUTPUT (live tail)\n",
+                        proc.pid,
+                        proc.command,
+                        proc.cwd,
+                        proc.started.elapsed().as_secs(),
+                        if proc.running {
+                            "running".to_string()
+                        } else {
+                            format!(
+                                "exit {:?}{}",
+                                proc.exit_code,
+                                if proc.timed_out { " (timed out)" } else { "" }
+                            )
+                        },
+                        proc.cpu_pct
+                            .map(|cpu| format!("{cpu:.1}%"))
+                            .unwrap_or_else(|| "n/a".into()),
+                        proc.rss_kb
+                            .map(|kb| format!("{}M", kb / 1024))
+                            .unwrap_or_else(|| "n/a".into()),
+                    );
+                    let tail = if proc.tail.trim().is_empty() {
+                        "(no output yet)".to_string()
+                    } else {
+                        proc.tail.clone()
+                    };
+                    body.push_str(&tail);
+                    self.dash_detail = Some((format!("PROCESS {pid}", pid = proc.pid), body));
+                }
+            }
+            5 => {
+                let Some((path, _, _)) = self.dash_files.get(self.dash_sel).cloned() else {
+                    return;
+                };
+                let diff = std::process::Command::new("git")
+                    .args(["-C", &self.root, "diff", "HEAD", "--", &path])
+                    .output()
+                    .map(|output| {
+                        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                        if text.trim().is_empty() {
+                            text = "(untracked or staged-only file — no unstaged diff)".into();
+                        }
+                        text
+                    })
+                    .unwrap_or_else(|error| format!("git diff failed: {error}"));
+                self.dash_detail = Some((format!("DIFF {path}"), diff));
+            }
+            // Any other focused panel opens as plain rows, the same body the
+            // attach client shows (spec 3.2 "Enter detail").
+            _ => {
+                let width = terminal::size().map(|(width, _)| width).unwrap_or(100);
+                let stats = self.dash_stats();
+                let panel = dashboard_panels(&stats, width.saturating_sub(1) as usize)
+                    .into_iter()
+                    .nth(self.dash_focus);
+                if let Some((title, rows)) = panel {
+                    self.dash_detail = Some((title.to_string(), rows.join("\n")));
+                }
+            }
+        }
+    }
+
+    /// SIGINT (or SIGTERM) the selected process (Ctrl+C / Ctrl+K).
+    fn dash_signal(&mut self, kill: bool) {
+        if self.dash_focus != 0 {
+            return;
+        }
+        let selected = self
+            .dash_procs
+            .iter()
+            .rev()
+            .nth(self.dash_sel)
+            .map(|proc| proc.pid);
+        let Some(pid) = selected else {
+            self.status = "No process selected".into();
+            return;
+        };
+        match crate::tools::shell::signal(pid, kill) {
+            Ok(message) => {
+                self.status = message;
+                self.dash_procs = crate::tools::shell::proc_snapshots();
+                self.dash_data_at = Some(std::time::Instant::now());
+            }
+            Err(error) => self.status = format!("signal failed: {error}"),
+        }
+    }
+
+    /// Route one key while the dashboard is open. Always consumed.
+    fn dashboard_key(&mut self, key: &KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                if self.dash_detail.is_some() {
+                    self.dash_detail = None;
+                } else {
+                    self.dashboard = false;
+                    self.status = "Ready".into();
+                }
+            }
+            KeyCode::Char('d') if control => {
+                self.dashboard = false;
+                self.status = "Ready".into();
+            }
+            KeyCode::Char('c') if control => self.dash_signal(false),
+            KeyCode::Char('k') if control => self.dash_signal(true),
+            KeyCode::Left => self.dash_panel(-1),
+            KeyCode::Right => self.dash_panel(1),
+            KeyCode::Up => self.dash_move(-1),
+            KeyCode::Down => self.dash_move(1),
+            KeyCode::Char('j') if !control => self.dash_move(1),
+            KeyCode::Char('k') if !control => self.dash_move(-1),
+            KeyCode::Enter => self.dash_open(),
+            _ => {}
         }
     }
 
@@ -1111,6 +2070,9 @@ impl Ui {
         } else {
             theme(self.theme)
         };
+        if self.dashboard {
+            return self.compose_dashboard(width, height, colors);
+        }
         let show_logo = self.entries.len() <= 1 && self.input.is_empty() && !self.busy;
         let show_alert = !self.last_flag.is_empty();
         let mut body_start = 0usize;
@@ -1337,6 +2299,15 @@ impl Ui {
                 visible.push(line.as_str());
             }
         }
+        // Remember where the transcript sits so a click (or Ctrl+O) can map a
+        // terminal row back to its entry: line `transcript_start` paints on
+        // frame row `body_start + 1`.
+        self.view = TranscriptView {
+            body_start,
+            transcript_start,
+            height: transcript_height,
+        };
+        self.top_entry = self.line_origin.get(transcript_start).copied();
 
         let usage_max = [
             self.usage.input,
@@ -1704,6 +2675,26 @@ impl Ui {
         (frame, (x, y))
     }
 
+    /// The eight-panel grid (spec 3.2): header, two columns of panels, and a
+    /// key-hint footer; a detail view takes the whole body when one is open.
+    fn compose_dashboard(
+        &mut self,
+        width: u16,
+        height: u16,
+        colors: &'static Theme,
+    ) -> (Vec<Row>, (u16, u16)) {
+        let stats = self.dash_stats();
+        compose_grid(
+            &stats,
+            width,
+            height,
+            colors,
+            self.dash_focus,
+            self.dash_sel,
+            self.dash_detail.clone(),
+        )
+    }
+
     fn insert(&mut self, ch: char) {
         self.input.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
@@ -1776,7 +2767,7 @@ fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Theme {
+pub(crate) struct Theme {
     name: &'static str,
     text: Color,
     muted: Color,
@@ -2300,24 +3291,695 @@ fn cache_percent(usage: Usage) -> u64 {
         .unwrap_or(0)
 }
 
-fn shape_preview(output: &str, limit: usize) -> String {
-    let clean = output.replace('\u{1b}', "");
-    let lines: Vec<_> = clean
+/// Output lines for a cell preview: ANSI stripped, blank lines dropped.
+fn clean_output_lines(output: &str) -> Vec<String> {
+    // Stripping only the ESC byte keeps the scan byte-wise and cheap; the
+    // remaining CSI bytes never start a line, so previews stay readable.
+    output
+        .replace('\u{1b}', "")
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.is_empty())
-        .collect();
-    if lines.len() <= limit {
-        return lines.join(" ");
+        .map(str::to_string)
+        .collect()
+}
+
+/// `exit=N` from a shell result's first line, when present.
+fn parse_exit_code(output: &str) -> Option<i32> {
+    output
+        .lines()
+        .next()?
+        .strip_prefix("exit=")?
+        .trim()
+        .parse::<i32>()
+        .ok()
+}
+
+/// Keep a single tool output bounded so a session cannot grow without limit.
+fn cap_output(output: &str) -> String {
+    const CAP: usize = 256 * 1024;
+    if output.len() <= CAP {
+        return output.to_string();
     }
-    let head = limit.min(3);
-    let tail = limit.saturating_sub(head);
+    let mut cut = CAP;
+    while cut > 0 && !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
     format!(
-        "{} … {} more lines … {}",
-        lines[..head].join(" "),
-        lines.len().saturating_sub(limit),
-        lines[lines.len() - tail..].join(" ")
+        "{}\n… [output truncated at {} KB]",
+        &output[..cut],
+        CAP / 1024
     )
+}
+
+/// Collapsed cell body: first `head` lines, a middle marker, last `tail`.
+fn preview_block(output: &str, head: usize, tail: usize) -> String {
+    let lines = clean_output_lines(output);
+    let mut block = String::new();
+    if lines.is_empty() {
+        return block;
+    }
+    if lines.len() <= head + tail {
+        let last = lines.len() - 1;
+        for (index, line) in lines.iter().enumerate() {
+            let connector = if index == last { '└' } else { '├' };
+            block.push_str(&format!("\n   {connector} {line}"));
+        }
+        return block;
+    }
+    for line in lines.iter().take(head) {
+        block.push_str(&format!("\n   ├ {line}"));
+    }
+    block.push_str(&format!("\n   ⋮ {} more lines", lines.len() - head - tail));
+    let start = lines.len() - tail;
+    for (index, line) in lines[start..].iter().enumerate() {
+        let connector = if index + 1 == tail { '└' } else { '├' };
+        block.push_str(&format!("\n   {connector} {line}"));
+    }
+    block
+}
+
+/// Expanded cell body: exit code up front, then a bounded head/tail slice so
+/// one huge result cannot flood the transcript.
+fn expanded_block(output: &str, exit_code: Option<i32>) -> String {
+    const MAX: usize = 120;
+    const HEAD: usize = 80;
+    let mut block = String::new();
+    if let Some(code) = exit_code.filter(|code| *code != 0) {
+        block.push_str(&format!("\n   └ exit {code}"));
+    }
+    let lines = clean_output_lines(output);
+    if lines.is_empty() {
+        return block;
+    }
+    if lines.len() <= MAX {
+        let last = lines.len() - 1;
+        for (index, line) in lines.iter().enumerate() {
+            let connector = if index == last { '└' } else { '├' };
+            block.push_str(&format!("\n   {connector} {line}"));
+        }
+        return block;
+    }
+    let tail = MAX - HEAD;
+    for line in lines[..HEAD].iter() {
+        block.push_str(&format!("\n   ├ {line}"));
+    }
+    block.push_str(&format!("\n   ⋮ {} more lines", lines.len() - MAX));
+    for (index, line) in lines[lines.len() - tail..].iter().enumerate() {
+        let connector = if index + 1 == tail { '└' } else { '├' };
+        block.push_str(&format!("\n   {connector} {line}"));
+    }
+    block
+}
+
+/// The `▸ Explored …` group line: counts grow as calls land, the spinner
+/// spins while any call is still in flight.
+fn group_text(cell: &GroupCell) -> String {
+    let counts = format!(
+        "{} file{} · {} search{}",
+        cell.files,
+        if cell.files == 1 { "" } else { "s" },
+        cell.searches,
+        if cell.searches == 1 { "" } else { "es" }
+    );
+    if cell.inflight > 0 {
+        format!("⠋ ▸ Explored  {counts}  …")
+    } else {
+        format!("▸ Explored  {counts}")
+    }
+}
+
+pub(crate) fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Cache hit rate: reads served from cache over everything read.
+fn hit_percent(usage: &Usage) -> u64 {
+    let total = usage.cache_read + usage.input;
+    usage
+        .cache_read
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0)
+}
+
+fn secs_text(ms: u128) -> String {
+    format!("{:.1}s", ms as f64 / 1000.0)
+}
+
+/// A `▓▓▓░░░` bar for the budget gauge.
+fn gauge(ratio: f64, width: usize) -> String {
+    let width = width.max(1);
+    let filled = (ratio.clamp(0.0, 1.0) * width as f64).round() as usize;
+    format!("{}{}", "▓".repeat(filled), "░".repeat(width - filled))
+}
+
+/// Split `height` across fractional bands, keeping the sum exact.
+fn bands(height: usize, fractions: &[f32]) -> Vec<usize> {
+    let total: f32 = fractions.iter().sum::<f32>().max(1.0);
+    let mut out: Vec<usize> = fractions
+        .iter()
+        .map(|fraction| (height as f32 * fraction / total).floor() as usize)
+        .collect();
+    let sum: usize = out.iter().sum();
+    if let Some(last) = out.last_mut().filter(|_| sum < height) {
+        *last += height - sum;
+    }
+    out
+}
+
+/// Working-tree churn for the FILES panel: numstat against HEAD plus
+/// untracked files (listed with `-1` added so they still show up).
+pub(crate) fn git_changed_files(root: &str) -> Vec<(String, i64, i64)> {
+    let mut out = Vec::new();
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["-C", root, "diff", "--numstat", "HEAD"])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut parts = line.split('\t');
+            let (Some(added), Some(removed), Some(path)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            out.push((
+                path.to_string(),
+                added.parse::<i64>().unwrap_or(0),
+                removed.parse::<i64>().unwrap_or(0),
+            ));
+        }
+    }
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["-C", root, "status", "--porcelain"])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Some(path) = line.strip_prefix("?? ") else {
+                continue;
+            };
+            if !out.iter().any(|(known, _, _)| known == path) {
+                out.push((path.to_string(), -1, 0));
+            }
+        }
+    }
+    out.sort_by_key(|row| std::cmp::Reverse(row.1.abs() + row.2.abs()));
+    out.truncate(50);
+    out
+}
+
+/// The eight panels as plain text rows, shared by the grid dashboard,
+/// `/stats`, and the `wrosecode dashboard` / `exec` CLI (spec 3.2).
+pub(crate) fn dashboard_panels(
+    stats: &DashStats,
+    width: usize,
+) -> Vec<(&'static str, Vec<String>)> {
+    // 0 PROCESSES — newest first, bounded by the registry cap.
+    let mut procs = Vec::new();
+    if stats.procs.is_empty() {
+        procs.push(" no tracked processes".to_string());
+    }
+    for proc in stats.procs.iter() {
+        let state = if proc.running {
+            format!("▶ {}s", proc.age_s)
+        } else {
+            let code = proc
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "?".into());
+            if proc.timed_out {
+                format!("✗{code} TO")
+            } else if proc.exit_code == Some(0) {
+                format!("✓{code}")
+            } else {
+                format!("✗{code}")
+            }
+        };
+        let cpu = proc
+            .cpu_pct
+            .map(|cpu| format!("{cpu:.0}%"))
+            .unwrap_or_else(|| "n/a".into());
+        let rss = proc
+            .rss_kb
+            .map(|kb| format!("{}M", kb / 1024))
+            .unwrap_or_else(|| "n/a".into());
+        let budget = width.saturating_sub(34).max(8);
+        procs.push(format!(
+            " {pid:>6} {state:<8} {cpu:>5} {rss:>6}  {cmd}",
+            pid = proc.pid,
+            cmd = clip(&proc.command, budget),
+        ));
+    }
+
+    // 1 THINKING — speed tier, the model/tool/wait split, turn count.
+    let thinking = vec![
+        format!(
+            " level {}/20 · {} · {} · {}",
+            stats.thinking_level,
+            speed_tier(stats.thinking_level),
+            stats.status,
+            if stats.inflight > 0 {
+                format!("{} tools live", stats.inflight)
+            } else {
+                "idle".to_string()
+            }
+        ),
+        format!(
+            " thinking {} · acting {} · waiting {}",
+            secs_text(stats.model_ms as u128),
+            secs_text(stats.tool_ms as u128),
+            secs_text(stats.wait_ms as u128),
+        ),
+        format!(
+            " turns {} · last turn {}",
+            stats.turns,
+            sparkline(&stats.turn_tokens, width.saturating_sub(14).max(4)),
+        ),
+    ];
+
+    // 2 TIMELINE — durations, parallelism, per-turn token spark.
+    let timeline = vec![
+        format!(
+            " model {} · tools {} · wait {} · wall {}",
+            secs_text(stats.model_ms as u128),
+            secs_text(stats.tool_ms as u128),
+            secs_text(stats.wait_ms as u128),
+            format!("{}s", stats.elapsed_s),
+        ),
+        format!(
+            " parallel ×{} · steps {} · fails {}",
+            stats.max_parallel, stats.tool_calls, stats.tool_failures,
+        ),
+        format!(
+            " tok {}",
+            sparkline(&stats.turn_tokens, width.saturating_sub(6).max(4))
+        ),
+        format!(
+            " recent: {}",
+            if stats.tool_failures > 0 {
+                stats.last_error.clone()
+            } else {
+                "—".to_string()
+            }
+        ),
+    ];
+
+    // 3 PLAN — the `update_plan` checklist (spec 3.1 / 3.2).
+    let mut plan = Vec::new();
+    if stats.plan.is_empty() {
+        plan.push(" no plan yet (update_plan)".to_string());
+    }
+    for (text, done) in stats.plan.iter().take(10) {
+        plan.push(format!(
+            " {} {}",
+            if *done { "☑" } else { "☐" },
+            clip(text, width.saturating_sub(4).max(8)),
+        ));
+    }
+    if stats.plan.len() > 10 {
+        plan.push(format!(" +{} more", stats.plan.len() - 10));
+    }
+
+    // 4 TOKENS & COST — turn totals, cache rate, spark, cost and savings.
+    let tokens = vec![
+        format!(
+            " in {} · out {} · reason {}",
+            compact_number(stats.usage.input),
+            compact_number(stats.usage.output),
+            compact_number(stats.usage.reasoning),
+        ),
+        format!(
+            " cache {}% · read {} · write {}",
+            stats.cache_hit_pct,
+            compact_number(stats.usage.cache_read),
+            compact_number(stats.usage.cache_write),
+        ),
+        format!(
+            " tok {}",
+            sparkline(&stats.turn_tokens, width.saturating_sub(6).max(4))
+        ),
+        format!(
+            " cost {} · saved ~{} tok",
+            stats
+                .cost_usd
+                .map(|cost| format!("${cost:.5}"))
+                .unwrap_or_else(|| "n/a".into()),
+            compact_number(stats.usage.cache_read),
+        ),
+    ];
+
+    // 5 FILES — git churn, newest/heaviest first.
+    let mut files = Vec::new();
+    let total_add: i64 = stats
+        .changed_files
+        .iter()
+        .map(|(_, added, _)| added.max(&0))
+        .sum();
+    let total_del: i64 = stats
+        .changed_files
+        .iter()
+        .map(|(_, _, removed)| removed)
+        .sum();
+    files.push(format!(
+        " +{total_add} -{total_del} · {} changed",
+        stats.changed_files.len()
+    ));
+    for (path, added, removed) in stats.changed_files.iter().take(8) {
+        let mark = if *added < 0 {
+            "+new".to_string()
+        } else {
+            format!("+{added}")
+        };
+        files.push(format!(" {mark} -{removed}  {path}",));
+    }
+    if stats.changed_files.len() > 8 {
+        files.push(format!(" +{} more", stats.changed_files.len() - 8));
+    }
+
+    // 6 CTF — coverage, flags, dead ends (spec 3.2).
+    let mut ctf = Vec::new();
+    ctf.push(format!(
+        " [{}] · tools {} ({} failed)",
+        stats.category, stats.tool_calls, stats.tool_failures,
+    ));
+    ctf.push(format!(
+        " coverage: {} files · {} searches · {} shells",
+        stats.files_read, stats.searches, stats.shells,
+    ));
+    if stats.flags.is_empty() {
+        ctf.push(format!(" flags {}", stats.flags_total));
+    } else {
+        for (flag, source) in stats.flags.iter().rev().take(3) {
+            ctf.push(format!(" 🚩 {} ({})", clip(flag, 32), clip(source, 18)));
+        }
+    }
+    if stats.tool_failures > 0 {
+        ctf.push(format!(
+            " dead ends: {} failed · last {}",
+            stats.tool_failures, stats.last_error
+        ));
+    }
+    ctf.push(format!(
+        " checker: {}",
+        if stats.verified {
+            "VERIFIED".to_string()
+        } else {
+            "unverified".to_string()
+        }
+    ));
+
+    // 7 BUDGET — cost against budget, steps, wall clock.
+    let mut budget = Vec::new();
+    let cost = stats.cost_usd;
+    if stats.budget_usd > 0.0 {
+        let used = cost.unwrap_or(0.0) / stats.budget_usd;
+        budget.push(format!(
+            " {} ${:.4} / ${:.2} ({:.0}%)",
+            gauge(used, 10),
+            cost.unwrap_or(0.0),
+            stats.budget_usd,
+            used * 100.0,
+        ));
+    } else {
+        budget.push(format!(
+            " {} ${} / n/a (unlimited)",
+            gauge(0.0, 10),
+            cost.map(|cost| format!("{cost:.4}"))
+                .unwrap_or_else(|| "?".into()),
+        ));
+    }
+    budget.push(format!(" steps {} (no cap)", stats.tool_calls));
+    budget.push(format!(
+        " wall {}s · flags {}",
+        stats.elapsed_s, stats.flags_total
+    ));
+    budget.push(format!(
+        " errors {} · status {}",
+        stats.errors, stats.status
+    ));
+
+    vec![
+        (DASH_PANELS[0], procs),
+        (DASH_PANELS[1], thinking),
+        (DASH_PANELS[2], timeline),
+        (DASH_PANELS[3], plan),
+        (DASH_PANELS[4], tokens),
+        (DASH_PANELS[5], files),
+        (DASH_PANELS[6], ctf),
+        (DASH_PANELS[7], budget),
+    ]
+}
+
+/// Paint one full dashboard frame: header row, footer key-hints, the
+/// eight-panel grid (or a full-body detail view), and the background fill.
+/// Shared by the TUI (`Ui::compose_dashboard`) and the attach client so both
+/// render byte-identical grids from the same `DashStats`.
+pub(crate) fn compose_grid(
+    stats: &DashStats,
+    width: u16,
+    height: u16,
+    colors: &'static Theme,
+    focus: usize,
+    selected: usize,
+    detail: Option<(String, String)>,
+) -> (Vec<Row>, (u16, u16)) {
+    let w = width as usize;
+    let h = height as usize;
+    let mut frame = vec![Row::new("", Color::Reset); h];
+    if h == 0 || w == 0 {
+        return (frame, (0, 0));
+    }
+    frame[0] = Row::new(
+        clip(
+            &format!(
+                " DASHBOARD · {}/{}/{}/{} · {}",
+                stats.mode, stats.provider, stats.model, stats.category, stats.status
+            ),
+            w,
+        ),
+        colors.accent,
+    );
+    if h >= 2 {
+        frame[h - 1] = Row::new(
+            clip(
+                " ←→ panel · ↑↓/jk select · Enter detail · Ctrl+C/K signal · Esc/Ctrl+D close",
+                w,
+            ),
+            colors.muted,
+        );
+    }
+    if h <= 2 {
+        return (frame, (0, 0));
+    }
+    if let Some((title, body)) = detail {
+        frame[1] = Row::new(clip(&format!("── {title} "), w), colors.accent);
+        let capacity = h.saturating_sub(4);
+        for (index, line) in body.lines().enumerate().take(capacity) {
+            frame[2 + index] = Row::new(clip(line, w), colors.text);
+        }
+        let total = body.lines().count();
+        if total > capacity && h >= 4 {
+            frame[2 + capacity] = Row::new(
+                clip(&format!(" ⋯ +{} more lines", total - capacity), w),
+                colors.muted,
+            );
+        }
+        if h >= 3 {
+            frame[h - 2] = Row::new(clip(" Esc back", w), colors.muted);
+        }
+        return (frame, (0, 0));
+    }
+    let panels = dashboard_panels(stats, w.saturating_sub(1));
+    let body_h = h - 2;
+    let left_w = w / 2;
+    let right_w = w.saturating_sub(left_w + 1);
+    let left = dash_screen(
+        &panels,
+        [0, 1, 2, 3],
+        &bands(body_h, &[4.0, 1.5, 1.5, 3.0]),
+        left_w,
+        focus,
+        selected,
+    );
+    let right = dash_screen(
+        &panels,
+        [4, 5, 6, 7],
+        &bands(body_h, &[3.0, 3.0, 2.5, 1.5]),
+        right_w,
+        focus,
+        selected,
+    );
+    for row in 0..body_h {
+        let (ltext, laccent) = left
+            .get(row)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), false));
+        let (rtext, raccent) = right
+            .get(row)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), false));
+        let mut text = pad_row(&ltext, left_w);
+        text.push('│');
+        text.push_str(&pad_row(&rtext, right_w));
+        let color = if laccent || raccent {
+            colors.accent
+        } else {
+            colors.text
+        };
+        frame[1 + row] = Row::new(clip(&text, w), color);
+    }
+    for row in &mut frame {
+        if row.bg == Color::Reset {
+            row.bg = colors.background;
+        }
+    }
+    (frame, (0, 0))
+}
+
+/// The theme the attach client paints with (`NO_COLOR` → plain).
+pub(crate) fn dashboard_theme(no_color: bool) -> &'static Theme {
+    if no_color {
+        &PLAIN_THEME
+    } else {
+        theme(0)
+    }
+}
+
+/// Render one dashboard column: four banded panels, each a titled box with
+/// its rows, marking the focused panel and the selected row (`▌`).
+fn dash_screen(
+    panels: &[(&'static str, Vec<String>)],
+    indices: [usize; 4],
+    band_heights: &[usize],
+    width: usize,
+    focus: usize,
+    selected: usize,
+) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for (slot, &index) in indices.iter().enumerate() {
+        let start = out.len();
+        let height = band_heights.get(slot).copied().unwrap_or(0);
+        let Some((title, rows)) = panels.get(index) else {
+            out.resize(start + height, (String::new(), false));
+            continue;
+        };
+        let mark = if focus == index { "▌" } else { " " };
+        let mut header = format!(" {mark}{title} ");
+        while header.chars().count() < width.max(1) {
+            header.push('─');
+        }
+        out.push((clip(&header, width), focus == index));
+        for (row_index, text) in rows.iter().enumerate() {
+            if out.len() - start >= height {
+                break;
+            }
+            let is_sel = focus == index && selected == row_index;
+            let prefix = if is_sel { "▌" } else { " " };
+            out.push((clip(&format!("{prefix}{text}"), width), is_sel));
+        }
+        while out.len() - start < height {
+            out.push((String::new(), false));
+        }
+        if out.len() - start > height {
+            out.truncate(start + height);
+        }
+    }
+    out
+}
+
+/// Pad (or truncate) a string to an exact display width.
+fn pad_row(text: &str, width: usize) -> String {
+    let mut out = clip(text, width);
+    while out.chars().count() < width {
+        out.push(' ');
+    }
+    out
+}
+
+/// The process registry as dashboard stats, newest first (shared with the
+/// web `/v1/status` endpoint and the attach client).
+pub(crate) fn proc_stats() -> Vec<ProcStat> {
+    crate::tools::shell::proc_snapshots()
+        .iter()
+        .rev()
+        .map(ProcStat::from)
+        .collect()
+}
+
+/// A [`DashStats`] snapshot straight from an [`Agent`]: what the web
+/// `/v1/status` endpoint serves and what `wrosecode exec --json` prints.
+/// Turn-split timings belong to the TUI's event stream, so those fields stay
+/// zero here rather than inventing numbers.
+pub(crate) fn stats_from_agent(agent: &Agent, session_id: &str, status: &str) -> DashStats {
+    let metrics = agent.metrics.snapshot();
+    let usage = agent.usage;
+    let plan = agent
+        .tools
+        .checklist
+        .lock()
+        .map(|checklist| checklist.clone())
+        .unwrap_or_default();
+    let history = agent.ctf.history("");
+    let flags_total = history.len();
+    let root = agent.config.root.display().to_string();
+    DashStats {
+        schema: "wrosecode/live-v1".into(),
+        live_at_ms: unix_ms(),
+        session_id: session_id.into(),
+        root,
+        provider: agent.config.provider.clone(),
+        model: agent.config.model.clone(),
+        mode: agent.mode.clone(),
+        category: agent.ctf.category.clone(),
+        thinking_level: agent.thinking_level,
+        status: status.into(),
+        elapsed_s: agent.started_at.elapsed().as_secs(),
+        budget_usd: agent.config.budget_usd,
+        cost_usd: metrics.cost_usd,
+        usage,
+        cache_hit_pct: hit_percent(&usage),
+        tool_calls: metrics.tool_calls as usize,
+        tool_failures: metrics.tool_failures as usize,
+        errors: metrics.rate_limits as usize,
+        turns: agent.model_turns,
+        plan,
+        flags: flag_rows(&history),
+        flags_total,
+        changed_files: git_changed_files(&agent.config.root.display().to_string()),
+        procs: proc_stats(),
+        ..DashStats::default()
+    }
+}
+
+/// Parse `.ctf/flags.log` lines into `(flag, source)` pairs, newest first
+/// (shared with the offline attach fallback). The log format is
+/// `unix_ts \t source \t transformation \t flag \t confidence`.
+pub(crate) fn flag_rows(history: &[String]) -> Vec<(String, String)> {
+    history
+        .iter()
+        .rev()
+        .take(8)
+        .map(|line| {
+            let source = line.split('\t').nth(1).unwrap_or("").to_string();
+            let flag = line.split('\t').nth(3).unwrap_or("").to_string();
+            let flag = if flag.is_empty() {
+                line.split_whitespace().next().unwrap_or(line).to_string()
+            } else {
+                flag
+            };
+            (
+                flag,
+                if source.is_empty() {
+                    "checker".into()
+                } else {
+                    source
+                },
+            )
+        })
+        .collect()
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -2400,6 +4062,8 @@ pub async fn run(
                 ui.advance_tip();
                 last_tip = std::time::Instant::now();
             }
+            // Keep `live.json` current for `wrosecode dashboard` attaches.
+            ui.maybe_write_live();
             continue;
         }
         let next = event::read()?;
@@ -2410,6 +4074,17 @@ pub async fn run(
         if let Event::Mouse(mouse) = &next {
             let (terminal_width, _) = terminal::size()?;
             let separator = terminal_width as usize * ui.pane_percent / 100;
+            if ui.dashboard {
+                // The dashboard has no scrollback: the wheel moves the panel
+                // selection instead (spec 3.2).
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => ui.dash_move(-1),
+                    MouseEventKind::ScrollDown => ui.dash_move(1),
+                    MouseEventKind::Down(MouseButton::Left) => ui.dash_open(),
+                    _ => {}
+                }
+                continue;
+            }
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)
                     if (mouse.column as usize).abs_diff(separator) <= 1 =>
@@ -2422,6 +4097,18 @@ pub async fn run(
                         .clamp(40, 80);
                 }
                 MouseEventKind::Up(MouseButton::Left) => ui.dragging_separator = false,
+                // A click on a transcript row expands or collapses its cell
+                // (spec 3.1): map the terminal row back through line_origin.
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let row = mouse.row as usize;
+                    let first = ui.view.body_start + 1;
+                    if row >= first && row < first + ui.view.height {
+                        let index = ui.view.transcript_start + (row - first);
+                        if let Some(entry) = ui.line_origin.get(index).copied() {
+                            ui.toggle_entry(entry);
+                        }
+                    }
+                }
                 MouseEventKind::ScrollUp => ui.scroll_up(agent.config.smooth_scroll_lines),
                 MouseEventKind::ScrollDown => ui.scroll_down(agent.config.smooth_scroll_lines),
                 _ => {}
@@ -2432,6 +4119,12 @@ pub async fn run(
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        // The dashboard owns every key while it is open (spec 3.2): panel
+        // focus, selection, detail, signals, and close.
+        if ui.dashboard {
+            ui.dashboard_key(&key);
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2485,11 +4178,22 @@ pub async fn run(
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if ui.input.is_empty() {
-                    ui.scroll_half_page(true);
+                    // Spec 3.2: Ctrl+D with an empty prompt opens the
+                    // live dashboard; Ctrl+D closes it from inside.
+                    ui.dashboard = true;
+                    ui.dash_detail = None;
+                    ui.dash_data_at = None;
+                    ui.dash_files_at = None;
+                    ui.status = "Dashboard · Ctrl+D close".into();
                 } else {
                     ui.delete_forward();
                 }
                 ui.completion = None;
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Expand or collapse the entry at the top of the viewport
+                // without reaching for the mouse (spec 3.1).
+                ui.toggle_top_entry();
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ui.cursor = 0;
@@ -2780,6 +4484,9 @@ pub async fn run(
                 }
                 let line = ui.take_input();
                 if line.is_empty() {
+                    // Enter on an empty prompt expands the top entry instead
+                    // of doing nothing (spec 3.1).
+                    ui.toggle_top_entry();
                     continue;
                 }
                 ui.push_history(line.clone());
@@ -2870,6 +4577,10 @@ async fn run_prompt(
                 }
                 _ = ticker.tick() => {
                     ui.spinner = ui.spinner.wrapping_add(1);
+                    // Advance the live `Thinking… n.ns` cell (spec 3.1).
+                    ui.tick_thinking();
+                    // Keep `live.json` fresh while a turn runs (spec 3.2).
+                    ui.maybe_write_live();
                     // Keep the terminal usable while the model thinks: keys
                     // land in the input box instead of being thrown away.
                     if drain_turn_keys(ui, scroll_step)? {
@@ -2936,6 +4647,12 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
                 ui.completion = None;
             }
             Event::Mouse(mouse) => match mouse.kind {
+                // The dashboard steals the wheel for selection (spec 3.2).
+                _ if ui.dashboard => match mouse.kind {
+                    MouseEventKind::ScrollUp => ui.dash_move(-1),
+                    MouseEventKind::ScrollDown => ui.dash_move(1),
+                    _ => {}
+                },
                 MouseEventKind::ScrollUp => ui.scroll_up(scroll_step),
                 MouseEventKind::ScrollDown => ui.scroll_down(scroll_step),
                 _ => {}
@@ -2943,6 +4660,12 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 let control = key.modifiers.contains(KeyModifiers::CONTROL);
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
+                // Dashboard keys are consumed before anything else, so a busy
+                // turn can still be watched and its processes signalled.
+                if ui.dashboard {
+                    ui.dashboard_key(&key);
+                    continue;
+                }
                 if control && key.code == KeyCode::Char('c') {
                     return Ok(true);
                 }
@@ -2963,7 +4686,7 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
                     KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         ui.insert('\n');
                     }
-                    KeyCode::Enter if ui.input.is_empty() => {}
+                    KeyCode::Enter if ui.input.is_empty() => ui.toggle_top_entry(),
                     KeyCode::Enter if ui.paste_chip.is_some() => {
                         let (pasted, _) = ui.paste_chip.take().expect("chip is present");
                         ui.insert_str(&pasted);
@@ -2996,11 +4719,16 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
                     }
                     KeyCode::Char('d') if control => {
                         if ui.input.is_empty() {
-                            ui.scroll_half_page(true);
+                            // Open the dashboard mid-turn too (spec 3.2).
+                            ui.dashboard = true;
+                            ui.dash_detail = None;
+                            ui.dash_data_at = None;
+                            ui.dash_files_at = None;
                         } else {
                             ui.delete_forward();
                         }
                     }
+                    KeyCode::Char('o') if control => ui.toggle_top_entry(),
                     KeyCode::Char('w') if control => ui.delete_word_before_cursor(),
                     _ => {}
                 }
@@ -3021,12 +4749,15 @@ async fn run_turn_queue(
     permissions: &mut mpsc::UnboundedReceiver<PermissionRequest>,
 ) -> Result<bool> {
     let scroll_step = agent.config.smooth_scroll_lines;
+    // One result block covers the prompt plus anything queued behind it.
+    ui.task_begin();
     let mut line = first.to_string();
     loop {
         if !run_prompt(agent, ui, &line, events, permissions, scroll_step).await? {
             return Ok(false);
         }
         let Some(next) = ui.pending.first().cloned() else {
+            ui.push_result_block();
             return Ok(true);
         };
         ui.pending.remove(0);
@@ -3548,12 +5279,18 @@ async fn run_command(
                 if let Some(index) = picker(ui, "Themes", labels)? {
                     ui.theme = index;
                     ui.status = format!("Theme: {}", theme(ui.theme).name);
-                    ui.push(Speaker::System, format!("Theme set to {}", theme(ui.theme).name));
+                    ui.push(
+                        Speaker::System,
+                        format!("Theme set to {}", theme(ui.theme).name),
+                    );
                 }
             } else if let Some(index) = theme_position(args) {
                 ui.theme = index;
                 ui.status = format!("Theme: {}", theme(ui.theme).name);
-                ui.push(Speaker::System, format!("Theme set to {}", theme(ui.theme).name));
+                ui.push(
+                    Speaker::System,
+                    format!("Theme set to {}", theme(ui.theme).name),
+                );
             } else {
                 // Two lines, not one: compact mode clips a transcript entry at
                 // the pane edge, and a single long line loses the tail of the
@@ -3569,17 +5306,72 @@ async fn run_command(
         }
         "/verbosity" => {
             let current = ui.verbosity.clone();
-            let mode = if args.is_empty() { ask_line(ui, "Verbosity (compact/normal/verbose)", &current)? } else { Some(args.into()) };
-            if let Some(mode) = mode { if matches!(mode.as_str(), "compact" | "normal" | "verbose") { ui.verbosity = mode.clone(); ui.push(Speaker::System, format!("Verbosity: {mode}")); } else { ui.push(Speaker::System, "Verbosity must be compact, normal, or verbose"); } }
+            let mode = if args.is_empty() {
+                ask_line(ui, "Verbosity (compact/normal/verbose)", &current)?
+            } else {
+                Some(args.into())
+            };
+            if let Some(mode) = mode {
+                if matches!(mode.as_str(), "compact" | "normal" | "verbose") {
+                    ui.verbosity = mode.clone();
+                    ui.push(Speaker::System, format!("Verbosity: {mode}"));
+                } else {
+                    ui.push(
+                        Speaker::System,
+                        "Verbosity must be compact, normal, or verbose",
+                    );
+                }
+            }
         }
-        "/stats" => ui.push(Speaker::System, format!("Model: {}\nProvider: {}\n{}\nLast API latency: {}\nTranscript entries: {}\nTool cells: {}\nScroll: {}", agent.config.model, agent.config.provider, agent.stats_line(), agent.last_api_latency.map(|d| format!("{} ms", d.as_millis())).unwrap_or_else(|| "none".into()), ui.entries.len(), ui.tool_rows.len(), ui.scroll)),
+        "/stats" => {
+            // The same eight panels as the dashboard, printed as text
+            // (spec 3.2: `/stats` must be readable without the grid).
+            let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(100);
+            let stats = ui.dash_stats();
+            let mut text = format!(
+                "Session {} · {}/{} · [{}] · {}\n{}\n",
+                stats.session_id,
+                stats.provider,
+                stats.model,
+                stats.category,
+                stats.status,
+                agent.stats_line()
+            );
+            for (title, rows) in dashboard_panels(&stats, width.saturating_sub(4)) {
+                text.push_str(&format!("[{title}]\n"));
+                for row in rows {
+                    text.push_str(&row);
+                    text.push('\n');
+                }
+            }
+            ui.push(Speaker::System, text);
+        }
+        "/dashboard" => {
+            ui.dashboard = true;
+            ui.dash_detail = None;
+            ui.dash_data_at = None;
+            ui.dash_files_at = None;
+            ui.status = "Dashboard · Ctrl+D close".into();
+        }
         "/export" => {
-            let (json, csv) = agent.metrics.export(&agent.config.root.join(".ctf/reports"))?;
-            ui.push(Speaker::System, format!("Exported:\n{}\n{}", json.display(), csv.display()));
+            let (json, csv) = agent
+                .metrics
+                .export(&agent.config.root.join(".ctf/reports"))?;
+            ui.push(
+                Speaker::System,
+                format!("Exported:\n{}\n{}", json.display(), csv.display()),
+            );
         }
         "/flags" => {
             let flags = agent.ctf.history(args);
-            ui.push(Speaker::System, if flags.is_empty() { "No matching flags".into() } else { flags.join("\n") });
+            ui.push(
+                Speaker::System,
+                if flags.is_empty() {
+                    "No matching flags".into()
+                } else {
+                    flags.join("\n")
+                },
+            );
         }
         "/sandbox" => {
             let sandbox = agent.tools.sandbox.clone();
@@ -3601,7 +5393,12 @@ async fn run_command(
         }
         "/writeup" => {
             sync_session(session, agent, ui);
-            let flags: Vec<String> = agent.ctf.history("").into_iter().filter_map(|line| line.split('\t').nth(3).map(str::to_string)).collect();
+            let flags: Vec<String> = agent
+                .ctf
+                .history("")
+                .into_iter()
+                .filter_map(|line| line.split('\t').nth(3).map(str::to_string))
+                .collect();
             let path = crate::report::writeup(&agent.config.root, session, &flags)?;
             if let Some(url) = &agent.config.qdrant_url {
                 if let Ok(text) = std::fs::read_to_string(&path) {
@@ -3614,7 +5411,10 @@ async fn run_command(
                     .await;
                 }
             }
-            ui.push(Speaker::System, format!("Writeup generated: {}", path.display()));
+            ui.push(
+                Speaker::System,
+                format!("Writeup generated: {}", path.display()),
+            );
         }
         "/diff" => {
             let diff = project::diff(&agent.config.root)?;
@@ -5253,5 +7053,354 @@ mod tests {
     fn logo_is_three_lines() {
         assert_eq!(LOGO.len(), 3);
         assert!(LOGO[0].contains("W") || LOGO[0].contains('╦'));
+    }
+
+    #[test]
+    fn dash_stats_round_trip_and_partial_json() {
+        let mut ui = shell();
+        ui.busy = true;
+        ui.flags_found = 2;
+        ui.flag_log.push(("flag{a}".into(), "checker".into()));
+        let stats = ui.dash_stats();
+        assert_eq!(stats.schema, "wrosecode/live-v1");
+        assert_eq!(stats.session_id, "test");
+        assert_eq!(stats.status, "busy");
+        assert_eq!(stats.flags_total, 2);
+        assert!(stats.live_at_ms > 0, "the freshness gate needs a timestamp");
+
+        let json = serde_json::to_string(&stats).expect("DashStats serializes");
+        let back: DashStats = serde_json::from_str(&json).expect("round trips");
+        assert_eq!(back.schema, stats.schema);
+        assert_eq!(back.session_id, stats.session_id);
+        assert_eq!(back.flags, stats.flags);
+
+        // live.json / /v1/status consumers must tolerate partial documents.
+        let partial: DashStats =
+            serde_json::from_str(r#"{"schema":"wrosecode/live-v1","session_id":"x"}"#)
+                .expect("partial documents parse");
+        assert_eq!(partial.session_id, "x");
+        assert!(partial.status.is_empty());
+        assert!(partial.procs.is_empty());
+        let empty: DashStats = serde_json::from_str("{}").expect("defaults cover every field");
+        assert!(empty.schema.is_empty());
+        assert_eq!(empty.live_at_ms, 0);
+    }
+
+    #[test]
+    fn flag_rows_parse_the_ctf_log_format() {
+        let history = vec![
+            "1700000001\tsrc-a\trot13\tflag{first}\t0.9".to_string(),
+            "1700000002\tsrc-b\tplain\tflag{second}\t1.0".to_string(),
+        ];
+        let rows = flag_rows(&history);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("flag{second}".to_string(), "src-b".to_string()));
+        assert_eq!(rows[1], ("flag{first}".to_string(), "src-a".to_string()));
+
+        // A line that never got tab-separated still yields its first token
+        // under the generic source.
+        let loose = vec!["flag{loose} crypto/rsa".to_string()];
+        assert_eq!(
+            flag_rows(&loose),
+            vec![("flag{loose}".to_string(), "checker".to_string())]
+        );
+
+        // Newest eight only: the panel and the result block agree on that cap.
+        let many: Vec<String> = (0..10)
+            .map(|index| format!("170000000{index}\tchecker\tt\tflag{{{index}}}\t1"))
+            .collect();
+        let rows = flag_rows(&many);
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[0].0, "flag{9}");
+        assert_eq!(rows[7].0, "flag{2}");
+    }
+
+    #[test]
+    fn compose_grid_paints_header_footer_panels_and_details() {
+        let stats = DashStats {
+            mode: "build".into(),
+            provider: "openai".into(),
+            model: "m".into(),
+            category: "crypto".into(),
+            status: "ready".into(),
+            plan: vec![("step one".into(), false), ("step two".into(), true)],
+            changed_files: vec![("src/main.rs".into(), 3, 1)],
+            budget_usd: 1.0,
+            cost_usd: Some(0.25),
+            ..DashStats::default()
+        };
+        let colors = dashboard_theme(true);
+        let (frame, _) = compose_grid(&stats, 100, 24, colors, 0, 0, None);
+        assert_eq!(frame.len(), 24, "one row per terminal line");
+        assert!(
+            frame[0]
+                .text
+                .contains(" DASHBOARD · build/openai/m/crypto · ready"),
+            "header: {:?}",
+            frame[0].text
+        );
+        assert!(
+            frame[23].text.contains("←→ panel · ↑↓/jk select"),
+            "footer: {:?}",
+            frame[23].text
+        );
+        let joined = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for title in [
+            "PROCESSES",
+            "THINKING",
+            "TIMELINE",
+            "PLAN",
+            "TOKENS & COST",
+            "FILES",
+            "CTF",
+            "BUDGET",
+        ] {
+            assert!(joined.contains(title), "{title} panel missing:\n{joined}");
+        }
+        assert!(joined.contains("step one"), "plan rows render:\n{joined}");
+        assert!(
+            joined.contains("src/main.rs"),
+            "file rows render:\n{joined}"
+        );
+        for (index, row) in frame.iter().enumerate() {
+            assert!(
+                row.text.chars().count() <= 100,
+                "row {index} overflows 100 columns: {:?}",
+                row.text
+            );
+        }
+
+        // Detail view: title line, body lines, and the back hint.
+        let (frame, _) = compose_grid(
+            &stats,
+            80,
+            12,
+            colors,
+            1,
+            0,
+            Some(("THINKING".into(), "line one\nline two".into())),
+        );
+        assert!(frame[1].text.contains("── THINKING"), "{:?}", frame[1].text);
+        assert!(frame[10].text.contains("Esc back"), "{:?}", frame[10].text);
+        let joined = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("line one"));
+        assert!(joined.contains("line two"));
+    }
+
+    #[test]
+    fn dashboard_panels_are_the_eight_named_bodies() {
+        let panels = dashboard_panels(&DashStats::default(), 100);
+        assert_eq!(panels.len(), 8);
+        let titles: Vec<&str> = panels.iter().map(|(title, _)| *title).collect();
+        assert_eq!(titles, DASH_PANELS);
+        assert!(
+            panels[0]
+                .1
+                .iter()
+                .any(|row| row.contains("no tracked processes")),
+            "empty process list: {:?}",
+            panels[0].1
+        );
+        assert!(
+            panels[6].1.iter().any(|row| row.contains("flags 0")),
+            "empty CTF panel still reports the count: {:?}",
+            panels[6].1
+        );
+        assert!(
+            panels[7].1.iter().any(|row| row.contains("unlimited")),
+            "no budget renders as unlimited: {:?}",
+            panels[7].1
+        );
+    }
+
+    #[test]
+    fn reasoning_cell_opens_ticks_and_freezes() {
+        let mut ui = shell();
+        ui.begin_turn();
+        let row = ui.entries.len() - 1;
+        assert!(
+            ui.entries[row].text.contains("Thinking…"),
+            "{:?}",
+            ui.entries[row].text
+        );
+        ui.tick_thinking();
+        assert!(ui.entries[row].text.contains("Thinking…"));
+        ui.finalize_think();
+        let frozen = ui.entries[row].text.clone();
+        assert!(
+            frozen.contains("Thought") && frozen.contains('s'),
+            "the frozen cell reports its elapsed time: {frozen:?}"
+        );
+        ui.tick_thinking();
+        assert_eq!(ui.entries[row].text, frozen, "a frozen cell stops ticking");
+        ui.finalize_think();
+        assert_eq!(ui.entries[row].text, frozen, "freeze is idempotent");
+
+        ui.begin_turn();
+        let next = ui.entries.len() - 1;
+        assert!(next > row, "each turn opens a new reasoning cell");
+        assert!(ui.entries[next].text.contains("Thinking…"));
+    }
+
+    #[test]
+    fn result_block_reports_verification_and_failures() {
+        let mut ui = shell();
+        ui.push(Speaker::Agent, "the flag is flag{ok}");
+        ui.task_begin();
+        ui.verified = true;
+        ui.push_result_block();
+        let text = &ui.entries.last().expect("a result block was pushed").text;
+        assert!(text.contains("── RESULT ─ ✔ verified"), "{text}");
+        assert!(text.contains("answer: the flag is flag{ok}"), "{text}");
+        assert!(text.contains("proof: none"), "{text}");
+        assert!(text.contains("steps "), "{text}");
+
+        let mut ui = shell();
+        ui.task_begin();
+        ui.record_error("network");
+        ui.push_result_block();
+        let text = &ui.entries.last().expect("a result block was pushed").text;
+        assert!(text.contains("── RESULT ─ ✗ failed"), "{text}");
+
+        let mut ui = shell();
+        ui.task_begin();
+        ui.push_result_block();
+        let text = &ui.entries.last().expect("a result block was pushed").text;
+        assert!(text.contains("── RESULT ─ ⚠ unverified"), "{text}");
+    }
+
+    #[test]
+    fn tool_cells_preview_expand_and_auto_expand_failures() {
+        let mut ui = shell();
+        ui.push(Speaker::System, "tool row");
+        let row = ui.entries.len() - 1;
+        let output = (1..=10)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.tool_cells.insert(
+            "t1".into(),
+            ToolCell {
+                title: "shell ls".into(),
+                running: false,
+                ok: true,
+                output,
+                elapsed_ms: 1500,
+                exit_code: Some(0),
+                row,
+            },
+        );
+
+        // Collapsed cells preview first three + last two lines (spec 3.1).
+        let cell = ui.tool_cells["t1"].clone();
+        let text = ui.cell_text("t1", &cell);
+        assert!(text.contains("✓ shell ls  1.5s"), "{text}");
+        assert!(text.contains("⋮ 5 more lines"), "{text}");
+        assert!(
+            text.contains("line 1") && text.contains("line 10"),
+            "{text}"
+        );
+        assert!(!text.contains("line 6"), "{text}");
+
+        // Enter / Ctrl+O expands, and a second press collapses again.
+        ui.toggle_entry(row);
+        let cell = ui.tool_cells["t1"].clone();
+        let text = ui.cell_text("t1", &cell);
+        assert!(text.contains("line 6"), "expanded:\n{text}");
+        ui.toggle_entry(row);
+        let cell = ui.tool_cells["t1"].clone();
+        assert!(!ui.cell_text("t1", &cell).contains("line 6"));
+
+        // Failed cells auto-expand with their exit code, no toggle required.
+        ui.tool_cells.insert(
+            "t2".into(),
+            ToolCell {
+                title: "shell false".into(),
+                running: false,
+                ok: false,
+                output: "boom".into(),
+                elapsed_ms: 10,
+                exit_code: Some(1),
+                row: row + 1,
+            },
+        );
+        let cell = ui.tool_cells["t2"].clone();
+        let text = ui.cell_text("t2", &cell);
+        assert!(text.contains("✗ shell false"), "{text}");
+        assert!(text.contains("└ exit 1"), "{text}");
+        assert!(text.contains("boom"), "{text}");
+
+        // A running cell shows no output until it finishes.
+        ui.tool_cells.insert(
+            "t3".into(),
+            ToolCell {
+                title: "shell sleep".into(),
+                running: true,
+                ok: false,
+                output: "hidden".into(),
+                elapsed_ms: 0,
+                exit_code: None,
+                row: row + 2,
+            },
+        );
+        let cell = ui.tool_cells["t3"].clone();
+        let text = ui.cell_text("t3", &cell);
+        assert!(text.contains("shell sleep  …"), "{text}");
+        assert!(!text.contains("hidden"), "{text}");
+    }
+
+    #[test]
+    fn child_tools_render_a_nested_tree_and_groups_count_work() {
+        let mut ui = shell();
+        ui.child_cells.insert(
+            "g1/c1".into(),
+            ToolCell {
+                title: "read a.rs".into(),
+                running: false,
+                ok: true,
+                output: String::new(),
+                elapsed_ms: 100,
+                exit_code: Some(0),
+                row: usize::MAX,
+            },
+        );
+        ui.child_cells.insert(
+            "g1/c2".into(),
+            ToolCell {
+                title: "grep b".into(),
+                running: true,
+                ok: false,
+                output: String::new(),
+                elapsed_ms: 0,
+                exit_code: None,
+                row: usize::MAX,
+            },
+        );
+        let tree = ui.child_lines("g1", 1);
+        assert!(tree.contains("├─ ✓ read a.rs  0.1s"), "{tree}");
+        assert!(tree.contains("└─ ⠋ grep b  …"), "{tree}");
+
+        // The collapsed `▸ Explored` group counts finished work and still
+        // marks in-flight children.
+        let done = GroupCell {
+            files: 2,
+            searches: 1,
+            inflight: 0,
+        };
+        assert_eq!(group_text(&done), "▸ Explored  2 files · 1 search");
+        let live = GroupCell {
+            files: 1,
+            searches: 0,
+            inflight: 1,
+        };
+        assert_eq!(group_text(&live), "⠋ ▸ Explored  1 file · 0 searches  …");
     }
 }

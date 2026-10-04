@@ -1,6 +1,7 @@
 mod acp;
 mod agent;
 mod api;
+mod attach;
 mod commands;
 mod config;
 mod crash;
@@ -134,7 +135,34 @@ async fn main() -> Result<()> {
         ctfd::run(command.action).await?;
         return Ok(());
     }
-    let cli = Cli::parse();
+    // `wrosecode dashboard …` attaches to a running session (spec 3.2);
+    // `wrosecode exec [--json] <prompt>` runs headless and, with --json,
+    // emits the same DashStats the dashboard renders.
+    if raw_args
+        .get(1)
+        .is_some_and(|argument| argument == "dashboard")
+    {
+        let mut attach_args = vec!["wrosecode-dashboard".to_string()];
+        attach_args.extend(raw_args.iter().skip(2).cloned());
+        let attach_cli = attach::AttachCli::parse_from(attach_args);
+        attach::run(attach_cli).await?;
+        return Ok(());
+    }
+    let mut exec_json = false;
+    let cli_args: Vec<String> = if raw_args.get(1).is_some_and(|argument| argument == "exec") {
+        let mut rewritten = vec!["wrosecode".to_string(), "--headless".to_string()];
+        for argument in raw_args.iter().skip(2) {
+            if argument == "--json" {
+                exec_json = true;
+            } else {
+                rewritten.push(argument.clone());
+            }
+        }
+        rewritten
+    } else {
+        raw_args.clone()
+    };
+    let cli = Cli::parse_from(cli_args);
     let root = std::env::current_dir()?;
     let store = store::Store::open_default()?;
     if let Some(path) = &cli.import_session {
@@ -299,10 +327,21 @@ async fn main() -> Result<()> {
                 .success();
         }
         let json_summary = cli.summary.as_deref() == Some("json");
-        if !cli.quiet && !json_summary {
+        if exec_json {
+            // Spec 3.2: `exec --json` emits the dashboard snapshot, with the
+            // answer and verification folded in.
+            let mut value = serde_json::to_value(tui::stats_from_agent(
+                &agent,
+                "exec",
+                if verified { "verified" } else { "unverified" },
+            ))?;
+            value["answer"] = serde_json::Value::String(response.clone());
+            value["verified"] = serde_json::Value::Bool(verified);
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else if !cli.quiet && !json_summary {
             println!("{response}");
         }
-        if json_summary {
+        if json_summary && !exec_json {
             println!(
                 "{}",
                 serde_json::json!({
@@ -315,7 +354,7 @@ async fn main() -> Result<()> {
                     "elapsed_ms": agent.started_at.elapsed().as_millis(),
                 })
             );
-        } else if !cli.no_summary {
+        } else if !cli.no_summary && !exec_json {
             let (cache_hits, saved_bytes) = agent.tools.cache_stats();
             eprintln!("────────────────────────────────────────────────────────────");
             eprintln!(

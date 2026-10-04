@@ -38,6 +38,8 @@ pub struct Tools {
     result_cache: Arc<Mutex<HashMap<String, String>>>,
     cache_hits: Arc<AtomicUsize>,
     cache_saved_bytes: Arc<AtomicUsize>,
+    /// The visible plan checklist maintained by the `update_plan` tool.
+    pub checklist: Arc<Mutex<Vec<(String, bool)>>>,
     redis_addr: Option<String>,
     pub sandbox: Arc<crate::sandbox::Sandbox>,
 }
@@ -62,6 +64,7 @@ impl Tools {
             result_cache: Arc::new(Mutex::new(HashMap::new())),
             cache_hits: Arc::new(AtomicUsize::new(0)),
             cache_saved_bytes: Arc::new(AtomicUsize::new(0)),
+            checklist: Arc::new(Mutex::new(Vec::new())),
             redis_addr,
             sandbox,
         }
@@ -129,6 +132,8 @@ impl Tools {
             ),
             json!({"name":"delegate_task","description":"Run or resume a parallel child agent; optional provider/model routing and stable task_id",
                 "input_schema":{"type":"object","properties":{"task":{"type":"string"},"task_id":{"type":"string"},"resume":{"type":"boolean"},"provider":{"type":"string"},"model":{"type":"string"}}}}),
+            json!({"name":"update_plan","description":"Replace the visible plan checklist; items are {text, done} objects",
+                "input_schema":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"done":{"type":"boolean"}},"required":["text"]}}},"required":["items"]}}),
         ];
         for (server, mcp) in &self.mcps {
             schemas.extend(mcp.schemas.iter().map(|schema| {
@@ -302,6 +307,29 @@ impl Tools {
                     input["body"].as_str(),
                 )
                 .await?
+            }
+            "update_plan" => {
+                let items = input["items"]
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("items must be an array"))?;
+                let mut plan: Vec<(String, bool)> = Vec::with_capacity(items.len());
+                for item in items {
+                    if let Some(text) = item.as_str() {
+                        plan.push((text.to_string(), false));
+                        continue;
+                    }
+                    let text = item["text"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("plan item needs a text string"))?;
+                    plan.push((text.to_string(), item["done"].as_bool().unwrap_or(false)));
+                }
+                let total = plan.len();
+                let done = plan.iter().filter(|(_, done)| *done).count();
+                *self
+                    .checklist
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("checklist lock poisoned"))? = plan;
+                format!("Plan updated: {done} of {total} steps done")
             }
             "delegate_task" => bail!("delegate_task is handled by the agent"),
             _ if call.name.starts_with("mcp__") => {

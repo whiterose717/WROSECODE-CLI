@@ -26,6 +26,8 @@ pub enum Progress {
     TextDelta(String),
     Usage(Usage),
     Metrics(crate::metrics::MetricsSnapshot),
+    /// Full replacement of the visible plan checklist (text, done).
+    Plan(Vec<(String, bool)>),
     FlagFound {
         flag: String,
         source: String,

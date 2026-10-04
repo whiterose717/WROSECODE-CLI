@@ -107,6 +107,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Show live usage and timing counters",
     },
     CommandSpec {
+        name: "/dashboard",
+        category: "Session",
+        description: "Open the eight-panel live dashboard (Ctrl+D)",
+    },
+    CommandSpec {
         name: "/verbosity",
         category: "Session",
         description: "Set compact, normal, or verbose tool output",
@@ -235,6 +240,7 @@ mod tests {
             "/clear",
             "/commit",
             "/connect",
+            "/dashboard",
             "/debug",
             "/diff",
             "/editor",
@@ -251,6 +257,7 @@ mod tests {
             "/rmslop",
             "/sessions",
             "/skills",
+            "/stats",
             "/theme",
         ] {
             assert!(lookup(name).is_some(), "missing {name}");

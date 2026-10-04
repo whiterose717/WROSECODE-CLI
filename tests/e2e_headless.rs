@@ -246,3 +246,43 @@ fn json_summary_reports_usage_from_the_provider() {
     assert_eq!(value["model_turns"], 1, "{summary_line}");
     let _ = Path::new(&sandbox.root);
 }
+
+#[test]
+fn exec_json_emits_the_dashboard_snapshot() {
+    let server = spawn(vec![completion("ok")]);
+    let sandbox = Sandbox::new("exec-json", &server.url(""));
+
+    // `exec` must be argv[1]: main rewrites it to --headless + --json.
+    let output = Command::new(env!("CARGO_BIN_EXE_wrosecode"))
+        .current_dir(&sandbox.root)
+        .env("HOME", &sandbox.home)
+        .env("WROSECODE_MOCK_API_KEY", "test-key")
+        .env_remove("WROSECODE_OPENAI_API_KEY")
+        .args([
+            "exec",
+            "--json",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+            "--max-wall-time",
+            "60",
+            "say ok",
+        ])
+        .output()
+        .expect("run wrosecode exec --json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("exec --json prints one JSON document");
+    assert_eq!(value["schema"], "wrosecode/live-v1", "{stdout}");
+    assert_eq!(value["answer"], "ok", "{stdout}");
+    assert!(value["verified"].as_bool().unwrap_or(false), "{stdout}");
+    assert!(value["mode"].is_string(), "{stdout}");
+    assert_eq!(value["provider"], "mock", "{stdout}");
+    assert_eq!(value["model"], "mock-model", "{stdout}");
+}

@@ -1,6 +1,6 @@
 # Architecture
 
-WROSECODE is one Rust binary with four presentation surfaces: the differential terminal dashboard, headless execution, ACP, and an Axum REST/web server. All surfaces call the same `Agent` runtime.
+WROSECODE is one Rust binary with four presentation surfaces: the differential terminal dashboard (plus its `wrosecode dashboard` attach client), headless execution, ACP, and an Axum REST/web server. All surfaces call the same `Agent` runtime.
 
 ```mermaid
 flowchart LR
@@ -37,6 +37,29 @@ the view is not following the bottom (each line pushed while detached feeds
 the count until `End`), and `/clear` drops the transcript while keeping the
 conversation context. `Ctrl+L` clears the visible transcript and redraws;
 only `/clear --context` also drops conversation context.
+
+Transcript rows are structured cells (`ToolCell`, `GroupCell`) rather than
+raw lines: `Ui::cell_text` renders a header with elapsed time plus a
+first-three/last-two `preview_block`, failed cells auto-expand with their
+exit code, child calls nest as a `├─`/`└─` tree through `child_lines`, and
+`toggle_entry` (Enter / `Ctrl+O`) flips the cell at the viewport top. Each
+turn opens a dimmed `Thinking…` cell (`begin_turn`) that `finalize_think`
+freezes into `Thought n.ns` once the model answers, and `push_result_block`
+closes every task with a `── RESULT ─ {status}` block (spec 3.3) whose
+baselines come from `task_begin`.
+
+The dashboard is one renderer shared by two clients: `compose_grid(stats,
+width, height, colors, focus, selected, detail)` builds the eight-panel grid
+(Processes, Thinking, Timeline, Plan, Tokens & Cost, Files, CTF, Budget) or a
+`── {title}` detail body, and `dashboard_panels` supplies the row text for
+`/stats`, the detail view, and the attach client alike. The snapshot type is
+`DashStats` (serde, `#[serde(default)]`, schema `wrosecode/live-v1`): the TUI
+refreshes processes at 10 Hz and git files at ~1.5 Hz, writes
+`~/.wrosecode/live.json` at most once a second, `stats_from_agent` builds the
+same shape for `GET /v1/status` and `wrosecode exec --json`, and
+`src/attach.rs` resolves its source in order — fresh live.json (≤10 s) →
+`/v1/status` (2 s timeouts) → offline best effort — before painting through
+the identical `compose_grid`.
 
 Input is never dropped while a model turn is running: keys land in the input
 box, `Enter` queues the message for after the reply (the status line shows
