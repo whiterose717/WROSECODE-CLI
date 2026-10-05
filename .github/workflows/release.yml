@@ -3,7 +3,7 @@ name: Native Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: read
@@ -15,6 +15,8 @@ concurrency:
 jobs:
   build:
     name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -22,48 +24,92 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: wrosecode-linux-x86_64
+
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: wrosecode-linux-aarch64
+
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             asset: wrosecode-darwin-x86_64
+
           - runner: macos-15
             target: aarch64-apple-darwin
             asset: wrosecode-darwin-aarch64
+
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             asset: wrosecode-windows-x86_64.exe
+
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             asset: wrosecode-windows-aarch64.exe
-    runs-on: ${{ matrix.runner }}
+
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
       - name: Verify tag and package versions match
         shell: bash
         run: |
-          node -e 'const p=require("./package.json"); if (process.env.GITHUB_REF_NAME !== `v${p.version}`) { console.error(`Tag ${process.env.GITHUB_REF_NAME} does not match package version ${p.version}`); process.exit(1); }'
-          node -e 'const p=require("./package.json"); const c=require("fs").readFileSync("Cargo.toml","utf8"); if (!new RegExp(`^version\\s*=\\s*"${p.version.replaceAll(".","\\.")}"$`,"m").test(c)) { console.error("Cargo.toml version does not match package.json"); process.exit(1); }'
+          set -euo pipefail
+
+          PACKAGE_VERSION="$(node -p 'require("./package.json").version')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+
+          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $PACKAGE_VERSION"
+            exit 1
+          fi
+
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | node -e '
+                let s="";
+                process.stdin.on("data", d => s += d);
+                process.stdin.on("end", () => {
+                  const m = JSON.parse(s);
+                  const p = m.packages.find(p => p.name === "wrosecode");
+                  if (!p) process.exit(2);
+                  process.stdout.write(p.version);
+                });
+              ')"
+
+          if [ "$CARGO_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Cargo.toml version $CARGO_VERSION does not match package.json version $PACKAGE_VERSION"
+            exit 1
+          fi
+
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
+
       - name: Name binary and create checksum
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
+
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp "target/${{ matrix.target }}/release/wrosecode.exe" "dist/${{ matrix.asset }}"
+            SOURCE="target/${{ matrix.target }}/release/wrosecode.exe"
           else
-            cp "target/${{ matrix.target }}/release/wrosecode" "dist/${{ matrix.asset }}"
+            SOURCE="target/${{ matrix.target }}/release/wrosecode"
           fi
-          sha256sum "dist/${{ matrix.asset }}" > "dist/${{ matrix.asset }}.sha256"
+
+          DEST="dist/${{ matrix.asset }}"
+          cp "$SOURCE" "$DEST"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$DEST" > "$DEST.sha256"
+          else
+            shasum -a 256 "$DEST" > "$DEST.sha256"
+          fi
+
       - name: Upload release assets for aggregation
         uses: actions/upload-artifact@v4
         with:
@@ -76,23 +122,28 @@ jobs:
     name: Publish GitHub Release assets
     needs: build
     runs-on: ubuntu-24.04
+
     permissions:
       contents: write
+
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
+
       - name: Download all native binaries and checksums
         uses: actions/download-artifact@v4
         with:
           pattern: native-*
           path: release-assets
           merge-multiple: true
+
       - name: Verify complete release set and checksums
         shell: bash
         run: |
           set -euo pipefail
+
           assets=(
             wrosecode-linux-x86_64
             wrosecode-linux-aarch64
@@ -101,20 +152,37 @@ jobs:
             wrosecode-windows-x86_64.exe
             wrosecode-windows-aarch64.exe
           )
+
           for asset in "${assets[@]}"; do
             test -s "release-assets/$asset"
             test -s "release-assets/$asset.sha256"
-            (cd release-assets && sha256sum --check "$asset.sha256")
+
+            (
+              cd release-assets
+              sha256sum --check "$asset.sha256"
+            )
           done
-          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 12
+
+          COUNT="$(find release-assets -maxdepth 1 -type f | wc -l)"
+          if [ "$COUNT" -ne 12 ]; then
+            echo "Expected exactly 12 release files, found $COUNT"
+            find release-assets -maxdepth 1 -type f -print
+            exit 1
+          fi
+
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+
           tag="$GITHUB_REF_NAME"
+
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --title "WROSECODE $tag" --notes "Native WROSECODE binaries for Linux, macOS, and Windows (x86_64 and aarch64). Each binary is accompanied by a SHA-256 checksum."
+            gh release create "$tag" \
+              --title "WROSECODE $tag" \
+              --notes "Native WROSECODE binaries for Linux, macOS, and Windows (x86_64 and aarch64). Each binary is accompanied by a SHA-256 checksum."
           fi
+
           gh release upload "$tag" release-assets/* --clobber
