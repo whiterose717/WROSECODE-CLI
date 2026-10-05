@@ -26,10 +26,12 @@ static FIRST_PAINT_MS: OnceLock<u128> = OnceLock::new();
 
 /// The wordmark. Lives here because the splash owns branding; `Ui::compose`
 /// renders the same block as its header while the transcript is empty.
-pub const LOGO: [&str; 3] = [
-    "╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗",
-    "║ ║╠╩╗│ │╠═╝╠═╗│  │ │║ ║╠═╗",
-    "╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝",
+pub const LOGO: [&str; 5] = [
+    "██╗    ██╗██████╗  ██████╗ ███████╗███████╗ ██████╗ ██████╗ ███████╗",
+    "██║    ██║██╔══██╗██╔═══██╗██╔════╝██╔════╝██╔════╝██╔═══██╗██╔════╝",
+    "██║ █╗ ██║██████╔╝██║   ██║███████╗█████╗  ██║     ██║   ██║█████╗  ",
+    "██║███╗██║██╔══██╗██║   ██║╚════██║██╔══╝  ██║     ██║   ██║██╔══╝  ",
+    "╚███╔███╔╝██║  ██║╚██████╔╝███████║███████╗╚██████╗╚██████╔╝███████╗",
 ];
 
 /// Milliseconds from process start to the first painted frame, recorded by
@@ -47,10 +49,8 @@ pub fn within_budget() -> bool {
 /// shape. `paint_ms` of `None` omits the timing line (nothing was measured).
 pub fn banner(paint_ms: Option<u128>) -> Vec<String> {
     let mut lines: Vec<String> = LOGO.iter().map(|logo| (*logo).to_string()).collect();
-    lines.push(format!(
-        "  WROSECODE v{} · agentic coding and CTF shell",
-        env!("CARGO_PKG_VERSION")
-    ));
+    lines.push(format!("  WROSECODE v{}", env!("CARGO_PKG_VERSION")));
+    lines.push("  starting workspace".into());
     if let Some(ms) = paint_ms {
         lines.push(timing_line(ms));
     }
@@ -78,6 +78,7 @@ pub fn paint_lines(
             &format!("WROSECODE v{}", env!("CARGO_PKG_VERSION")),
             colors,
         )];
+        painted.push("starting workspace".into());
         if let Some(ms) = paint_ms {
             painted.push(timing_line(ms));
         }
@@ -122,8 +123,8 @@ pub fn paint_stage(profile: TerminalProfile, boot: &Instant, stage: u8) -> io::R
 }
 
 /// Hide wordmark rows beyond the reveal stage (later rows paint blank, then
-/// fill in on the next stage). The tail lines always show: version, timing
-/// and status stay readable from the very first frame.
+/// fill in on the next stage). The tail lines always show: version, startup
+/// status, and timing stay readable from the very first frame.
 fn reveal_lines(mut lines: Vec<String>, stage: u8) -> Vec<String> {
     let shown = (stage as usize + 1).min(LOGO.len());
     for (index, line) in lines.iter_mut().enumerate().take(LOGO.len()) {
@@ -146,17 +147,22 @@ mod tests {
     #[test]
     fn banner_carries_the_wordmark_version_and_timing() {
         let lines = banner(Some(12));
-        assert_eq!(lines.len(), 5, "three logo rows, version, timing");
-        assert!(lines[0].starts_with("╦ ╦"));
+        assert_eq!(lines.len(), 8, "five logo rows, version, status, timing");
+        assert!(lines[0].starts_with("██╗"));
         assert!(
-            lines[3].contains(env!("CARGO_PKG_VERSION")),
+            lines[5].contains(env!("CARGO_PKG_VERSION")),
             "the version row: {:?}",
-            lines[3]
+            lines[5]
         );
         assert!(
-            lines[4].contains("first paint 12ms") && lines[4].contains("budget 50ms"),
+            lines[6].contains("starting workspace"),
+            "the status row: {:?}",
+            lines[6]
+        );
+        assert!(
+            lines[7].contains("first paint 12ms") && lines[7].contains("budget 50ms"),
             "the timing row: {:?}",
-            lines[4]
+            lines[7]
         );
     }
 
@@ -164,16 +170,16 @@ mod tests {
     fn banner_reports_a_budget_miss_instead_of_hiding_it() {
         let over = banner(Some(90));
         assert!(
-            over[4].contains("over budget 50ms"),
+            over[7].contains("over budget 50ms"),
             "an over-budget splash says so: {:?}",
-            over[4]
+            over[7]
         );
     }
 
     #[test]
     fn no_measurement_means_no_timing_line() {
         let lines = banner(None);
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 7);
         assert!(lines.iter().all(|line| !line.contains("first paint")));
         // Nothing painted yet: budget check fails closed.
         assert!(!within_budget());
@@ -185,12 +191,13 @@ mod tests {
         let full = banner(Some(3));
         let stage0 = reveal_lines(full.clone(), 0);
         assert!(!stage0[0].is_empty(), "first row shows at once");
-        assert!(stage0[1].is_empty() && stage0[2].is_empty());
-        // Tail lines (version, timing) stay readable from frame one.
-        assert!(stage0[3].contains(env!("CARGO_PKG_VERSION")));
-        assert!(stage0[4].contains("first paint"));
-        let stage2 = reveal_lines(full.clone(), 2);
-        assert_eq!(stage2, full, "the last stage is the full banner");
+        assert!(stage0[1].is_empty() && stage0[4].is_empty());
+        // Tail lines (version, status, timing) stay readable from frame one.
+        assert!(stage0[5].contains(env!("CARGO_PKG_VERSION")));
+        assert!(stage0[6].contains("starting workspace"));
+        assert!(stage0[7].contains("first paint"));
+        let stage4 = reveal_lines(full.clone(), 4);
+        assert_eq!(stage4, full, "the last stage is the full banner");
         let beyond = reveal_lines(full.clone(), 9);
         assert_eq!(beyond, full, "stages past the end clamp");
     }

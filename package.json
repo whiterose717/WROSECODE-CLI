@@ -1,9 +1,41 @@
 {
-  "name": "@wrosecode/cli",
-  "version": "0.2.0",
-  "description": "Installer shim for the WROSECODE Rust binary",
-  "bin": {"wrosecode": "npm/wrosecode.js"},
-  "files": ["npm/wrosecode.js"],
-  "engines": {"node": ">=18"},
-  "license": "MIT"
+  "name": "wrosecode",
+  "version": "1.0.0",
+  "description": "A terminal coding agent written in Rust",
+  "license": "MIT",
+  "keywords": [
+    "cli",
+    "coding-agent",
+    "developer-tools",
+    "terminal",
+    "rust"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/whiterose717/WROSECODE-CLI.git"
+  },
+  "homepage": "https://github.com/whiterose717/WROSECODE-CLI#readme",
+  "bugs": {
+    "url": "https://github.com/whiterose717/WROSECODE-CLI/issues"
+  },
+  "bin": {
+    "wrosecode": "npm/wrosecode.js"
+  },
+  "files": [
+    "npm/wrosecode.js",
+    "npm/install.js",
+    "npm/check-publish.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "cargo build --release --locked",
+    "check": "node --check npm/wrosecode.js && node --check npm/install.js && node --check npm/check-publish.js",
+    "postinstall": "node npm/install.js",
+    "prepack": "npm run check",
+    "prepublishOnly": "npm run check && node npm/check-publish.js"
+  }
 }

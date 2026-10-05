@@ -10,8 +10,9 @@ theme = "wrose-dark"
 # compact | normal | verbose
 verbosity = "normal"
 alternate_screen = true
-# auto = detect terminal quirks (VS Code wheel conflict, Zellij repaint), on/off force it.
-mouse_capture = "auto"
+# off = native terminal text selection (default); "on" enables click-to-expand
+# and wheel handling inside the app (WROSECODE_MOUSE=1 does the same).
+mouse_capture = "off"
 # Ring the terminal bell when a flag is detected.
 alert_bell = true
 # How many lines a single Up/Down press scrolls (1 = one line per press).

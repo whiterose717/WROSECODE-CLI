@@ -107,12 +107,17 @@ impl Tools {
             ),
             schema(
                 "edit_file",
-                "Replace text matching exactly once",
+                "Compatibility alias for search_replace. Replace text matching exactly once; fails cleanly if the old block is absent or ambiguous.",
                 json!({"path":"string","old":"string","new":"string"}),
             ),
             schema(
+                "search_replace",
+                "Preferred editing tool. Exact semantic search-and-replace: read_file first, provide a unique existing search_block with enough surrounding context, and a replace_block preserving indentation. Fails cleanly on drift or ambiguity.",
+                json!({"path":"string","search_block":"string","replace_block":"string"}),
+            ),
+            schema(
                 "apply_patch",
-                "Apply a multi-file patch document (*** Begin Patch ... *** End Patch) with @@ hunks, adds, deletes, and moves",
+                "Fallback only for multi-file moves/adds/deletes. Prefer search_replace for ordinary code edits because it anchors on exact current source.",
                 json!({"patch":"string"}),
             ),
             schema(
@@ -294,17 +299,21 @@ impl Tools {
                 self.forget_read(path)?;
                 result
             }
-            "edit_file" => {
+            "edit_file" | "search_replace" => {
                 self.authorize(&call.name, None).await?;
                 let path = arg(input, "path")?;
                 self.require_read(path)?;
-                let result = fs::edit(
-                    &self.config.root,
-                    path,
-                    arg(input, "old")?,
-                    arg(input, "new")?,
-                )
-                .await?;
+                let old = input
+                    .get("search_block")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| input.get("old").and_then(|value| value.as_str()))
+                    .ok_or_else(|| anyhow::anyhow!("missing search_block"))?;
+                let new = input
+                    .get("replace_block")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| input.get("new").and_then(|value| value.as_str()))
+                    .ok_or_else(|| anyhow::anyhow!("missing replace_block"))?;
+                let result = fs::edit(&self.config.root, path, old, new).await?;
                 self.forget_read(path)?;
                 result
             }
@@ -492,7 +501,7 @@ impl Tools {
         // before the next turn instead of after the run fails.
         let output = if matches!(
             call.name.as_str(),
-            "write_file" | "edit_file" | "apply_patch"
+            "write_file" | "edit_file" | "search_replace" | "apply_patch"
         ) {
             match self.lsp_diagnostics(&call.name, input).await {
                 Some(feedback) => format!("{output}\n\n{feedback}"),
@@ -512,7 +521,7 @@ impl Tools {
             }
         } else if matches!(
             call.name.as_str(),
-            "write_file" | "edit_file" | "apply_patch" | "shell"
+            "write_file" | "edit_file" | "search_replace" | "apply_patch" | "shell"
         ) {
             self.result_cache
                 .lock()
@@ -527,7 +536,7 @@ impl Tools {
     /// time, or nothing is wrong — a clean edit reads exactly as before.
     async fn lsp_diagnostics(&self, name: &str, input: &Value) -> Option<String> {
         let paths: Vec<String> = match name {
-            "write_file" | "edit_file" => input["path"]
+            "write_file" | "edit_file" | "search_replace" => input["path"]
                 .as_str()
                 .map(|path| vec![path.to_string()])
                 .unwrap_or_default(),
@@ -621,6 +630,7 @@ impl Tools {
             name,
             "write_file"
                 | "edit_file"
+                | "search_replace"
                 | "apply_patch"
                 | "http"
                 | "mcp"
@@ -730,7 +740,7 @@ fn schema(name: &str, description: &str, fields: Value) -> Value {
         .map(|(k, _)| (k.clone(), json!({"type":"string"})))
         .collect::<serde_json::Map<_, _>>();
     let required = props.keys().cloned().collect::<Vec<_>>();
-    json!({"name":name,"description":description,"input_schema":{"type":"object","properties":props,"required":required}})
+    json!({"name":name,"description":description,"input_schema":{"type":"object","properties":props,"required":required,"additionalProperties":false}})
 }
 
 pub fn truncate(mut output: String, max: usize) -> String {
@@ -980,11 +990,25 @@ mod tests {
         assert_eq!(tools.cache_stats().0, 1);
         assert!(tools.execute(&edit).await.is_ok());
         assert_eq!(std::fs::read_to_string(dir.join("main.rs")).unwrap(), "new");
+        tools.execute(&read).await.unwrap();
         assert!(tools
             .execute(&ToolCall {
                 id: "3".into(),
-                name: "edit_file".into(),
-                input: json!({"path":"main.rs","old":"new","new":"newer"})
+                name: "search_replace".into(),
+                input: json!({"path":"main.rs","search_block":"new","replace_block":"newer"})
+            })
+            .await
+            .is_ok());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("main.rs")).unwrap(),
+            "newer"
+        );
+        tools.execute(&read).await.unwrap();
+        assert!(tools
+            .execute(&ToolCall {
+                id: "4".into(),
+                name: "search_replace".into(),
+                input: json!({"path":"main.rs","search_block":"old","replace_block":"latest"})
             })
             .await
             .is_err());

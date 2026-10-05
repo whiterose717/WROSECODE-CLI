@@ -304,7 +304,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let runtime = config::RuntimeConfig::load(&root);
-    let settings = settings::Settings::load()?;
+    let mut settings = settings::Settings::load()?;
+    let explicit_model = cli.model.clone();
     let selected_model = cli.model.unwrap_or_else(|| {
         settings
             .profile(&cli.provider)
@@ -318,6 +319,11 @@ async fn main() -> Result<()> {
                 }
             })
     });
+    // An explicit model is a deliberate selection. Save it so a later
+    // invocation without `--model` starts with the model actually used.
+    if explicit_model.is_some() && settings.profile(&cli.provider).is_some() {
+        settings.set_default_model(&cli.provider, &selected_model)?;
+    }
     // Thinking mode precedence: --think > the provider profile's think key
     // (model-specific) > [agent].think from config.toml > derived from the
     // legacy numeric thinking_level. An explicit mode rewrites the effective

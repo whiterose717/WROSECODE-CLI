@@ -663,7 +663,7 @@ impl Agent {
             // tail — think level, recall, repo map, skill — follows the
             // boundary marker.
             let stable = format!(
-                "{}\n{}{}{}Project: {}\nMode: {}\nCTF category: {}\nRules: Plan once silently, batch independent read-only tools in one response, choose the cheapest probe first, never repeat an unchanged call, and change strategy after two steps without new information. Prefer rg over grep, fd over find, and feroxbuster over gobuster when installed. Keep narration to one short preamble per tool batch. Work until the answer is verified. For CTF work, actively search for and verify flag formats; do not stop after describing navigation steps.\n",
+                "{}\n{}{}{}Project: {}\nMode: {}\nCTF category: {}\nRules:\n{}\n",
                 self.harness.prompt(),
                 overlay,
                 instructions,
@@ -671,6 +671,7 @@ impl Agent {
                 self.config.root.display(),
                 self.mode,
                 self.ctf.category,
+                AGENTIC_ORCHESTRATOR_DOCTRINE,
             );
             let volatile = format!(
                 "Thinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
@@ -882,7 +883,7 @@ impl Agent {
             let mut snapshot_paths: Vec<std::path::PathBuf> = Vec::new();
             for call in &calls {
                 let touched: Vec<String> = match call.name.as_str() {
-                    "write_file" | "edit_file" => call.input["path"]
+                    "write_file" | "edit_file" | "search_replace" => call.input["path"]
                         .as_str()
                         .map(|path| vec![path.to_string()])
                         .unwrap_or_default(),
@@ -1076,7 +1077,10 @@ impl Agent {
                 .iter()
                 .zip(results.iter())
                 .filter(|(call, (_, result, _))| {
-                    matches!(call.name.as_str(), "write_file" | "edit_file") && result.is_ok()
+                    matches!(
+                        call.name.as_str(),
+                        "write_file" | "edit_file" | "search_replace"
+                    ) && result.is_ok()
                 })
                 .filter_map(|(call, _)| call.input["path"].as_str().map(str::to_owned))
                 .collect();
@@ -1330,7 +1334,7 @@ fn format_tool_title(name: &str, detail: &str) -> String {
         "shell" => "Ran",
         "read_file" => "Read",
         "grep" | "glob" => "Searched",
-        "edit_file" | "write_file" => "Edited",
+        "edit_file" | "search_replace" | "write_file" => "Edited",
         "apply_patch" => "Patched",
         "web_fetch" | "web_search" => "Fetched",
         "delegate_task" => "Delegated",
@@ -1386,6 +1390,19 @@ fn task_requires_tool(query: &str) -> bool {
     .iter()
     .any(|needle| query.contains(needle))
 }
+
+/// Stable operating doctrine for the coding loop. Kept as one constant so it
+/// sits above the volatile prompt boundary and remains prefix-cache friendly.
+const AGENTIC_ORCHESTRATOR_DOCTRINE: &str = "\
+Research first: use the repo map, hot memory, and explicit file reads; do not mutate from guesses.
+Gate protocol: before read_file/grep/glob, check whether the answer is already in memory, pinned files, or the repo map.
+Parallelism: batch independent read-only tools and independent delegate_task calls in one response. Sequential calls are only for true dependencies.
+Delegation: for broad exploration, spawn focused delegate_task children and consume their summaries instead of flooding the main context.
+Editing: prefer search_replace for code changes. Read the file first, use a unique exact search_block with surrounding context, preserve indentation, and keep edits atomic. Use apply_patch only for multi-file add/delete/move patches.
+Verification: after edits, run the relevant build, test, linter, or configured check. If it fails, ingest the error and repair without waiting.
+Latency discipline: keep narration minimal, avoid repeated unchanged calls, choose cheap probes first, and change strategy after two low-information steps.
+Safety: destructive shell commands still require approval. Plan mode is read-only.
+Completion: finish with a concise summary of what changed and what passed.";
 
 /// The summarizer's instructions (Codex compaction, clai's state-preserving
 /// summary): what to keep, in what order, and nothing else.
@@ -1961,8 +1978,12 @@ mod tests {
             .split_once(crate::provider::SYSTEM_VOLATILE_MARK)
             .expect("the agent must mark the stable/volatile boundary");
         assert!(
-            stable.contains("Rules: Plan once silently"),
+            stable.contains("Research first: use the repo map"),
             "rules belong to the stable prefix: {stable}"
+        );
+        assert!(
+            stable.contains("prefer search_replace"),
+            "the edit doctrine belongs to the stable prefix: {stable}"
         );
         assert!(
             !stable.contains("Thinking level"),

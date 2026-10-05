@@ -5,9 +5,8 @@ A terminal coding agent written in Rust. Build with `cargo install --path .` or 
 ## Install and run
 
 ```bash
-cd /home/kali/Desktop/wrose
 cargo build --release
-install -Dm755 target/release/wrosecode ~/.local/bin/wrosecode
+install -Dm755 target/release/wrosecode "$HOME/.local/bin/wrosecode"
 wrosecode --permission yolo
 ```
 
@@ -15,6 +14,55 @@ For a fully static Linux binary with no glibc dependency, run
 `./scripts/build-musl.sh` (it needs `rustup target add
 x86_64-unknown-linux-musl` and `musl-tools` for `musl-gcc`) and install
 `target/x86_64-unknown-linux-musl/release/wrosecode` instead.
+
+## Install from npm
+
+Install globally:
+
+```bash
+npm install -g wrosecode
+```
+
+Run the CLI:
+
+```bash
+wrosecode
+```
+
+Run without a permanent installation:
+
+```bash
+npx wrosecode
+```
+
+Update:
+
+```bash
+npm install -g wrosecode@latest
+```
+
+Uninstall:
+
+```bash
+npm uninstall -g wrosecode
+```
+
+The npm package is a small launcher; it downloads the matching native binary
+from the [GitHub Releases](https://github.com/whiterose717/WROSECODE-CLI/releases)
+for this package version and verifies the binary against its SHA-256 sidecar
+before installation. Supported targets are Linux x86_64/aarch64, macOS
+x86_64/aarch64, and Windows x86_64/aarch64. Node.js 18 or newer is required
+for the npm installer; Rust and Cargo are not required for npm users.
+
+Source: <https://github.com/whiterose717/WROSECODE-CLI>
+
+### Maintainer release process
+
+Push a version-matched tag such as `v1.0.0`. The GitHub Actions release
+workflow builds all six supported native targets, creates a SHA-256 sidecar
+for each binary, validates the full set, then creates or updates the GitHub
+Release. Publish to npm only after that workflow succeeds and all twelve
+assets are visible on the release page.
 
 Rust was chosen for low input latency, predictable memory use, a single native binary, and direct terminal control. The architecture combines a differential TUI, streamed provider adapters, durable sessions, MCP tools, repository maps, skills, permission tiers, and parallel tool execution.
 
@@ -58,20 +106,20 @@ produces output it folds back into a slim `WROSECODE v…` header so the
 conversation gets the screen. Below 80 columns the block art collapses to a
 single `WROSECODE v…` line.
 
-Captured at 110×36 straight from a real run:
+Example terminal view at 110×36 (session ID and project path anonymized):
 
 ```
-╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗  ⠧  session ses_1791153855-1574184-0 · [misc] · paint 11ms
+╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗  ⠇  session ses_<session-id> · [misc] · paint 13ms
 ║ ║╠╩╗│ │╠═╝╠═╗│  │ │║ ║╠═╗
-╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝  WROSECODE v0.2.0 · FAST
- anthropic / claude-sonnet-5 · think medium · up to 3 agents · sandbox none · ask · /home/kali/Desktop/wrose
+╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝  WROSECODE v1.0.0 · FAST
+ anthropic / claude-sonnet-5 · think medium · up to 3 agents · sandbox none · ask · /path/to/project
  BUILD · claude · [misc] · git master* · 0 mcp · 636 skills
  2 connected · 10 need setup · /providers
  tip · @ files
-  ctf  wrosecode ctf <file|dir|url>  ·  or /ctf here
+ ctf  wrosecode ctf <file|dir|url>  ·  or /ctf here
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
  TRANSCRIPT  1 entry
- INFO  WROSECODE v0.2.0 · session ses_1791153855-1574184-0
+ INFO  WROSECODE v1.0.0 · session ses_<session-id>
        Type a request · /help commands · Ctrl+P palette
        Tab build/plan · [ ] thinking · PgUp/PgDn scroll · /clear
 
@@ -86,17 +134,17 @@ Captured at 110×36 straight from a real run:
 
 
 
- SUBAGENT TREE  0 running
- root [misc] think medium · up to 3 agents
 
 
 
 
 
 
- Ready · session ses_1791153855-1574184-0 · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 4s · step 0
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────
->
+
+
+ Ready · session ses_<session-id> · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 4s · step 0
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+│ >
 ```
 
 The rows above the rule are the start screen — wordmark, info panel, provider
@@ -117,7 +165,9 @@ hit rate, elapsed time, tool step, sandbox and approval, speed tier and
 workers, cost, and tool counts — for example
 ` Ready · session ses_1791153855-1574184-0 · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 4s · step 0 ·
 none/ask · FAST · 3w · cost n/a · tools 0:0`. During a turn it swaps in an
-animated spinner, the queue note, and the live timeout and tool progress.
+animated spinner, the queue note, and the live timeout and tool progress. The
+input box below it is an open-bottomed `┌──` / `│ >` frame that grows with
+the draft.
 
 File magic and extensions categorize common web, pwn, crypto, reverse
 engineering, and forensics tasks.
@@ -289,18 +339,21 @@ assuming a full xterm:
 | `WROSECODE_NO_ALT_SCREEN=1` | Run inline instead of switching to the alternate screen |
 | `NO_COLOR` set to a non-empty value, or `--no-color` on the command line | No colour anywhere: the gradient wordmark falls back to plain text and frames emit no colour codes |
 
-`mouse_capture` in `config.toml` overrides detection:
+`mouse_capture` in `config.toml` opts into mouse handling:
 
 ```toml
 [ui]
-mouse_capture = "auto"   # "auto" (default), "on", or "off"
-alert_bell = true        #  before flag notifications
+mouse_capture = "off"   # "off" (default), "on", or "auto" (off unless WROSECODE_MOUSE=1)
+alert_bell = true        #  before flag notifications
 ```
 
-`auto` keeps native wheel scrolling inside VS Code and disables capture on dumb
-terminals; `on` forces capture everywhere except `dumb`, `off` disables it
-everywhere. The mouse is only used for the separator drag, so turning it off
-costs nothing but that gesture.
+The default keeps the terminal's native text selection: drag to select and
+copy with the terminal's own shortcut or menu, with no mouse reporting to
+fight it. Set `mouse_capture = "on"` (or `WROSECODE_MOUSE=1`) only if you
+want click-to-expand cells and wheel scrolling inside the app — every mouse
+gesture already has a keyboard equivalent (`Enter`/`Ctrl+O` to expand,
+`PageUp`/`PageDown`/`Home`/`End` to scroll, arrows + `Enter` in the
+dashboard).
 
 ## Advanced CTF workflow
 
@@ -459,7 +512,9 @@ The `delegate_task` tool can select a different `provider` and `model` for a chi
 
 Attach an MCP stdio server for one run with `--mcp-bin PATH` and repeated `--mcp-arg ARG` flags. `/mcps add` saves additional servers in `~/.wrosecode/mcps.toml`; they reconnect at startup. The same file takes remote servers over the streamable-HTTP transport: give the entry a `url = "https://…/mcp"` instead of a `bin`, plus an optional `[servers.headers]` table for `Authorization` or API keys — `/mcps add` prompts for the URL when you prefer the TUI. The client posts JSON-RPC, keeps the server's `Mcp-Session-Id`, and accepts either a JSON body or an SSE stream for replies. Tools are exposed to the model as `mcp__SERVER__TOOL`.
 
-Release installers are `install.sh` and `install.ps1`. Set `WROSECODE_RELEASE_BASE` to the URL of your published binary assets before using them; no release host is configured in this source tree.
+The standalone `install.sh` and `install.ps1` scripts accept
+`WROSECODE_RELEASE_BASE`; npm users do not need to set it because the npm
+installer derives the versioned GitHub Release URL from package metadata.
 
 ## Configuration
 

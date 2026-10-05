@@ -138,7 +138,8 @@ impl Renderer {
 
 /// How the current terminal wants to be driven. Each field can be forced off with
 /// an environment variable so a broken terminal never needs a code change:
-/// `WROSECODE_NO_ALT_SCREEN`, `WROSECODE_NO_MOUSE`, `WROSECODE_FULL_REDRAW`.
+/// `WROSECODE_NO_ALT_SCREEN`, `WROSECODE_MOUSE=1` (opt into mouse reporting),
+/// `WROSECODE_FULL_REDRAW`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalProfile {
     pub alternate: bool,
@@ -161,6 +162,9 @@ pub struct TerminalEnv {
     pub force_no_color: bool,
     /// `COLORTERM` — `truecolor`/`24bit` advertises 24-bit colour.
     pub colorterm: String,
+    /// `WROSECODE_MOUSE=1` opts into mouse reporting when `mouse_capture`
+    /// is `"auto"`.
+    pub force_mouse: bool,
 }
 
 impl TerminalEnv {
@@ -178,6 +182,7 @@ impl TerminalEnv {
             force_full_redraw: std::env::var_os("WROSECODE_FULL_REDRAW").is_some(),
             force_no_color: std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
             colorterm: std::env::var("COLORTERM").unwrap_or_default(),
+            force_mouse: std::env::var("WROSECODE_MOUSE").is_ok_and(|value| value == "1"),
         }
     }
 }
@@ -195,15 +200,18 @@ impl TerminalProfile {
         Self::decide(configured_alternate, mouse_capture, &env)
     }
 
-    /// Pure decision function. `mouse_capture` of `None` means `"auto"`.
+    /// Pure decision function. `mouse_capture` of `None` means `"auto"`,
+    /// which keeps native terminal text selection: mouse reporting stays
+    /// off unless explicitly enabled, so drag-to-select and the terminal's
+    /// own copy shortcut keep working. Opt in with `"on"` (or
+    /// `WROSECODE_MOUSE=1`) for click-to-expand and wheel handling; every
+    /// mouse action already has a keyboard equivalent.
     pub fn decide(
         configured_alternate: bool,
         mouse_capture: Option<&str>,
         env: &TerminalEnv,
     ) -> Self {
         let dumb = env.term.is_empty() || env.term == "dumb";
-        // VS Code reserves the wheel for its own scrollback, so mouse capture
-        // fights the user; keep the terminal's native selection instead.
         let mouse = match mouse_capture
             .unwrap_or("auto")
             .to_ascii_lowercase()
@@ -211,7 +219,7 @@ impl TerminalProfile {
         {
             "on" | "true" | "yes" | "1" => !dumb,
             "off" | "false" | "no" | "0" => false,
-            _ => !dumb && !env.vscode,
+            _ => env.force_mouse,
         };
         let alternate = configured_alternate && !dumb && !env.no_alt_screen;
         // Multiplexers that composite their own cell grid keep stale glyphs unless
@@ -365,47 +373,6 @@ const PLAIN_THEME: Theme = Theme {
     background: Color::Reset,
 };
 
-/// The project root's git branch, with a trailing `*` when tracked files are
-/// dirty. `None` outside a repository (or when git is not installed).
-fn git_state(root: &std::path::Path) -> Option<String> {
-    let branch = git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .or_else(|| git_stdout(root, &["symbolic-ref", "--short", "HEAD"]))?;
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return None;
-    }
-    // `diff-index` skips untracked files, which keeps this fast on big trees.
-    let dirty = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["diff-index", "--quiet", "HEAD", "--"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| !status.success())
-        .unwrap_or(false);
-    Some(if dirty {
-        format!("{branch}*")
-    } else {
-        branch.to_string()
-    })
-}
-
-fn git_stdout(root: &std::path::Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
 /// One-line provider health for the splash: `3 connected · 2 need setup`.
 fn provider_health_line() -> String {
     let Ok(settings) = Settings::load() else {
@@ -424,21 +391,6 @@ fn provider_health_line() -> String {
         }
     }
     format!("{connected} connected · {setup} need setup")
-}
-
-/// The last three saved sessions (newest first) for the splash's resume rows.
-fn recent_sessions() -> Vec<(String, String)> {
-    Session::dir()
-        .ok()
-        .and_then(|dir| Session::list(&dir).ok())
-        .map(|sessions| {
-            sessions
-                .into_iter()
-                .take(3)
-                .map(|session| (session.name, session.summary))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Owns the raw-mode / alternate-screen / mouse capture state for the whole
@@ -511,6 +463,8 @@ struct Ui {
     entries: Vec<Entry>,
     input: String,
     cursor: usize,
+    /// First wrapped input row shown in the editor viewport.
+    input_scroll: usize,
     history: Vec<String>,
     history_index: Option<usize>,
     scroll: usize,
@@ -604,19 +558,10 @@ struct Ui {
     colors: ColorSupport,
     /// `NO_COLOR` / `--no-color`: paint every row with the plain theme.
     no_color: bool,
-    /// Current git branch of the project root, with a `*` when tracked files
-    /// are dirty. `None` outside a git repository.
-    git: Option<String>,
-    /// Connected MCP servers.
-    mcp_count: usize,
-    /// Discovered skills.
-    skill_count: usize,
     /// Sandbox engine name (`none`, `docker`, …).
     sandbox: String,
     /// One-line provider health, e.g. `3 connected · 2 need setup`.
     provider_health: String,
-    /// The last three saved sessions, newest first: (id, summary).
-    recent: Vec<(String, String)>,
     /// Index into [`TIPS`] for the rotating splash tip row.
     tip_index: usize,
     /// Tool calls in the current turn — the status bar's `step n`.
@@ -856,12 +801,8 @@ struct UiMeta {
     theme: usize,
     timeout_seconds: u64,
     budget_usd: f64,
-    git: Option<String>,
-    mcp_count: usize,
-    skill_count: usize,
     sandbox: String,
     provider_health: String,
-    recent: Vec<(String, String)>,
 }
 
 impl From<&Agent> for UiMeta {
@@ -879,12 +820,8 @@ impl From<&Agent> for UiMeta {
             theme: theme_index(&agent.config.ui_theme),
             timeout_seconds: agent.config.shell_timeout_seconds,
             budget_usd: agent.config.budget_usd,
-            git: git_state(std::path::Path::new(&agent.config.root)),
-            mcp_count: agent.tools.mcps.len(),
-            skill_count: agent.skills.len(),
             sandbox: agent.config.sandbox.engine.clone(),
             provider_health: provider_health_line(),
-            recent: recent_sessions(),
         }
     }
 }
@@ -905,12 +842,8 @@ impl UiMeta {
             theme: 0,
             timeout_seconds: 30,
             budget_usd: 0.0,
-            git: None,
-            mcp_count: 0,
-            skill_count: 0,
             sandbox: "none".into(),
             provider_health: "0 connected · 0 need setup".into(),
-            recent: Vec::new(),
         }
     }
 }
@@ -938,6 +871,7 @@ impl Ui {
             }],
             input: String::new(),
             cursor: 0,
+            input_scroll: 0,
             history: Vec::new(),
             history_index: None,
             completion: None,
@@ -1001,12 +935,8 @@ impl Ui {
             paste_chip: None,
             colors: ColorSupport::None,
             no_color: false,
-            git: meta.git,
-            mcp_count: meta.mcp_count,
-            skill_count: meta.skill_count,
             sandbox: meta.sandbox,
             provider_health: meta.provider_health,
-            recent: meta.recent,
             tip_index: 0,
             turn_steps: 0,
             tool_cells: HashMap::new(),
@@ -1203,11 +1133,11 @@ impl Ui {
         let flags_delta = self.flags_found.saturating_sub(base.flags);
         let errors_delta = self.error_count.saturating_sub(base.errors);
         let status = if self.verified {
-            "✔ verified"
+            Some("✔ verified")
         } else if errors_delta > 0 {
-            "✗ failed"
+            Some("✗ failed")
         } else {
-            "⚠ unverified"
+            None
         };
         let answer = self
             .entries
@@ -1246,8 +1176,11 @@ impl Ui {
         } else {
             None
         };
+        let status_line = status
+            .map(|status| format!(" {status}\n"))
+            .unwrap_or_default();
         let mut text = format!(
-            " {status}\n answer: {answer}\n proof: {proof}\n time {} (model {} · tools {} · wait {})\n steps {step_count}{step_lines} · tokens {} ({hit}% cache) · cost {} · saved ~{} tok",
+            "{status_line} answer: {answer}\n proof: {proof}\n time {} (model {} · tools {} · wait {})\n steps {step_count}{step_lines} · tokens {} ({hit}% cache) · cost {} · saved ~{} tok",
             secs_text(wall),
             secs_text(model),
             secs_text(tools),
@@ -1268,7 +1201,10 @@ impl Ui {
         if flags_delta > 0 {
             text.push_str(&format!("\n flags found {flags_delta}"));
         }
-        let header = format!("── RESULT ─ {status} ──────────────");
+        let header = match status {
+            Some(status) => format!("── RESULT ─ {status} ──────────────"),
+            None => "── RESULT ─────────────────────────".into(),
+        };
         self.push(Speaker::System, format!("{header}\n{text}"));
     }
 
@@ -1376,6 +1312,7 @@ impl Ui {
                 .map(|ch| self.cursor + ch.len_utf8())
                 .unwrap_or(self.cursor);
             self.input.replace_range(self.cursor..end, "");
+            self.history_index = None;
         }
     }
 
@@ -1415,6 +1352,7 @@ impl Ui {
     fn insert_str(&mut self, text: &str) {
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.history_index = None;
     }
 
     /// Append to prompt history: consecutive duplicates are dropped and the
@@ -1457,12 +1395,6 @@ impl Ui {
         self.scroll_end();
     }
 
-    /// Rows the prompt box occupies: one for a single line, growing with the
-    /// draft up to four, then scrolling like the transcript (spec 1.2).
-    fn input_rows(&self) -> usize {
-        self.input.split('\n').count().clamp(1, 4)
-    }
-
     /// Bracketed paste (spec 1.2): a short paste types through, a long one
     /// becomes an expandable chip so large pastes never replay per key.
     fn accept_paste(&mut self, text: &str) {
@@ -1470,7 +1402,8 @@ impl Ui {
         let lines = normalized.lines().count().max(1);
         if lines >= 4 || normalized.len() >= 200 {
             self.paste_chip = Some((normalized, lines));
-            self.status = format!("[Pasted {lines} lines]  ⏎ insert  ·  Esc discard");
+            self.status =
+                format!("[Pasted {lines} lines]  Enter insert · Enter again send · Esc discard");
         } else {
             for ch in normalized.chars() {
                 self.insert(ch);
@@ -2208,15 +2141,15 @@ impl Ui {
         if self.dashboard {
             return self.compose_dashboard(width, height, colors);
         }
-        let show_logo = self.entries.len() <= 1 && self.input.is_empty() && !self.busy;
+        let show_logo = self.entries.len() <= 1
+            && self.input.is_empty()
+            && !self.busy
+            && self.tool_cells.is_empty()
+            && self.finished_children == 0;
         let show_alert = !self.last_flag.is_empty();
         let mut body_start = 0usize;
         if show_logo {
             let spin = SPINNER[self.spinner % SPINNER.len()];
-            let paint_note = match splash::first_paint_ms() {
-                Some(ms) => format!(" · paint {ms}ms"),
-                None => String::new(),
-            };
             // Narrow terminals get a one-line wordmark instead of the block art.
             let (lines, wide) = if width_usize < 80 {
                 (
@@ -2231,21 +2164,8 @@ impl Ui {
                     break;
                 }
                 let tail = match (wide, index) {
-                    (false, 0) => format!(
-                        "  {spin}  session {} · [{}] · {}{paint_note}",
-                        self.session_id,
-                        self.category,
-                        speed_tier(self.thinking_level)
-                    ),
-                    (true, 0) => format!(
-                        "  {spin}  session {} · [{}]{paint_note}",
-                        self.session_id, self.category
-                    ),
-                    (true, 2) => format!(
-                        "  WROSECODE v{} · {}",
-                        env!("CARGO_PKG_VERSION"),
-                        speed_tier(self.thinking_level)
-                    ),
+                    (false, 0) => String::new(),
+                    (true, 2) => format!("  WROSECODE v{}", env!("CARGO_PKG_VERSION")),
                     _ => String::new(),
                 };
                 let text = clip(&format!("{line}{tail}"), width_usize);
@@ -2254,22 +2174,14 @@ impl Ui {
                 frame[body_start] = row;
                 body_start += 1;
             }
-            // Compact info panel beneath the wordmark: provider/model ·
-            // thinking · sandbox · approval · cwd, then mode/harness and the
-            // git, MCP, and skill counts.
+            if body_start < height_usize && height_usize >= 16 {
+                frame[body_start] = Row::new("", colors.muted);
+                body_start += 1;
+            }
             if body_start < height_usize {
                 frame[body_start] = Row::new(
                     clip(
-                        &format!(
-                            " {} / {} · think {} · {} · sandbox {} · {} · {}",
-                            self.provider,
-                            self.model,
-                            self.think_label(),
-                            level_resources(self.thinking_level),
-                            self.sandbox,
-                            self.permission,
-                            self.root
-                        ),
+                        &format!("  model    {} / {}", self.provider, self.model),
                         width_usize,
                     ),
                     colors.muted,
@@ -2277,67 +2189,29 @@ impl Ui {
                 body_start += 1;
             }
             if body_start < height_usize {
-                let git = match &self.git {
-                    Some(branch) => format!(" · git {branch}"),
-                    None => String::new(),
-                };
                 frame[body_start] = Row::new(
-                    clip(
-                        &format!(
-                            " {} · {} · [{}]{} · {} mcp · {} skills",
-                            self.mode,
-                            self.harness,
-                            self.category,
-                            git,
-                            self.mcp_count,
-                            self.skill_count
-                        ),
-                        width_usize,
-                    ),
+                    clip(&format!("  project  {}", self.root), width_usize),
                     colors.muted,
                 );
                 body_start += 1;
             }
-            // Provider health with the hint to open /providers.
             if body_start < height_usize {
                 frame[body_start] = Row::new(
                     clip(
-                        &format!(" {} · /providers", self.provider_health),
+                        &format!("  status   {}", startup_connection(&self.provider_health)),
                         width_usize,
                     ),
                     colors.status,
                 );
                 body_start += 1;
             }
-            // Rotating tips row.
             if body_start < height_usize {
                 frame[body_start] = Row::new(
                     clip(
-                        &format!(" tip · {}", TIPS[self.tip_index % TIPS.len()]),
+                        &format!("  {spin} ready   type a request below"),
                         width_usize,
                     ),
                     colors.accent,
-                );
-                body_start += 1;
-            }
-            // Recent sessions with the resume shortcut, then the CTF hint.
-            for (name, summary) in &self.recent {
-                if body_start >= height_usize {
-                    break;
-                }
-                frame[body_start] = Row::new(
-                    clip(&format!("  resume {name}  ·  {summary}"), width_usize),
-                    colors.muted,
-                );
-                body_start += 1;
-            }
-            if body_start < height_usize {
-                frame[body_start] = Row::new(
-                    clip(
-                        "  ctf  wrosecode ctf <file|dir|url>  ·  or /ctf here",
-                        width_usize,
-                    ),
-                    colors.status,
                 );
                 body_start += 1;
             }
@@ -2381,23 +2255,111 @@ impl Ui {
             );
             body_start += 1;
         }
-        // The prompt box grows with the draft (up to four rows) and a large
-        // paste parks a chip above it; the body shrinks by exactly that much
-        // so the status line, separator and prompt stay glued to the bottom.
-        let input_rows = self.input_rows();
+        // The prompt panel keeps a visible minimum footprint even when the
+        // draft is empty; multiline input then grows inside that bottom panel.
+        let input_width = width_usize.saturating_sub(5).max(1);
+        let input_visual_lines = wrap_input(&self.input, input_width);
+        let input_rows = input_visual_lines.len().max(1);
         let chip_rows = usize::from(self.paste_chip.is_some());
-        let body_end = height_usize.saturating_sub(2 + input_rows + chip_rows);
+        let min_input_rows = if height_usize >= 10 { 3 } else { 1 };
+        // Leave the transcript/status area at least one row, and cap the
+        // editor at eight rows on tall terminals. Short terminals shrink it
+        // to the space actually available instead of painting over output.
+        let input_capacity = height_usize
+            .saturating_sub(body_start + 4 + chip_rows)
+            .min(8)
+            .max(1);
+        let visible_input_rows = input_rows.max(min_input_rows).min(input_capacity);
+        let (cursor_row, _) = input_cursor_position(&input_visual_lines, self.cursor);
+        let max_input_scroll = input_rows.saturating_sub(visible_input_rows);
+        self.input_scroll = self.input_scroll.min(max_input_scroll);
+        if cursor_row < self.input_scroll {
+            self.input_scroll = cursor_row;
+        } else if cursor_row >= self.input_scroll + visible_input_rows {
+            self.input_scroll = cursor_row + 1 - visible_input_rows;
+        }
+        let body_end = height_usize.saturating_sub(2 + visible_input_rows + chip_rows);
         let body_height = body_end.saturating_sub(body_start);
+        if show_logo {
+            self.view = TranscriptView {
+                body_start,
+                transcript_start: 0,
+                height: 0,
+            };
+            self.top_entry = None;
+            self.max_scroll = 0;
+            self.scroll = 0;
+            self.page_size = body_height.max(1);
+        }
         // The transcript owns the full terminal width. Token, latency and
         // cost counters stay internal (status line, `/stats`, `live.json`)
         // instead of occupying permanent screen real estate.
         let left_width = width_usize;
-        let top_height = body_height.saturating_mul(2).checked_div(3).unwrap_or(0);
-        let bottom_height = body_height.saturating_sub(top_height);
+        // The tree pane takes only its natural height (capped), so the
+        // transcript flexes to fill every remaining body row instead of
+        // splitting the body into fixed fractions.
+        let mut running: Vec<&ToolCell> = if show_logo {
+            Vec::new()
+        } else {
+            self.tool_cells
+                .values()
+                .filter(|cell| cell.running)
+                .collect()
+        };
+        running.sort_by_key(|cell| cell.row);
+        // Header + root line + one footer line are reserved; the rest is the
+        // capped running window.
+        let slots = max_tree_height(body_height).saturating_sub(3);
+        let hidden = running.len().saturating_sub(slots);
+        let filled = self.spinner % 6 + 1;
+        let footer = if hidden > 0 {
+            format!(" +{hidden} more running")
+        } else if self.finished_children > 0 {
+            format!(
+                " ✓ {} subagents done · {}",
+                self.finished_children,
+                format_duration_ms(self.finished_ms.min(u64::MAX as u128) as u64)
+            )
+        } else {
+            String::new()
+        };
+        let mut tree_lines: Vec<String> = Vec::new();
+        if !running.is_empty() || !footer.is_empty() {
+            let running_count = running.len();
+            tree_lines.push(format!(" SUBAGENT TREE  {running_count} running"));
+            tree_lines.push(format!(
+                " root [{}] think {} · {}",
+                self.category,
+                self.think_label(),
+                level_resources(self.thinking_level)
+            ));
+            for cell in running.into_iter().skip(hidden) {
+                tree_lines.push(format!(
+                    " ├─ [{}{}] {}",
+                    "█".repeat(filled),
+                    "░".repeat(7 - filled),
+                    clip(&cell.title, left_width.saturating_sub(16).max(8))
+                ));
+            }
+            if !footer.is_empty() {
+                tree_lines.push(footer);
+            }
+        }
+        let tree_height = tree_lines.len().min(body_height);
+        tree_lines.truncate(tree_height);
+        // One row is the transcript header; every other remaining body row
+        // shows transcript content.
+        let transcript_height = if show_logo {
+            0
+        } else {
+            body_height.saturating_sub(tree_height).saturating_sub(1)
+        };
         // Wrapped rows come from the cache; scrolling reslices instead of
         // re-wrapping, and only the visible window is ever read below.
         let verbose = self.verbosity == "verbose";
-        self.ensure_transcript(left_width, verbose);
+        if !show_logo {
+            self.ensure_transcript(left_width, verbose);
+        }
         let base = self.transcript_lines.len();
         // The live draft only joins the view when the viewport is pinned to
         // the bottom; otherwise its growth would shift a scrolled-up view.
@@ -2413,11 +2375,12 @@ impl Ui {
         } else {
             Vec::new()
         };
-        let transcript_height = top_height.saturating_sub(1);
         let total_lines = base + draft_lines.len();
-        self.max_scroll = total_lines.saturating_sub(transcript_height);
-        self.scroll = self.scroll.min(self.max_scroll);
-        self.page_size = transcript_height.max(1);
+        if !show_logo {
+            self.max_scroll = total_lines.saturating_sub(transcript_height);
+            self.scroll = self.scroll.min(self.max_scroll);
+            self.page_size = transcript_height.max(1);
+        }
         let transcript_end = total_lines.saturating_sub(self.scroll);
         let transcript_start = transcript_end.saturating_sub(transcript_height);
         let mut visible: Vec<&str> = Vec::with_capacity(transcript_height);
@@ -2431,14 +2394,18 @@ impl Ui {
         // Remember where the transcript sits so a click (or Ctrl+O) can map a
         // terminal row back to its entry: line `transcript_start` paints on
         // frame row `body_start + 1`.
-        self.view = TranscriptView {
-            body_start,
-            transcript_start,
-            height: transcript_height,
-        };
-        self.top_entry = self.line_origin.get(transcript_start).copied();
+        if !show_logo {
+            self.view = TranscriptView {
+                body_start,
+                transcript_start,
+                height: transcript_height,
+            };
+            self.top_entry = self.line_origin.get(transcript_start).copied();
+        }
 
-        for row in 0..top_height {
+        // Header row plus every transcript content row that fits; the tree
+        // lines painted below start exactly where these end.
+        for row in 0..transcript_height.saturating_add(1) {
             let line = if row == 0 {
                 format!(
                     " TRANSCRIPT  {} {}{}",
@@ -2456,65 +2423,29 @@ impl Ui {
                     .map(|line| (*line).to_string())
                     .unwrap_or_default()
             };
-            frame[body_start + row] = Row::new(clip(&line, left_width), colors.text);
-        }
-        // The subagent tree shows only in-flight work, newest last, capped
-        // to the pane so it can never shove the transcript out of view.
-        // Finished subagents collapse to a single summary line.
-        let mut running: Vec<&ToolCell> = self
-            .tool_cells
-            .values()
-            .filter(|cell| cell.running)
-            .collect();
-        running.sort_by_key(|cell| cell.row);
-        // Header + root line + one footer line are reserved; the rest is the
-        // capped running window.
-        let slots = bottom_height.saturating_sub(3);
-        let hidden = running.len().saturating_sub(slots);
-        // Oldest at the top of the window, newest at the bottom: a
-        // scrolling view over the in-flight list.
-        let shown: Vec<&ToolCell> = running.into_iter().skip(hidden).collect();
-        let filled = self.spinner % 6 + 1;
-        let footer = if hidden > 0 {
-            format!(" +{hidden} more running")
-        } else if self.finished_children > 0 {
-            format!(
-                " ✓ {} subagents done · {}",
-                self.finished_children,
-                format_duration_ms(self.finished_ms.min(u64::MAX as u128) as u64)
-            )
-        } else {
-            String::new()
-        };
-        for row in 0..bottom_height {
-            let line = if row == 0 {
-                let running_count = self.tool_cells.values().filter(|cell| cell.running).count();
-                format!(" SUBAGENT TREE  {running_count} running")
-            } else if row == 1 {
-                format!(
-                    " root [{}] think {} · {}",
-                    self.category,
-                    self.think_label(),
-                    level_resources(self.thinking_level)
-                )
-            } else if row == bottom_height.saturating_sub(1) && !footer.is_empty() {
-                footer.clone()
+            let mut painted = Row::new(clip(&line, left_width), colors.text);
+            if row == 0 {
+                painted.fg = colors.accent;
+                painted.bg = transcript_panel_bg(colors);
+            } else if let Some(entry_index) = self.line_origin.get(transcript_start + row - 1) {
+                let entry = &self.entries[*entry_index];
+                let (fg, bg) = transcript_style(entry, colors);
+                painted.fg = fg;
+                painted.bg = bg;
             } else {
-                shown
-                    .get(row - 2)
-                    .map(|cell| {
-                        format!(
-                            " ├─ [{}{}] {}",
-                            "█".repeat(filled),
-                            "░".repeat(7 - filled),
-                            clip(&cell.title, left_width.saturating_sub(16).max(8))
-                        )
-                    })
-                    .unwrap_or_default()
-            };
-            let target = body_start + top_height + row;
+                painted.bg = transcript_panel_bg(colors);
+            }
+            if !show_logo {
+                frame[body_start + row] = painted;
+            }
+        }
+        // Tree lines were sized above to fit exactly; paint them directly
+        // after the transcript rows.
+        let tree_start = body_start + transcript_height.saturating_add(1);
+        for (offset, line) in tree_lines.iter().enumerate() {
+            let target = tree_start + offset;
             if target < body_end {
-                frame[target] = Row::new(clip(&line, left_width), colors.muted);
+                frame[target] = Row::new(clip(line, left_width), colors.muted);
             }
         }
         let choices: Vec<String> = if self.picker.is_some() {
@@ -2577,7 +2508,15 @@ impl Ui {
         } else {
             format!(" · queued {}", self.pending.len())
         };
-        let status_text = if self.busy {
+        let status_text = if show_logo && !self.busy {
+            format!(
+                " {} Ready · {} / {} · {}",
+                spinner[self.spinner % spinner.len()],
+                self.provider,
+                self.model,
+                startup_connection(&self.provider_health)
+            )
+        } else if self.busy {
             format!(
                 " {} {}{} · session {} · {} · think:{} · tok {}/{} · cache {}% · {}s · step {} · {}/{} · {} · {}w · cost {} · timeout {}s · tools {}:{}",
                 spinner[self.spinner % spinner.len()],
@@ -2628,77 +2567,93 @@ impl Ui {
             )
         };
         if status_row < height_usize {
-            frame[status_row] = Row::new(clip(&status_text, width_usize), colors.status);
+            let mut status = Row::new(clip(&status_text, width_usize), colors.status);
+            status.bg = if self.busy {
+                activity_bg(colors)
+            } else {
+                transcript_panel_bg(colors)
+            };
+            frame[status_row] = status;
         }
         let separator_row = status_row.saturating_add(1);
         if separator_row < height_usize {
-            frame[separator_row] = Row::new("─".repeat(width_usize), colors.muted);
+            // Top edge of the input box; the draft rows below hang a `│ `
+            // gutter off it.
+            let edge = if show_logo && width_usize >= 24 {
+                let label = " prompt ";
+                format!(
+                    "┌{}{}",
+                    label,
+                    "─".repeat(width_usize.saturating_sub(1 + label.chars().count()))
+                )
+            } else {
+                let mut edge = String::from("┌");
+                edge.push_str(&"─".repeat(width_usize.saturating_sub(1)));
+                edge
+            };
+            let mut separator = Row::new(clip(&edge, width_usize), colors.accent);
+            separator.bg = input_panel_bg(colors);
+            frame[separator_row] = separator;
         }
         if let Some((_, pasted_lines)) = &self.paste_chip {
             let chip_row = separator_row.saturating_add(1);
             if chip_row < height_usize {
-                frame[chip_row] = Row::new(
+                let mut chip = Row::new(
                     clip(
-                        &format!(" [Pasted {pasted_lines} lines]  ⏎ insert  ·  Esc discard"),
+                        &format!(
+                            " [Pasted {pasted_lines} lines]  Enter insert · Enter again send · Esc discard"
+                        ),
                         width_usize,
                     ),
                     colors.accent,
                 );
+                chip.bg = input_panel_bg(colors);
+                frame[chip_row] = chip;
             }
         }
-        // The prompt grows with the draft: up to `input_rows` rows are shown,
-        // the window follows the caret so a long draft scrolls inside its box,
-        // and only the first line of the draft keeps the "> " marker.
-        let input_top = height_usize.saturating_sub(input_rows);
-        let input_width = width_usize.saturating_sub(3);
+        // The input box: a top border row with the draft rows bottom-aligned
+        // behind a `│ ` gutter. Empty space stays styled as part of the panel
+        // so the prompt never collapses into a single lonely line.
+        let input_top = height_usize.saturating_sub(visible_input_rows);
+        for row_index in input_top..height_usize {
+            let mut row = Row::new("│", colors.muted);
+            row.bg = input_panel_bg(colors);
+            frame[row_index] = row;
+        }
+        let rendered_input_rows = input_rows.min(visible_input_rows);
+        let input_content_top = input_top + visible_input_rows.saturating_sub(rendered_input_rows);
         let input_color = input_syntax_color(&self.input, colors);
-        let draft_lines: Vec<&str> = self.input.split('\n').collect();
-        let caret_line = self.input[..self.cursor].matches('\n').count();
-        let skip = caret_line.saturating_sub(input_rows.saturating_sub(1));
-        let cursor_in_line = self.input[..self.cursor]
-            .rsplit('\n')
-            .next()
-            .map(str::chars)
-            .map(Iterator::count)
-            .unwrap_or(0);
-        let mut caret_x = 2usize;
-        for (offset, line) in draft_lines.iter().enumerate().skip(skip).take(input_rows) {
-            let row_index = input_top + (offset - skip);
-            if row_index >= height_usize {
-                break;
-            }
-            let prefix = if offset == skip {
-                if skip == 0 {
-                    "> "
-                } else {
-                    "↳ "
-                }
+        let (cursor_row, cursor_column) = input_cursor_position(&input_visual_lines, self.cursor);
+        let mut caret_x = 4usize + cursor_column;
+        for (index, line) in input_visual_lines
+            .iter()
+            .enumerate()
+            .skip(self.input_scroll)
+            .take(visible_input_rows)
+        {
+            let slot = input_content_top - input_top + index - self.input_scroll;
+            let row_index = input_top + slot;
+            let prefix = if line.start == 0 {
+                "│ > "
             } else {
-                "  "
+                "│ ↳ "
             };
-            let line_chars: Vec<char> = line.chars().collect();
-            let visible: String = if offset == caret_line {
-                let start = cursor_in_line.saturating_sub(input_width.saturating_sub(1));
-                caret_x = 2 + cursor_in_line.saturating_sub(start);
-                if self.mask_input {
-                    line_chars
-                        .iter()
-                        .skip(start)
-                        .take(input_width)
-                        .map(|_| '•')
-                        .collect()
-                } else {
-                    line_chars.iter().skip(start).take(input_width).collect()
-                }
-            } else if self.mask_input {
-                line_chars.iter().take(input_width).map(|_| '•').collect()
+            let visible: String = if self.mask_input {
+                line.text.chars().map(|_| '•').collect()
             } else {
-                line_chars.iter().take(input_width).collect()
+                line.text.clone()
             };
-            frame[row_index] = Row::new(
+            let mut input_row = Row::new(
                 clip(&format!("{prefix}{visible}"), width_usize),
                 input_color,
             );
+            input_row.bg = input_panel_bg(colors);
+            if let Some(row) = frame.get_mut(row_index) {
+                *row = input_row;
+            }
+            if index == cursor_row {
+                caret_x = 4 + cursor_column;
+            }
         }
         for row in &mut frame {
             if row.bg == Color::Reset {
@@ -2706,8 +2661,8 @@ impl Ui {
             }
         }
         let x = caret_x.min(width_usize.saturating_sub(1)) as u16;
-        let y = input_top
-            .saturating_add(caret_line.saturating_sub(skip))
+        let y = input_content_top
+            .saturating_add(cursor_row.saturating_sub(self.input_scroll))
             .min(height_usize.saturating_sub(1)) as u16;
         (frame, (x, y))
     }
@@ -2735,11 +2690,13 @@ impl Ui {
     fn insert(&mut self, ch: char) {
         self.input.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
+        self.history_index = None;
     }
     fn backspace(&mut self) {
         if let Some((index, _)) = self.input[..self.cursor].char_indices().last() {
             self.input.remove(index);
             self.cursor = index;
+            self.history_index = None;
         }
     }
     fn move_left(&mut self) {
@@ -2759,17 +2716,136 @@ impl Ui {
     fn set_input(&mut self, text: String) {
         self.input = text;
         self.cursor = self.input.len();
+        self.input_scroll = 0;
     }
     fn take_input(&mut self) -> String {
         let line = std::mem::take(&mut self.input);
         self.cursor = 0;
+        self.input_scroll = 0;
         self.history_index = None;
-        line.trim().to_string()
+        line
     }
+
+    fn line_home(&mut self) {
+        self.cursor = self.input[..self.cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+    }
+
+    fn line_end(&mut self) {
+        self.cursor = self.input[self.cursor..]
+            .find('\n')
+            .map(|index| self.cursor + index)
+            .unwrap_or(self.input.len());
+    }
+
+    fn move_vertical(&mut self, down: bool, terminal_width: usize) -> bool {
+        let rows = wrap_input(&self.input, terminal_width.saturating_sub(5).max(1));
+        let (row, column) = input_cursor_position(&rows, self.cursor);
+        let target = if down {
+            row.checked_add(1).filter(|next| *next < rows.len())
+        } else {
+            row.checked_sub(1)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let target_line = &rows[target];
+        self.cursor = target_line
+            .text
+            .char_indices()
+            .nth(column)
+            .map(|(offset, _)| target_line.start + offset)
+            .unwrap_or(target_line.end);
+        true
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InputVisualLine {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+/// Wrap the editor's source text for display while retaining byte offsets into
+/// the original buffer. Explicit newlines create rows; long logical lines are
+/// split only in this view and are never changed in the submitted prompt.
+fn wrap_input(input: &str, width: usize) -> Vec<InputVisualLine> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut base = 0usize;
+    let logical_lines: Vec<&str> = input.split('\n').collect();
+    for (line_index, line) in logical_lines.iter().enumerate() {
+        let chars: Vec<(usize, char)> = line.char_indices().collect();
+        if chars.is_empty() {
+            rows.push(InputVisualLine {
+                text: String::new(),
+                start: base,
+                end: base,
+            });
+        } else {
+            for chunk in chars.chunks(width) {
+                let start = base + chunk[0].0;
+                let end = base
+                    + chunk
+                        .last()
+                        .map(|(offset, ch)| offset + ch.len_utf8())
+                        .unwrap_or(0);
+                rows.push(InputVisualLine {
+                    text: input[start..end].to_string(),
+                    start,
+                    end,
+                });
+            }
+        }
+        base += line.len();
+        if line_index + 1 < logical_lines.len() {
+            base += 1;
+        }
+    }
+    rows
+}
+
+fn input_cursor_position(rows: &[InputVisualLine], cursor: usize) -> (usize, usize) {
+    let row = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| cursor >= row.start && cursor <= row.end)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    let line = &rows[row];
+    let byte = cursor.clamp(line.start, line.end);
+    (row, line.text[..byte - line.start].chars().count())
 }
 
 fn clip(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
+}
+
+/// Total rows the tree pane may occupy (header + root + running window +
+/// footer). One body row is always reserved for the transcript header
+/// itself, so the tree can never starve the transcript.
+fn max_tree_height(body_height: usize) -> usize {
+    body_height.saturating_sub(1).min(8)
+}
+
+fn startup_connection(provider_health: &str) -> String {
+    if provider_health.contains("unavailable") {
+        return "checking connection".into();
+    }
+    if provider_health.starts_with('0') || provider_health.contains("no providers") {
+        return "setup needed".into();
+    }
+    if let Some((connected, _)) = provider_health.split_once(" connected") {
+        let connected = connected.trim();
+        if connected != "0" {
+            return format!("{connected} connected");
+        }
+    }
+    "ready".into()
 }
 
 /// One transcript entry as rendered rows: label on the first line, indented
@@ -2785,12 +2861,21 @@ fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
     };
     let available = left_width.saturating_sub(9).max(1);
     let mut lines = Vec::new();
-    for (part_index, line) in entry.text.lines().enumerate() {
+    let logical_lines: Vec<&str> = if entry.speaker == Speaker::User {
+        // `lines()` drops a trailing empty line; user text is shown exactly,
+        // including its explicit and final newlines.
+        entry.text.split('\n').collect()
+    } else {
+        entry.text.lines().collect()
+    };
+    for (part_index, line) in logical_lines.into_iter().enumerate() {
         // The first line of a tool cell is the command or task being run:
         // always show all of it, wrapped, so a long command is never cut
         // off mid-text the way silent clipping would.
-        let wrap_first = verbose || (part_index == 0 && entry.speaker == Speaker::Tool);
-        for (wrap_index, part) in if wrap_first {
+        let wrap_line = verbose
+            || entry.speaker == Speaker::User
+            || (part_index == 0 && entry.speaker == Speaker::Tool);
+        for (wrap_index, part) in if wrap_line {
             wrap(line, available)
         } else {
             vec![clip(line, available)]
@@ -2807,6 +2892,95 @@ fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
         }
     }
     lines
+}
+
+/// Keep transcript activity scannable at a glance.  Foreground colours carry
+/// the meaning, while the subtle backgrounds make the input, live work, and
+/// completed output read as separate panels without consuming extra rows.
+fn transcript_style(entry: &Entry, colors: &Theme) -> (Color, Color) {
+    let lower = entry.text.to_ascii_lowercase();
+    match entry.speaker {
+        Speaker::User => (colors.accent, transcript_panel_bg(colors)),
+        Speaker::Agent => (colors.text, transcript_panel_bg(colors)),
+        Speaker::Tool => {
+            let editing = lower.contains("wrote ")
+                || lower.contains("write_file")
+                || lower.contains("edit_file")
+                || lower.contains("apply_patch")
+                || lower.contains("modified ")
+                || lower.contains("created ");
+            if editing {
+                (Color::Green, tool_panel_bg(colors))
+            } else {
+                (Color::Yellow, tool_panel_bg(colors))
+            }
+        }
+        Speaker::System if lower.contains("result") || lower.contains("verified") => {
+            (Color::Green, result_panel_bg(colors))
+        }
+        Speaker::System if lower.contains("thinking") || lower.contains("running") => {
+            (colors.status, activity_bg(colors))
+        }
+        Speaker::System => (colors.muted, transcript_panel_bg(colors)),
+    }
+}
+
+fn input_panel_bg(colors: &Theme) -> Color {
+    if colors.background == Color::Reset {
+        Color::Reset
+    } else if colors.name == "light" {
+        Color::Grey
+    } else {
+        Color::Rgb {
+            r: 18,
+            g: 30,
+            b: 48,
+        }
+    }
+}
+
+fn transcript_panel_bg(colors: &Theme) -> Color {
+    if colors.background == Color::Reset {
+        Color::Reset
+    } else {
+        colors.background
+    }
+}
+
+fn tool_panel_bg(colors: &Theme) -> Color {
+    if colors.background == Color::Reset {
+        Color::Reset
+    } else {
+        Color::Rgb {
+            r: 35,
+            g: 30,
+            b: 18,
+        }
+    }
+}
+
+fn activity_bg(colors: &Theme) -> Color {
+    if colors.background == Color::Reset {
+        Color::Reset
+    } else {
+        Color::Rgb {
+            r: 30,
+            g: 25,
+            b: 42,
+        }
+    }
+}
+
+fn result_panel_bg(colors: &Theme) -> Color {
+    if colors.background == Color::Reset {
+        Color::Reset
+    } else {
+        Color::Rgb {
+            r: 18,
+            g: 38,
+            b: 26,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4399,11 +4573,19 @@ pub async fn run(
                 }
             }
             KeyCode::Delete if ui.cursor == ui.input.len() => ui.backspace(),
-            KeyCode::Delete if ui.cursor < ui.input.len() => {
-                ui.input.remove(ui.cursor);
+            KeyCode::Delete if ui.cursor < ui.input.len() => ui.delete_forward(),
+            KeyCode::Left
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                ui.move_word_left()
             }
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => ui.move_word_left(),
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => ui.move_word_right(),
+            KeyCode::Right
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                ui.move_word_right()
+            }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => ui.move_word_left(),
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => ui.move_word_right(),
             KeyCode::Left => ui.move_left(),
@@ -4412,8 +4594,8 @@ pub async fn run(
             KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_end(),
             KeyCode::Home if ui.input.is_empty() => ui.scroll_home(),
             KeyCode::End if ui.input.is_empty() => ui.scroll_end(),
-            KeyCode::Home => ui.cursor = 0,
-            KeyCode::End => ui.cursor = ui.input.len(),
+            KeyCode::Home => ui.line_home(),
+            KeyCode::End => ui.line_end(),
             KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_up(5),
             KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => ui.scroll_down(5),
             KeyCode::Up if ui.palette => {
@@ -4441,6 +4623,38 @@ pub async fn run(
             KeyCode::Down if ui.input.is_empty() && ui.scroll > 0 => ui.scroll_down(1),
             KeyCode::Up if ui.input.is_empty() && ui.history_index.is_none() => ui.scroll_up(1),
             KeyCode::Down if ui.input.is_empty() && ui.history_index.is_none() => ui.scroll_down(1),
+            KeyCode::Up if !ui.input.is_empty() => {
+                let width = terminal::size()
+                    .map(|(width, _)| width as usize)
+                    .unwrap_or(80);
+                if !ui.move_vertical(false, width)
+                    && !ui.input.contains('\n')
+                    && !ui.history.is_empty()
+                {
+                    let index = ui
+                        .history_index
+                        .unwrap_or(ui.history.len())
+                        .saturating_sub(1);
+                    ui.history_index = Some(index);
+                    ui.set_input(ui.history[index].clone());
+                }
+            }
+            KeyCode::Down if !ui.input.is_empty() => {
+                let width = terminal::size()
+                    .map(|(width, _)| width as usize)
+                    .unwrap_or(80);
+                if !ui.move_vertical(true, width) {
+                    if let Some(index) = ui.history_index {
+                        if index + 1 < ui.history.len() {
+                            ui.history_index = Some(index + 1);
+                            ui.set_input(ui.history[index + 1].clone());
+                        } else {
+                            ui.history_index = None;
+                            ui.set_input(String::new());
+                        }
+                    }
+                }
+            }
             KeyCode::Up => {
                 if !ui.history.is_empty() {
                     let index = ui
@@ -4486,7 +4700,7 @@ pub async fn run(
             KeyCode::Enter => {
                 if let Some((pasted, _)) = ui.paste_chip.take() {
                     ui.insert_str(&pasted);
-                    ui.status = "Pasted into the input".into();
+                    ui.status = "Paste inserted · press Enter again to send".into();
                     continue;
                 }
                 if ui.picker.is_some() {
@@ -4528,12 +4742,13 @@ pub async fn run(
                 ui.push_history(line.clone());
                 save_history(&ui.history);
                 ui.push(Speaker::User, line.clone());
-                if line == "/quit" || line == "/exit" {
+                let command = line.trim();
+                if command == "/quit" || command == "/exit" {
                     break;
                 }
-                if line.starts_with('/') {
+                if command.starts_with('/') {
                     if let Err(error) = run_command(
-                        &line,
+                        command,
                         &mut agent,
                         &mut ui,
                         &mut settings,
@@ -4545,9 +4760,9 @@ pub async fn run(
                     {
                         ui.push(Speaker::System, format!("Error: {error:#}"));
                     }
-                } else if let Some(fact) = line.strip_prefix("#!fact ") {
+                } else if let Some(fact) = command.strip_prefix("#!fact ") {
                     ui.push(Speaker::System, agent.memory.save(fact, true)?);
-                } else if let Some(fact) = line.strip_prefix("#fact ") {
+                } else if let Some(fact) = command.strip_prefix("#fact ") {
                     ui.push(Speaker::System, agent.memory.save(fact, false)?);
                 } else {
                     if !ui.ctf_offered && mentions_ctf(&line) {
@@ -4724,8 +4939,8 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
                     }
                     KeyCode::Backspace if !control => ui.backspace(),
                     KeyCode::Delete => ui.delete_forward(),
-                    KeyCode::Left if alt => ui.move_word_left(),
-                    KeyCode::Right if alt => ui.move_word_right(),
+                    KeyCode::Left if alt || control => ui.move_word_left(),
+                    KeyCode::Right if alt || control => ui.move_word_right(),
                     KeyCode::Left if !control => ui.move_left(),
                     KeyCode::Right if !control => ui.move_right(),
                     KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -4750,8 +4965,20 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
                     }
                     KeyCode::Home if ui.input.is_empty() => ui.scroll_home(),
                     KeyCode::End if ui.input.is_empty() => ui.scroll_end(),
-                    KeyCode::Home => ui.cursor = 0,
-                    KeyCode::End => ui.cursor = ui.input.len(),
+                    KeyCode::Home => ui.line_home(),
+                    KeyCode::End => ui.line_end(),
+                    KeyCode::Up if !ui.input.is_empty() => {
+                        let width = terminal::size()
+                            .map(|(width, _)| width as usize)
+                            .unwrap_or(80);
+                        ui.move_vertical(false, width);
+                    }
+                    KeyCode::Down if !ui.input.is_empty() => {
+                        let width = terminal::size()
+                            .map(|(width, _)| width as usize)
+                            .unwrap_or(80);
+                        ui.move_vertical(true, width);
+                    }
                     KeyCode::Up => ui.scroll_up(1),
                     KeyCode::Down => ui.scroll_down(1),
                     KeyCode::PageUp => ui.scroll_page(false),
@@ -4893,7 +5120,7 @@ async fn restore_session(
     session: &Session,
     agent: &mut Agent,
     ui: &mut Ui,
-    settings: &Settings,
+    settings: &mut Settings,
 ) -> Result<()> {
     if !session.provider_name.is_empty() && !session.model.is_empty() {
         switch_provider(agent, ui, settings, &session.provider_name, &session.model).await?;
@@ -5166,7 +5393,7 @@ fn picker(ui: &mut Ui, title: &str, items: Vec<String>) -> Result<Option<usize>>
 async fn switch_provider(
     agent: &mut Agent,
     ui: &mut Ui,
-    settings: &Settings,
+    settings: &mut Settings,
     name: &str,
     model: &str,
 ) -> Result<()> {
@@ -5182,6 +5409,11 @@ async fn switch_provider(
         model,
         agent.tools.client.clone(),
     )?;
+    // Persist the model selected in the UI so it becomes the default after
+    // restart and replaces the provider's previous default.
+    if !model.trim().is_empty() && profile.model != model {
+        settings.set_default_model(name, model)?;
+    }
     let mut config = (*agent.config).clone();
     config.provider = name.into();
     config.model = model.into();
@@ -7182,11 +7414,16 @@ mod tests {
         );
         assert!(wide[0].contains("38;5;"), "the art is gradient-painted");
         let narrow = splash::paint_lines(79, ColorSupport::Ansi256, None);
-        assert_eq!(narrow.len(), 1, "one line below 80 columns");
+        assert_eq!(narrow.len(), 2, "compact startup below 80 columns");
         assert!(
             strip_sgr(&narrow[0]).contains("WROSECODE v"),
             "the collapsed wordmark keeps the version: {:?}",
             narrow[0]
+        );
+        assert!(
+            narrow[1].contains("starting workspace"),
+            "the compact splash keeps a quiet status row: {:?}",
+            narrow
         );
         let muted = splash::paint_lines(79, ColorSupport::None, Some(3));
         assert!(
@@ -7201,7 +7438,7 @@ mod tests {
     }
 
     #[test]
-    fn info_panel_reports_health_tips_and_ctf() {
+    fn startup_screen_is_minimal_and_prompt_forward() {
         let mut ui = shell();
         let (frame, _) = ui.compose(120, 40);
         let joined = frame
@@ -7210,17 +7447,31 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for needle in [
-            "/providers",
-            "tip ·",
-            "ctf",
-            "sandbox",
-            "think ",
-            "mcp",
-            "skills",
+            "WROSECODE v",
+            "model",
+            "project",
+            "status",
+            "prompt",
+            "│ > ",
         ] {
             assert!(
                 joined.contains(needle),
-                "info panel shows {needle:?}:\n{joined}"
+                "startup screen shows {needle:?}:\n{joined}"
+            );
+        }
+        for clutter in [
+            "TRANSCRIPT",
+            "session",
+            "/providers",
+            "tip ·",
+            "ctf",
+            "mcp",
+            "skills",
+            "resume",
+        ] {
+            assert!(
+                !joined.contains(clutter),
+                "startup screen hides clutter {clutter:?}:\n{joined}"
             );
         }
     }
@@ -7522,8 +7773,8 @@ mod tests {
         let mut ui = shell();
         let (frame, _) = ui.compose(100, 30);
         assert!(
-            frame[0].text.contains("session"),
-            "row 0 is the art plus the session tail: {:?}",
+            !frame[0].text.contains("session"),
+            "startup art should not expose session noise: {:?}",
             frame[0].text
         );
         assert!(
@@ -7692,12 +7943,30 @@ mod tests {
                     row.text
                 );
             }
-            assert_eq!(frame[height - 1].text, "> ", "the prompt owns the last row");
             assert_eq!(
-                frame[height - 2].text,
-                "─".repeat(width),
-                "the divider owns the second-to-last row"
+                frame[height - 1].text,
+                "│ > ",
+                "the prompt owns the last row"
             );
+            let expected_edge = format!("┌{}", "─".repeat(width.saturating_sub(1)));
+            if height >= 10 {
+                assert_eq!(
+                    frame[height - 4].text,
+                    expected_edge,
+                    "normal terminals keep a full input panel"
+                );
+                assert_eq!(
+                    frame[height - 2].text,
+                    "│",
+                    "empty prompt space stays visibly inside the input panel"
+                );
+            } else {
+                assert_eq!(
+                    frame[height - 2].text,
+                    expected_edge,
+                    "tiny terminals keep the compact one-line prompt"
+                );
+            }
             assert!(
                 frame[0].text.starts_with(" WROSECODE"),
                 "row 0 is the slim header: {:?}",
@@ -7705,7 +7974,7 @@ mod tests {
             );
             assert_eq!(
                 cursor,
-                (2, (height - 1) as u16),
+                (4, (height - 1) as u16),
                 "the caret sits in the empty prompt"
             );
 
@@ -7786,7 +8055,7 @@ mod tests {
         ui.status = "Thinking".into();
         ui.pending.push("second request".into());
         let (frame, _) = ui.compose(80, 24);
-        let status = &frame[21].text;
+        let status = &frame[19].text;
         assert!(status.contains("queued 1"), "status: {status}");
     }
 
@@ -7907,17 +8176,17 @@ mod tests {
             "the chip does not touch the draft until Enter"
         );
 
-        // The chip owns a row between the separator and the prompt.
+        // The chip owns a row between the separator and the prompt panel.
         let (frame, _) = ui.compose(100, 30);
         assert!(
-            frame[28].text.contains("[Pasted 300 lines]"),
+            frame[26].text.contains("[Pasted 300 lines]"),
             "chip row: {:?}",
-            frame[28].text
+            frame[26].text
         );
         assert!(
-            frame[26].text.contains("Ready") || frame[26].text.starts_with(' '),
+            frame[24].text.contains("Ready") || frame[24].text.starts_with(' '),
             "the status line shifts up to make room: {:?}",
-            frame[26].text
+            frame[24].text
         );
     }
 
@@ -7925,23 +8194,32 @@ mod tests {
     fn multiline_input_grows_then_scrolls() {
         let mut ui = shell();
         ui.set_input("one".into());
-        assert_eq!(ui.input_rows(), 1);
+        assert_eq!(wrap_input(&ui.input, 95).len(), 1);
 
         ui.set_input("one\ntwo".into());
-        assert_eq!(ui.input_rows(), 2, "the draft grows a row per line");
+        assert_eq!(
+            wrap_input(&ui.input, 95).len(),
+            2,
+            "the draft grows by line"
+        );
         let (frame, (_, y)) = ui.compose(100, 30);
         assert_eq!(y, 29, "the caret sits on the draft's last row");
-        assert!(frame[28].text.starts_with("> one"), "{:?}", frame[28].text);
+        assert!(
+            frame[28].text.starts_with("│ > one"),
+            "{:?}",
+            frame[28].text
+        );
         assert!(frame[29].text.contains("two"), "{:?}", frame[29].text);
 
-        // Ten lines are capped at a four-row box that follows the caret.
+        // Ten lines remain in the source while the eight-row viewport follows
+        // the caret and makes the earlier rows reachable by moving it up.
         let long = (0..10)
             .map(|index| format!("line{index}"))
             .collect::<Vec<_>>()
             .join("\n");
         ui.set_input(long);
         ui.cursor = ui.input.len();
-        assert_eq!(ui.input_rows(), 4, "the box stops growing after four rows");
+        assert_eq!(wrap_input(&ui.input, 95).len(), 10, "all rows are counted");
         let (frame, (_, y)) = ui.compose(100, 30);
         assert_eq!(y, 29, "the caret stays on the bottom row of the box");
         assert!(
@@ -7950,24 +8228,29 @@ mod tests {
             frame[29].text
         );
         assert!(
-            frame[26].text.contains("line6"),
-            "the box starts four rows above the caret: {:?}",
-            frame[26].text
+            frame[22].text.contains("line2"),
+            "the viewport shows the latest rows: {:?}",
+            frame[22].text
         );
         assert!(
-            frame[26].text.starts_with("↳ "),
+            frame[22].text.starts_with("│ ↳ "),
             "a scrolled window marks its first row: {:?}",
-            frame[26].text
+            frame[22].text
+        );
+        assert_eq!(
+            ui.input.split('\n').count(),
+            10,
+            "rendering preserves all input"
         );
 
         // The caret walks up: the window follows it back toward the top.
         ui.cursor = 0;
         let (frame, (_, y)) = ui.compose(100, 30);
-        assert_eq!(y, 26, "caret on the first line of the visible window");
+        assert_eq!(y, 22, "caret on the first visible row");
         assert!(
-            frame[26].text.starts_with("> line0"),
+            frame[22].text.starts_with("│ > line0"),
             "{:?}",
-            frame[26].text
+            frame[22].text
         );
     }
 
@@ -8059,6 +8342,27 @@ mod tests {
         );
         assert!(profile.alternate, "alt screen is fine in VS Code");
         assert!(!profile.mouse, "mouse capture would fight the scroll wheel");
+    }
+
+    #[test]
+    fn mouse_capture_defaults_off_for_native_selection() {
+        // `auto` keeps the terminal's own drag-to-select: mouse reporting
+        // stays off unless explicitly enabled.
+        let profile = TerminalProfile::decide(true, None, &env("xterm-256color"));
+        assert!(
+            !profile.mouse,
+            "auto must not capture the mouse: {profile:?}"
+        );
+        let forced = TerminalProfile::decide(
+            true,
+            None,
+            &TerminalEnv {
+                term: "xterm-256color".into(),
+                force_mouse: true,
+                ..TerminalEnv::default()
+            },
+        );
+        assert!(forced.mouse, "WROSECODE_MOUSE=1 opts back in");
     }
 
     #[test]
@@ -8167,9 +8471,10 @@ mod tests {
     }
 
     #[test]
-    fn logo_is_three_lines() {
-        assert_eq!(LOGO.len(), 3);
-        assert!(LOGO[0].contains("W") || LOGO[0].contains('╦'));
+    fn logo_is_clear_block_wordmark() {
+        assert_eq!(LOGO.len(), 5);
+        assert!(LOGO[0].contains("██╗"));
+        assert!(LOGO[4].contains("███████"));
     }
 
     #[test]
@@ -8406,7 +8711,11 @@ mod tests {
         ui.task_begin();
         ui.push_result_block(&[]);
         let text = &ui.entries.last().expect("a result block was pushed").text;
-        assert!(text.contains("── RESULT ─ ⚠ unverified"), "{text}");
+        assert!(
+            text.starts_with("── RESULT ─────────────────────────"),
+            "{text}"
+        );
+        assert!(!text.contains("unverified"), "{text}");
     }
 
     #[test]

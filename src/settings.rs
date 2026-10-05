@@ -329,6 +329,21 @@ impl Settings {
         self.last_tests.remove(&profile.name);
         Ok(())
     }
+
+    /// Make `model` the persistent default for a provider.
+    ///
+    /// Model selection is a user setting, not just live agent state: the next
+    /// process must start with the model selected in the previous session.
+    /// Reusing `upsert_provider` keeps credentials, headers, thinking options,
+    /// and the provider's other settings intact.
+    pub fn set_default_model(&mut self, name: &str, model: &str) -> Result<()> {
+        let mut profile = self
+            .profile(name)
+            .cloned()
+            .with_context(|| format!("unknown provider: {name}"))?;
+        profile.model = model.trim().to_string();
+        self.upsert_provider(profile)
+    }
     pub fn remove_provider(&mut self, name: &str) -> Result<()> {
         // Even built-in defaults (including `anthropic`) are removable: the
         // catalogue is user data, and the startup path falls back to another
@@ -755,6 +770,24 @@ mod tests {
         assert!(settings.remove_provider("nope").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn selected_model_persists_as_provider_default() {
+        let dir = std::env::temp_dir().join(format!("wrose-model-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut settings = Settings::load_at(dir.clone()).unwrap();
+        settings
+            .set_default_model("anthropic", "claude-last-used")
+            .unwrap();
+
+        let reloaded = Settings::load_at(dir.clone()).unwrap();
+        assert_eq!(
+            reloaded.profile("anthropic").unwrap().model,
+            "claude-last-used"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn mcps_accept_a_url_endpoint_or_a_binary_but_not_both() {
         let dir = std::env::temp_dir().join(format!("wrose-mcp-{}", std::process::id()));

@@ -1,5 +1,42 @@
 # Build output
 /target
+node_modules/
+**/node_modules/
+
+# Local environment, credentials, and temporary files
+.env
+.env.*
+!.env.example
+.npmrc
+*.pem
+*.key
+*.log
+*.tmp
+*.temp
+*.swp
+*.tgz
+.DS_Store
+MAX_BINARY_BYTES
+coverage/
+dist/
+
+# User-specific WROSECODE state and local configuration
+.wrosecode/
+credentials/
+providers.toml
+config.local.toml
+*.sqlite
+*.sqlite3
+*.db
+npm/bin/
+
+# Local CTF captures and scratch work (not the checked-in skill corpus)
+*.pcap
+*.pcapng
+ctf-notes.md
+writeups/
+wearransom/
+snake.html
 
 # CTF workspace runtime output (.ctf/README.md stays tracked)
 .ctf/flags.log
