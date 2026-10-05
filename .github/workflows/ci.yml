@@ -1,28 +1,64 @@
 name: CI
+
 on:
   push:
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
+
 jobs:
   test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-        with: {components: rustfmt, clippy}
-      - uses: Swatinem/rust-cache@v2
-      - run: npm ci --ignore-scripts
-      - run: npm run check
-      - run: npm pack --dry-run --json
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-      # Phase 7 speed budgets: release-mode regression gate (src/benchmarks.rs)
-      - run: cargo test --release benchmarks -- --nocapture
-      - run: cargo build --release --locked
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install npm dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate npm package scripts
+        run: npm run check
+
+      - name: Validate npm package contents
+        run: npm pack --dry-run --json
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --all-targets
+
+      - name: Run release benchmark regression tests
+        run: cargo test --release benchmarks -- --nocapture
+
+      - name: Build release binary
+        run: cargo build --release --locked
