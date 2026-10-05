@@ -1,693 +1,596 @@
 # WROSECODE
 
-A terminal coding agent written in Rust. Build with `cargo install --path .` or `cargo build --release`. Run `wrosecode` from a project directory, or `wrosecode 'your task'` for one turn. Set `ANTHROPIC_API_KEY` for the Anthropic provider. For an OpenAI-compatible server, set `WROSECODE_OPENAI_URL` and run `wrosecode --provider openai-compat --model MODEL`.
+<p align="center">
+  <strong>A fast, native AI coding agent for the terminal — built in Rust.</strong>
+</p>
 
-## Install and run
+<p align="center">
+  <a href="https://www.npmjs.com/package/wrosecode"><img src="https://img.shields.io/npm/v/wrosecode?logo=npm&label=npm" alt="npm version"></a>
+  <a href="https://github.com/whiterose717/WROSECODE-CLI"><img src="https://img.shields.io/badge/source-GitHub-181717?logo=github" alt="GitHub"></a>
+  <img src="https://img.shields.io/badge/Rust-native-000000?logo=rust" alt="Rust">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="Platforms">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
+</p>
 
-```bash
-cargo build --release
-install -Dm755 target/release/wrosecode "$HOME/.local/bin/wrosecode"
-wrosecode --permission yolo
-```
+---
 
-For a fully static Linux binary with no glibc dependency, run
-`./scripts/build-musl.sh` (it needs `rustup target add
-x86_64-unknown-linux-musl` and `musl-tools` for `musl-gcc`) and install
-`target/x86_64-unknown-linux-musl/release/wrosecode` instead.
+## Overview
 
-## Install from npm
+**WROSECODE** is a terminal-first AI coding agent written in Rust.
 
-Install globally:
+It combines a responsive full-screen TUI, streamed model responses, repository-aware context, file editing, shell execution, persistent sessions, provider management, MCP support, CTF workflows, automation, and configurable permission modes directly from the terminal.
+
+---
+
+## Installation
+
+### Install from npm
+
+Standard global installation:
 
 ```bash
 npm install -g wrosecode
 ```
 
-Run the CLI:
+Then run:
 
 ```bash
 wrosecode
 ```
 
-Run without a permanent installation:
+Check the installed version:
+
+```bash
+wrosecode --version
+```
+
+### If npm blocks install scripts
+
+WROSECODE currently uses an npm install script to download and verify the correct native binary for your platform.
+
+If npm shows an `install scripts blocked` warning, install with:
+
+```bash
+npm install -g --allow-scripts=wrosecode wrosecode
+```
+
+To permanently allow WROSECODE install scripts for your user account:
+
+```bash
+npm config set allow-scripts=wrosecode --location=user
+```
+
+Then future installs can use:
+
+```bash
+npm install -g wrosecode
+```
+
+### Run without permanent installation
 
 ```bash
 npx wrosecode
 ```
 
-Update:
+### Update
 
 ```bash
-npm install -g wrosecode@latest
+npm install -g --allow-scripts=wrosecode wrosecode@latest
 ```
 
-Uninstall:
+### Uninstall
 
 ```bash
 npm uninstall -g wrosecode
 ```
 
-The npm package is a small launcher; it downloads the matching native binary
-from the [GitHub Releases](https://github.com/whiterose717/WROSECODE-CLI/releases)
-for this package version and verifies the binary against its SHA-256 sidecar
-before installation. Supported targets are Linux x86_64/aarch64, macOS
-x86_64/aarch64, and Windows x86_64/aarch64. Node.js 18 or newer is required
-for the npm installer; Rust and Cargo are not required for npm users.
+---
 
-Source: <https://github.com/whiterose717/WROSECODE-CLI>
+## Quick Start
 
-### Maintainer release process
-
-Push a version-matched tag such as `v1.0.0`. The GitHub Actions release
-workflow builds all six supported native targets, creates a SHA-256 sidecar
-for each binary, validates the full set, then creates or updates the GitHub
-Release. Publish to npm only after that workflow succeeds and all twelve
-assets are visible on the release page.
-
-Rust was chosen for low input latency, predictable memory use, a single native binary, and direct terminal control. The architecture combines a differential TUI, streamed provider adapters, durable sessions, MCP tools, repository maps, skills, permission tiers, and parallel tool execution.
-
-## Quick start
+Start WROSECODE in the current project directory:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...      # or a local server: WROSECODE_OPENAI_URL + --provider openai-compat
-wrosecode                                # interactive session in the current directory
-wrosecode 'inventory the attack surface' # one turn, then exit
-wrosecode --permission yolo              # skip approval prompts (see Permissions)
+wrosecode
 ```
 
-Worth touching in the first session:
+Run a single task:
+
+```bash
+wrosecode "explain this repository and identify the main entry points"
+```
+
+Run with YOLO permissions:
+
+```bash
+wrosecode --permission yolo
+```
+
+Run a task directly with YOLO permissions:
+
+```bash
+wrosecode --permission yolo "fix the failing tests and explain the changes"
+```
+
+---
+
+## Permission Modes
+
+WROSECODE supports multiple permission levels.
+
+| Mode | Behavior |
+|---|---|
+| `ask` | Ask before mutating or risky operations |
+| `auto-safe` | Automatically run safer actions and prompt for riskier actions |
+| `yolo` | Skip most normal approval prompts and allow more autonomous tool execution |
+
+Conservative mode:
+
+```bash
+wrosecode --permission ask
+```
+
+Automatic safe mode:
+
+```bash
+wrosecode --permission auto-safe
+```
+
+YOLO mode:
+
+```bash
+wrosecode --permission yolo
+```
+
+> **Warning:** `--permission yolo` gives WROSECODE significantly more freedom to execute tools and modify files. Use it only in directories and environments where you are comfortable with autonomous changes.
+
+---
+
+## How the npm Package Works
+
+The npm package is a small launcher. During installation it:
+
+1. Detects your operating system and CPU architecture.
+2. Downloads the matching native WROSECODE binary from the corresponding GitHub Release.
+3. Downloads the matching `.sha256` checksum.
+4. Verifies the binary.
+5. Installs the native executable.
+6. Launches it when you run `wrosecode`.
+
+Rust and Cargo are **not required** for npm users.
+
+### Supported Platforms
+
+| Platform | Architecture |
+|---|---|
+| Linux | x86_64 |
+| Linux | aarch64 |
+| macOS | x86_64 |
+| macOS | aarch64 / Apple Silicon |
+| Windows | x86_64 |
+| Windows | aarch64 |
+
+Node.js 18 or newer is required for npm installation.
+
+---
+
+## Core Features
+
+- Native Rust CLI
+- Full-screen terminal UI
+- Streamed AI responses
+- Multiline prompt input
+- Repository-aware context
+- File reading and editing
+- Shell and tool execution
+- Persistent sessions
+- Session resume and fork
+- Prompt history
+- Multiple model/provider backends
+- Thinking levels
+- MCP support
+- Skills
+- Custom commands
+- Custom agents
+- Recipes
+- Headless automation
+- Machine-readable event streams
+- Live dashboard
+- Docker sandbox support
+- CTF workflows
+- CTFd integration
+- SHA-256 verified native releases
+
+---
+
+## Providers
+
+WROSECODE supports built-in and custom providers, including:
+
+- Anthropic
+- OpenAI-compatible APIs
+- Ollama
+- LM Studio
+- Custom OpenAI-compatible gateways
+- Custom Anthropic-compatible gateways
+
+Open the provider manager:
 
 ```text
-/ctf        point the agent at a challenge file, URL, or CTFd task
-/providers  add, key, and health-check models without editing files
-Ctrl+T      cycle thinking levels (off → max)     Ctrl+D   eight-panel dashboard
-/help       every command, every keybinding
-/resume     pick a past session (the start screen lists the three most recent)
+/providers
 ```
 
-Sessions persist under `~/.wrosecode/sessions`; model profiles and keys live
-in `~/.wrosecode/providers.toml` (keys display as `••••last4` and are typed
-through a masked prompt).
-
-## CTF dashboard
-
-The first view is an opencode-style start screen: a large `WROSECODE` wordmark
-with a smooth colour gradient (truecolor where the terminal advertises it, 256
-or 16 colours otherwise, plain text under `NO_COLOR`/`--no-color`), carrying the
-live spinner, the session ID, the challenge category, and the speed tier the
-current thinking level maps to. Under it an info panel shows the provider and
-model, thinking level and resource budget, sandbox and approval modes, working
-directory, mode, harness, git branch, and MCP and skill counts — followed by
-provider health with a `/providers` hint, a rotating tip (`/` commands, `@`
-files, `ctrl+t` thinking, `ctrl+d` dashboard, `ctrl+o` output), the three most
-recent sessions with one-line `resume` suggestions, and a `/ctf` hint. It only
-draws while the transcript is still empty — as soon as you type or a turn
-produces output it folds back into a slim `WROSECODE v…` header so the
-conversation gets the screen. Below 80 columns the block art collapses to a
-single `WROSECODE v…` line.
-
-Example terminal view at 110×36 (session ID and project path anonymized):
-
-```
-╦ ╦╔╗ ╭─╮╔═╗╔═╗╭─╮╭─╮╔═╗╔═╗  ⠇  session ses_<session-id> · [misc] · paint 13ms
-║ ║╠╩╗│ │╠═╝╠═╗│  │ │║ ║╠═╗
-╚═╝╚═╝╰─╯╚═╝╚═╝╰─╯╰─╯╚═╝╚═╝  WROSECODE v1.0.0 · FAST
- anthropic / claude-sonnet-5 · think medium · up to 3 agents · sandbox none · ask · /path/to/project
- BUILD · claude · [misc] · git master* · 0 mcp · 636 skills
- 2 connected · 10 need setup · /providers
- tip · @ files
- ctf  wrosecode ctf <file|dir|url>  ·  or /ctf here
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────
- TRANSCRIPT  1 entry
- INFO  WROSECODE v1.0.0 · session ses_<session-id>
-       Type a request · /help commands · Ctrl+P palette
-       Tab build/plan · [ ] thinking · PgUp/PgDn scroll · /clear
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- Ready · session ses_<session-id> · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 4s · step 0
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────
-│ >
-```
-
-The rows above the rule are the start screen — wordmark, info panel, provider
-health, rotating tip, recent sessions, and the `/ctf` hint — and they are what
-the spinner animates in. The wordmark carries `TURBO` / `FAST` / `SMART` /
-`DEEP` plus the worker count that tier actually allows (1 / 3 / 5 / 10).
-
-The transcript owns the full terminal width: there is no always-on token or
-timeline panel. Token, latency, and cost counters are still tracked
-internally and surface in the status line, in `/stats` on demand, in
-`~/.wrosecode/live.json`, and in the closing `── RESULT ─` receipt. The
-bottom pane shows the subagent tree — only in-flight work, newest last, with
-`+N more running` when it overflows — and finished subagents collapse to one
-`✓ N subagents done` line. The bottom status
-line leads with the run state, session ID, model, and `think:` label (the level name, or
-`auto→medium` while the auto controller drives it), then tokens, cache
-hit rate, elapsed time, tool step, sandbox and approval, speed tier and
-workers, cost, and tool counts — for example
-` Ready · session ses_1791153855-1574184-0 · claude-sonnet-5 · think:medium · tok 0/0 · cache 0% · 4s · step 0 ·
-none/ask · FAST · 3w · cost n/a · tools 0:0`. During a turn it swaps in an
-animated spinner, the queue note, and the live timeout and tool progress. The
-input box below it is an open-bottomed `┌──` / `│ >` frame that grows with
-the draft.
-
-File magic and extensions categorize common web, pwn, crypto, reverse
-engineering, and forensics tasks.
-
-A found flag raises a `🚩 FLAG ALERT` banner under the header and survives until
-the next turn or `/clear`. It also emits a terminal bell (`\x07`, disabled with
-`alert_bell = false`) and a desktop notification when `notify-send` is available,
-so a flag found in a background pane is not missed.
-
-Every model response and tool result is scanned for `flag{...}`, `CTF{...}`, `picoCTF{...}`, and `HTB{...}`. The patterns live in `config.toml` under `[ctf]`; `auto_copy` controls the clipboard copy. New flags are highlighted and appended to `.ctf/flags.log`. Optional CTFd submission is enabled with `auto_submit = true` in `config.toml`, or from the environment:
+List providers:
 
 ```bash
-export WROSECODE_CTFD_AUTO_SUBMIT=1   # overrides config.toml
-export CTFD_URL=https://ctf.example
-export CTFD_TOKEN=your-token
-export CTFD_CHALLENGE_ID=42
+wrosecode providers list
 ```
 
-CTF skills cover recon, web, pwn, crypto, reverse engineering, forensics, stego, OSINT, and network analysis. Independent model tool calls run concurrently; `delegate_task` supports provider and model routing. Identical read-only calls use the in-memory result cache, while file edits invalidate cached results.
+Add a custom provider:
 
-### Keyboard controls
+```bash
+printf '%s\n' "$MY_API_KEY" | wrosecode providers add my-gateway \
+  --base-url https://llm.example.com/v1 \
+  --stdin \
+  --model my-model
+```
+
+Test a provider:
+
+```bash
+wrosecode providers test my-gateway
+```
+
+Use a provider:
+
+```bash
+wrosecode --provider my-gateway "Explain this project"
+```
+
+---
+
+## Thinking Levels
+
+WROSECODE supports:
+
+```text
+off → low → medium → high → max → auto
+```
+
+Cycle thinking levels:
+
+```text
+Ctrl+T
+```
+
+Set one directly:
+
+```bash
+wrosecode --think high
+```
+
+---
+
+## Keyboard Controls
 
 | Key | Action |
-| --- | --- |
-| `↑` / `↓` | Scroll the transcript whenever the input box is empty |
-| `PageUp` / `PageDown` | Move the transcript a full viewport at a time (at the real page size, not a fixed five lines) |
-| `Home` / `End` | Jump to the top or bottom of the transcript when the input is empty; otherwise move the caret |
-| `Ctrl+Home` / `Ctrl+End` | Always jump to the top or bottom of the transcript |
-| `Esc`, then `j` / `k` | Enter navigation mode and scroll with the single keys; `Space`/`b` page down/up |
-| `Shift+Enter` | Insert a newline |
-| `Enter` | Submit the prompt or selected command; during a turn it queues the message for after the reply |
-| `Ctrl+K` | Clear input |
-| `Ctrl+U` | Clear input when there is text, otherwise scroll half a page up |
-| `Ctrl+D` | Delete the character under the caret when there is text; with an empty prompt, open the live eight-panel dashboard (`Esc` or `Ctrl+D` closes it) |
-| `Ctrl+W` | Delete the word before the caret |
-| `Ctrl+A` / `Ctrl+E` | Jump to the start / end of the line |
-| `Alt+←` / `Alt+→` (also `Alt+B` / `Alt+F`) | Jump a word left / right |
-| `Ctrl+L` | Clear the visible transcript and redraw (history and conversation context are kept; `/clear --context` drops the context too) |
-| `Ctrl+T` | Cycle the thinking level (`off` → `low` → `medium` → `high` → `max` → `auto`) |
+|---|---|
+| `Enter` | Submit prompt |
+| `Shift+Enter` | Insert newline |
+| `PageUp` / `PageDown` | Scroll transcript |
+| `Home` / `End` | Move caret or jump through transcript |
+| `Ctrl+T` | Cycle thinking level |
+| `Ctrl+D` | Open/close live dashboard when prompt is empty |
+| `Ctrl+P` | Open command palette |
 | `Ctrl+Shift+C` | Copy latest output |
-| `[` / `]` | Step the thinking level down or up (same cycle as `Ctrl+T`) |
-| `@` at the start of a prompt | Open the file-mention picker (`Mention files`); `Esc` closes it |
-| Bracketed paste | A paste of 4+ lines collapses into `[Pasted N lines]`: `Enter` inserts it, `Esc` discards it |
-| `Tab` | Complete the current word (paths, slash commands, tool names) when the input is not empty; otherwise switch build and plan modes |
-| `Ctrl+C` | With text typed: clear the input. At an empty prompt: arm a ~2s exit window (`press Ctrl+C again to exit`); a second press inside it quits. During a turn it cancels the turn instead of closing the shell (which also arms the exit window, so Ctrl+C, Ctrl+C stops a run and exits) |
-| Mouse wheel | Scroll the transcript (smooth scrolling follows `smooth_scroll_lines`) |
+| `Ctrl+K` | Clear input |
+| `Ctrl+W` | Delete previous word |
+| `Ctrl+A` / `Ctrl+E` | Jump to start/end of line |
+| `Tab` | Complete input or switch build/plan mode |
+| `Ctrl+C` | Cancel current turn, clear input, or exit with confirmation |
 
-While scrolled up, the transcript header shows `· ↓ N new lines  (End to jump)`; each new line arriving is counted there until `End` returns to the bottom. Multi-line drafts grow the input box to four rows and then scroll with the caret. Prompt history (last 500 entries, consecutive duplicates collapsed) persists to `~/.wrosecode/history` and is recalled with `↑`/`↓`.
+---
 
-Shell calls have a 30 second timeout and are terminated if stuck. Panics and turn errors are written to `.ctf/errors.log`; the TUI keeps provider errors visible with a recovery suggestion. One-shot runs print a computed usage report, and `--summary json` emits a machine-readable `TaskComplete` object.
+## Live Dashboard
 
-### Thinking levels
+Open the dashboard:
 
-Six levels decide how much reasoning each provider call spends: `off`, `low`, `medium`, `high`, `max`, and `auto`. `Ctrl+T` cycles them, `[` / `]` step down and up, `/think <level>` sets one directly (bare `/think` prints the current level and the list), and `--think <level>` fixes the startup default. The mode resolves `--think` → the provider profile's `think` key in `~/.wrosecode/providers.toml` (so a model can carry its own default) → `[agent] think` in `config.toml` → the legacy numeric `[agent] thinking_level`. Each concrete level maps to the provider's native control — Anthropic extended-thinking `budget_tokens` (1024 / 2048 / 4096 / 6144 for low / medium / high / max, clamped to 8191) or an OpenAI-style `reasoning_effort` (`low` / `medium` / `high`, with `max` reported as `high`) — and a per-model `think_map` on the profile overrides that with either a string or a token count per level. A provider that rejects the parameter retries once without it, records `think control ignored` in the transcript, and marks the status bar `think:… (ignored)`.
+```text
+Ctrl+D
+```
 
-`auto` is a controller rather than a strength: it starts at `medium`, escalates one concrete level after three consecutive failing steps (the transcript shows `think: medium → high (no progress ×3)`), drops back one level once progress returns, and settles a trivial read/answer task at `low`. The status bar shows it as `auto→high` — mode plus the live level. The dashboard's Thinking panel reports the previous turn's model time and reasoning tokens (`last turn 4.2s · reasoning 1280 tok`).
+or:
 
-## Advanced dashboard and persistence
+```text
+/dashboard
+```
 
-The terminal shows two live panes: the full-width transcript on top and the subagent tree below it (in-flight work only, capped, with finished work collapsed to one line). Clicking a transcript row expands or collapses its tool cell. `Ctrl+T` now cycles the thinking level; for colours `/theme` opens a picker over the palettes — dark, light, solarized, Dracula, Nord, and Mono — and `/theme NAME` applies one directly (`/theme` on an unknown name lists what exists). Your own palettes drop into `~/.wrosecode/themes/*.toml` as five hex colours (`text`, `muted`, `accent`, `status`, `background`, with an optional `name`); a file that fails to parse, has bad hex, or reuses a built-in name is skipped. `NO_COLOR` (any non-empty value) or `--no-color` turns colour off everywhere: the gradient wordmark becomes plain text and every frame renders without colour codes. The shell paints its first frame — gradient wordmark, info panel with provider, thinking, sandbox, approval, git, MCP and skill counts, provider health, a rotating tip, recent sessions, and the `/ctf` hint — before provider setup, skill discovery, MCP reconnects, and session restore, so startup never waits on the network: the measured time is stamped next to the session line (`· paint 9ms`), reported by `/debug` as `First paint`, and must stay inside a 50 ms budget. `Ctrl+P` opens fuzzy command search; `Ctrl+F` and `Ctrl+R` open the flag and prompt pickers with the same filter-as-you-type behaviour. The renderer targets 60 frames per second while writing only changed terminal rows.
+The dashboard includes:
 
-Sessions checkpoint to SQLite WAL every ten seconds at `~/.wrosecode/state.db`, while portable JSON session files remain available. Every session gets a stable `ses_…` ID, shown in the status line and in `/sessions` with a one-line summary and age; resuming restores conversation history, provider, and model. Resume or fork work with:
+- Processes
+- Thinking
+- Timeline
+- Plan
+- Tokens & Cost
+- Files
+- CTF
+- Budget
+
+Outside the TUI:
 
 ```bash
-wrosecode --session SESSION_ID
-wrosecode -s SESSION_ID
-wrosecode --session SESSION_ID --fork
-wrosecode --session SESSION_ID --export-session session.json
-wrosecode --import-session session.json
-```
-
-Token counts, model latency percentiles, cache traffic, and costs come from provider usage. Configure prices in `pricing.toml` or `~/.wrosecode/pricing.toml`. Press `Ctrl+E` or run `/export` to write `metrics.json`, `metrics.csv`, and `latency.csv` (a latency histogram with one row per bucket: `bucket_upper_ms,count`). Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export the same counters to an OTLP HTTP collector. Pass `--trace` to log per-step timings (API latency, tool time, slow renders) as NDJSON to `~/.wrosecode/trace.log`.
-
-Rate-limited provider replies (HTTP 429 / quota errors) are classified separately
-from other failures, counted in the dashboard (`WARN 429s n`), and exported with
-the rest of the metrics.
-
-## Live dashboard and transcript
-
-With an empty prompt, `Ctrl+D` (or `/dashboard`) replaces the split view with
-the live eight-panel dashboard: Processes, Thinking, Timeline, Plan, Tokens &
-Cost, Files, CTF, and Budget. `←`/`→` move between panels, `↑`/`↓` (or
-`j`/`k`) move the selection inside Processes and Files, `Enter` opens the
-focused panel as full output (a selected process shows its live tail, a
-selected file its `git diff`), `Ctrl+C` / `Ctrl+K` send SIGINT / SIGKILL to the
-selected process, and `Esc` / `Ctrl+D` returns to the shell. `/stats` prints
-the same eight panels as plain text.
-
-Captured at 110×36 straight from a real run:
-
-```
- DASHBOARD · BUILD/anthropic/claude-sonnet-5/misc · ready
- ▌PROCESSES ───────────────────────────────────────────│  TOKENS & COST ──────────────────────────────────────
-▌ no tracked processes                                 │  in 0 · out 0 · reason 0
-                                                       │  cache 0% · read 0 · write 0
-                                                       │  tok ·
-                                                       │  cost n/a · saved ~0 tok
-                                                       │
-                                                       │
-                                                       │
-                                                       │
-                                                       │
-                                                       │  FILES ──────────────────────────────────────────────
-                                                       │  +0 -0 · 0 changed
-                                                       │
-  THINKING ────────────────────────────────────────────│
-  level 5/20 medium · FAST · ready · idle              │
-  thinking 0.0s · acting 0.0s · waiting 6.9s           │
-  turns 0 · last turn ·                                │
-  last turn 0.0s · reasoning 0 tok                     │
-  TIMELINE ────────────────────────────────────────────│
-  model 0.0s · tools 0.0s · wait 6.9s · wall 6s        │
-  parallel ×0 · steps 0 · fails 0                      │  CTF ────────────────────────────────────────────────
-  tok ·                                                │  [misc] · tools 0 (0 failed)
-  recent: —                                            │  coverage: 0 files · 0 searches · 0 shells
-  PLAN ────────────────────────────────────────────────│  flags 0
-  no plan yet (update_plan)                            │  checker: unverified
-                                                       │
-                                                       │
-                                                       │
-                                                       │  BUDGET ─────────────────────────────────────────────
-                                                       │  ░░░░░░░░░░ $? / n/a (unlimited)
-                                                       │  steps 0 (no cap)
-                                                       │  wall 6s · flags 0
-                                                       │  errors 0 · status ready
-                                                       │
- ←→ panel · ↑↓/jk select · Enter detail · Ctrl+C/K signal · Esc/Ctrl+D close
-```
-
-Transcript rows are cells rather than raw lines: each tool shows a one-line
-header with its elapsed time and a preview of the first three and last two
-output lines, failed cells auto-expand with their exit code, nested subagent
-calls draw as a `├─` / `└─` tree, and reasoning opens as a dimmed
-`Thinking… 2.1s` cell that freezes into `Thought n.ns` when the model answers.
-Press `Enter` (or `Ctrl+O`) to expand the cell at the top of the viewport;
-explorations group under a collapsed `▸ Explored  3 files · 1 search` line.
-Every finished task ends with a `── RESULT ─ {status}` block: verification
-state, answer, proof, the model/tools/wait time split, steps, tokens, cache
-rate, and cost.
-
-The same dashboard runs outside the TUI:
-
-```bash
-# Attach to a running session: fresh live.json (≤10s) → /v1/status → offline
 wrosecode dashboard
-
-# One plain frame, no ANSI — pipe-friendly
-wrosecode dashboard --once --offline
-
-# Headless run whose final JSON is the dashboard snapshot
-wrosecode exec --json 'enumerate the challenge'
 ```
 
-While idle, a running TUI rewrites `~/.wrosecode/live.json` about once a
-second (schema `wrosecode/live-v1`) — that file is what the attach client
-reads when no web server is up, and `GET /v1/status` serves the identical
-snapshot when the session runs `--web`.
-
-## Terminal compatibility
-
-The TUI decides how much terminal control to take from the environment instead of
-assuming a full xterm:
-
-| Condition | Effect |
-| --- | --- |
-| `TERM` empty or `dumb` | No alternate screen, no mouse capture |
-| VS Code / Cursor integrated terminal (`TERM_PROGRAM=vscode`, `VSCODE_PID`, `VSCODE_CWD`) | Mouse capture stays off so the terminal's native wheel scroll and text selection keep working |
-| Zellij (`ZELLIJ` set) or `WROSECODE_FULL_REDRAW=1` | Every frame repaints fully (multiplexers composite their own grid and keep stale glyphs otherwise) |
-| `WROSECODE_NO_ALT_SCREEN=1` | Run inline instead of switching to the alternate screen |
-| `NO_COLOR` set to a non-empty value, or `--no-color` on the command line | No colour anywhere: the gradient wordmark falls back to plain text and frames emit no colour codes |
-
-`mouse_capture` in `config.toml` opts into mouse handling:
-
-```toml
-[ui]
-mouse_capture = "off"   # "off" (default), "on", or "auto" (off unless WROSECODE_MOUSE=1)
-alert_bell = true        #  before flag notifications
-```
-
-The default keeps the terminal's native text selection: drag to select and
-copy with the terminal's own shortcut or menu, with no mouse reporting to
-fight it. Set `mouse_capture = "on"` (or `WROSECODE_MOUSE=1`) only if you
-want click-to-expand cells and wheel scrolling inside the app — every mouse
-gesture already has a keyboard equivalent (`Enter`/`Ctrl+O` to expand,
-`PageUp`/`PageDown`/`Home`/`End` to scroll, arrows + `Enter` in the
-dashboard).
-
-## Advanced CTF workflow
-
-The detector loads regexes from `config.toml`, checks plain output, ROT13, hexadecimal, and Base64 variants, and uses entropy to select encoded candidates. New flags pass through a checker before optional rate limited CTFd submission. `Ctrl+F` opens flag history and `/writeup` creates a Markdown evidence report.
-While a picker is open, typing fuzzy-filters the list (`pdng` finds
-`flag{padding...}`), `↑`/`↓` move, `Enter` copies the selected flag, and `Esc`
-closes. `Ctrl+R` does the same for prompt history.
-
-Long engagements also need to remember what has *not* been tried yet: `/coverage`
-opens a persistent checklist in `.wrosecode/coverage.json` — add scope items,
-tick them off as they are verified, and the `coverage` tool lets the agent
-update the same list while it works. The file survives sessions, so skipped
-areas stay visible instead of quietly falling out of the engagement.
+Plain output:
 
 ```bash
-# CTFd operations
+wrosecode dashboard --once --offline
+```
+
+Headless JSON:
+
+```bash
+wrosecode exec --json "inspect this repository"
+```
+
+---
+
+## CTF Mode
+
+WROSECODE includes workflows for:
+
+- Web
+- Pwn
+- Crypto
+- Reverse engineering
+- Forensics
+- Steganography
+- OSINT
+- Network analysis
+
+Run:
+
+```bash
+wrosecode ctf challenge.pcap --budget 60
+```
+
+Example:
+
+```bash
+wrosecode ctf chal.txt \
+  --flag-format 'SECRET\{[^}]+\}' \
+  --category forensics
+```
+
+CTFd helpers:
+
+```bash
 wrosecode ctfd list
 wrosecode ctfd scoreboard
 wrosecode ctfd download 42
 wrosecode ctfd submit 42 'flag{answer}'
-wrosecode ctfd verify 42 'flag{answer}'    # exit 0 verified, 2 rejected, 1 inconclusive
-
-# Race the primary model against other configured models
-wrosecode --provider vyce --model deepseek-v4.1 \
-  --race openai:gpt-4o-mini --race ollama:qwen3 \
-  'solve this challenge and verify the flag'
+wrosecode ctfd verify 42 'flag{answer}'
 ```
 
-### CTF autopilot
+---
 
-`wrosecode ctf <file|dir|url|description>` hands the target to an autonomous
-loop (headless; in the TUI it is `/ctf`, and mentioning a flag, CTF, or
-challenge offers it):
+## Sessions
+
+Resume a session:
 
 ```bash
-# Triage → category hypothesis → playbooks → verify, or a loud budget stop
-wrosecode ctf chal.pcap --budget 60
-wrosecode ctf chal.txt --flag-format 'SECRET\{[^}]+\}' --category forensics
-wrosecode ctf https://challenge.example --remote challenge.example:443 --parallel 2
+wrosecode --session SESSION_ID
 ```
 
-Every run starts by printing the allowlist it will work inside
-(`SCOPE files … · hosts …`, `TOOLS installed/missing`, `GUESS <category>`),
-writes `ctf-notes.md` (challenge, scope, triage, assumptions, dead ends —
-dead ends are re-read by the stuck handler so nothing is retried), and loads
-the matching `skills/ctf-*` playbook. Out-of-scope writes are denied with the
-reason handed back to the model instead of executed. Flags are `✔ flag
-verified` only when the value re-derives from an artifact (or a decode chain);
-a model claim alone is `⚠ candidate, unverified`.
-
-The stop condition is never silent: hitting the budget prints
-`BUDGET EXHAUSTED (steps|tokens|seconds)` plus `Tried:` / `Learned:` /
-`Next:`, and every run leaves `writeups/<challenge>.md`. Exit codes are `0`
-verified, `2` unsolved (budget or stop), `1` error.
-
-Project playbooks load from `skills/`, `.ctf/skills/`, and `~/.wrosecode/skills/`. Delegated tasks accept stable `task_id` values and can resume completed results. Thinking levels allocate runtime concurrency as follows: 0–3 uses one worker, 4–7 uses up to three, 8–12 uses up to five, and 13–20 allows the configured swarm limit.
-
-The tool runtime includes MCP, Burp raw request import/export, optional Playwright screenshots, in-memory and Redis result caches, and an optional Qdrant writeup archive. Start the supporting services with `docker compose up -d`.
-
-## Web and automation
+Short form:
 
 ```bash
-# Local REST API and browser dashboard
-wrosecode --provider vyce --model deepseek-v4.1 --web
-
-# Headless automation with machine-readable completion data
-wrosecode --headless --summary json 'analyze the supplied challenge'
+wrosecode -s SESSION_ID
 ```
 
-The web server binds to `127.0.0.1:7878` by default. See `API.md` before exposing it through a reverse proxy.
-
-`--events PATH` (or `--events -` for stdout) writes a framed NDJSON submission stream for embedding clients: a `start` frame with the session and prompt, `step` frames for tool begins/ends, thinking-level changes, plans, flag hits, and usage, `text` frames carrying streamed tokens, and a final `result` frame with the answer, verification status, usage, and model-turn count. Frames are flushed as they happen and the `result` frame is always last, so a host application can drive and render a session without parsing the transcript:
+Fork:
 
 ```bash
-wrosecode --headless --events run.jsonl --summary json 'analyze the supplied challenge'
-jq -r 'select(.type == "text") | .delta' run.jsonl   # live answer stream
+wrosecode --session SESSION_ID --fork
 ```
 
-`src/events.rs` is the formatter; `docs/ref-notes.md` records it against Codex's submission/event protocol.
+Export:
 
-## Shell sandbox
+```bash
+wrosecode --session SESSION_ID --export-session session.json
+```
 
-`[sandbox]` in `config.toml` decides where `shell` calls run:
+Import:
 
-| `engine` | Behaviour |
-| --- | --- |
-| `none` (default) | Run the command on the host, exactly like before. |
-| `docker` | Run it inside a container. The project directory is bind-mounted at `/workspace`, so file edits made by other tools stay visible. |
+```bash
+wrosecode --import-session session.json
+```
+
+---
+
+## MCP
+
+Attach an MCP stdio server:
+
+```bash
+wrosecode --mcp-bin PATH --mcp-arg ARG
+```
+
+Manage saved MCP servers:
+
+```text
+/mcps
+```
+
+---
+
+## Headless & Automation
+
+Run without the full-screen TUI:
+
+```bash
+wrosecode --headless --summary json "analyze this repository"
+```
+
+Write structured events:
+
+```bash
+wrosecode --headless \
+  --events run.jsonl \
+  --summary json \
+  "analyze the supplied challenge"
+```
+
+Start local web/API mode:
+
+```bash
+wrosecode --web
+```
+
+---
+
+## Docker Sandbox
+
+Example `config.toml`:
 
 ```toml
 [sandbox]
 engine = "docker"
 image = "wrosecode-sandbox:latest"
-persistent = true      # one warm container reused across calls (no cold start)
+persistent = true
 name = "wrosecode-sandbox"
 network = "bridge"
 memory = "2g"
 cpus = "2.0"
-auto_build = false     # docker build -f Dockerfile.sandbox when the image is missing
 ```
 
-Build the analysis image once:
+Build:
 
 ```bash
 docker build -f Dockerfile.sandbox -t wrosecode-sandbox:latest .
 ```
 
-`engine = "docker"` never falls back silently: if the docker CLI, the daemon, or
-the image is missing, the tool call fails with a message that tells you which of
-the three to fix. `persistent = true` keeps one `sleep infinity` container alive
-and `docker exec`s into it, so there is no per-call cold start.
+Useful commands:
 
-Whatever the engine, `shell` is resource-boxed: the host path runs the command
-in its own process group, so a timeout or a cancelled turn kills the whole
-group — grandchildren included — stdout and stderr are tail-capped at 256 KiB
-while the command runs so a flooding pipe cannot pin memory, and a background
-daemon cannot hold the result open. The container path adds an in-container
-`timeout -k 5` (skipped automatically on images without coreutils) so killing
-the docker client on timeout cannot strand the workload inside the container.
-
-```bash
-/sandbox        # status: engine, container, image
-/sandbox up     # warm the container now
-/sandbox down   # stop and remove it
+```text
+/sandbox
+/sandbox up
+/sandbox down
 ```
 
-`auto_build = true` runs `docker build -f Dockerfile.sandbox -t <image> .` the
-first time the image is missing, then falls back to `docker pull`.
+---
 
-### Desktop control (opt-in)
+## Build From Source
 
-The `computer` tool drives this machine's desktop with `screenshot`, `click`,
-`type`, `key`, and `scroll`, but it ships disabled — until you opt in, the
-schema is not even advertised to the model. Enable it for one run with
-`--computer`, or permanently with `[tools] computer = true` in `config.toml`.
-Screenshots probe `grim`, `gnome-screenshot`, `scrot`, `import`, and
-`screencapture` in that order; input actions go through `xdotool`. Every call
-is launched as a literal argument vector (never through a shell string),
-screenshot paths are confined to the project root, and approval follows the
-normal mutating-tool policy: `ask` prompts for each call, `auto-safe` and
-`yolo` run it, and plan mode refuses it.
-
-## Run the agent in a container
-
-Build the image that carries `wrosecode` itself plus the challenge toolchain:
+Clone:
 
 ```bash
-docker build -t wrosecode-sandbox .
-docker run --rm -it -v "$PWD:/workspace" \
-  -e ANTHROPIC_API_KEY wrosecode-sandbox --permission yolo
+git clone https://github.com/whiterose717/WROSECODE-CLI.git
+cd WROSECODE-CLI
 ```
 
-With an interactive terminal, `wrosecode` opens a full-screen chat UI showing the conversation, tool activity, status, and a persistent input box. Anthropic text appears as it streams; the OpenAI-compatible backend displays its completed response. The UI redraws only changed lines, renders just the visible slice of a long transcript, and pins itself to the bottom while new output arrives (the header shows `· ↑N lines` when you have scrolled away). Type `/` at the start of the input to open the command palette. Keep typing to filter, use the arrow keys to select, press Enter to run, or Esc to close. `Tab` switches between build and read-only plan modes. Use `PageUp`/`PageDown` to scroll, `Up`/`Down` for prompt history. Messages typed while a turn is running are kept: they are queued and sent after the reply, and `Ctrl+C` during a turn cancels just that turn (a second `Ctrl+C` within ~2s exits). One-shot calls and piped input keep plain text output. The UI displays permission requests and accepts `y` or `n`; `Ctrl+C` there denies the request and stays in the session.
+Build:
 
-The `delegate_task` tool can select a different `provider` and `model` for a child task. Supported provider names are `anthropic`, `openai-compat`, `ollama`, and `lm-studio`.
+```bash
+cargo build --release
+```
 
-Attach an MCP stdio server for one run with `--mcp-bin PATH` and repeated `--mcp-arg ARG` flags. `/mcps add` saves additional servers in `~/.wrosecode/mcps.toml`; they reconnect at startup. The same file takes remote servers over the streamable-HTTP transport: give the entry a `url = "https://…/mcp"` instead of a `bin`, plus an optional `[servers.headers]` table for `Authorization` or API keys — `/mcps add` prompts for the URL when you prefer the TUI. The client posts JSON-RPC, keeps the server's `Mcp-Session-Id`, and accepts either a JSON body or an SSE stream for replies. Tools are exposed to the model as `mcp__SERVER__TOOL`.
+Run:
 
-The standalone `install.sh` and `install.ps1` scripts accept
-`WROSECODE_RELEASE_BASE`; npm users do not need to set it because the npm
-installer derives the versioned GitHub Release URL from package metadata.
+```bash
+./target/release/wrosecode
+```
 
-## Configuration
+Install with Cargo:
 
-`config.toml` in the project root is the single source of truth for the tunables;
-`config.schema.json` describes it for editor validation. Every section and every
-key is optional — a missing file, a missing section, or a typo falls back to the
-built-in defaults rather than failing to start. CLI flags always win.
+```bash
+cargo install --path .
+```
 
-| Section | Purpose |
-| --- | --- |
-| `[ui]` | Theme, verbosity, alternate screen, `mouse_capture`, `alert_bell`, scroll step. |
-| `[agent]` | Thinking mode (`think`), legacy level (`thinking_level`), worker ceiling, shell timeout, retries, permission tier, budget, planner model for `plan` mode (`planner = "provider/model"`), aider-style auto-commit of edited paths (`auto_commit`, default on). |
-| `[ctf]` | Flag regexes, clipboard copy, CTFd auto-submit. |
-| `[cache]` | `memory` or `redis`, plus Redis and Qdrant URLs. |
-| `[sandbox]` | Where `shell` calls run (`none` or `docker`) and the container settings. |
-| `[lsp]` | Language-server diagnostics appended to file edits (`enabled`, `wait_ms`, per-language `commands`). |
-| `[tools]` | Opt-in extra tool surfaces: `computer` enables desktop control (off by default; the `--computer` flag turns it on for one run). |
+---
 
-`cargo test` parses the shipped `config.toml` and asserts every key lands where
-it should, so a section cannot silently stop being read again.
+## Testing
 
-## Tests
+Formatting:
 
 ```bash
 cargo fmt --check
+```
+
+Clippy:
+
+```bash
 cargo clippy --all-targets -- -D warnings
+```
+
+Tests:
+
+```bash
 cargo test --all-targets
-cargo test --release benchmarks -- --nocapture   # speed budgets (also in ./scripts/check.sh and CI)
 ```
 
-Three layers run in that one command:
-
-| Layer | Where | What it proves |
-| --- | --- | --- |
-| Unit | `src/**` modules | Flag detection corpus, metrics/histogram math, terminal profile rules, CTFd verdict classification, config parsing |
-| CLI | `tests/cli.rs` | The argument surface stays documented: `--version`, `--help`, unknown flags, `ctfd verify --help` |
-| End to end | `tests/e2e_headless.rs`, `tests/e2e_ctfd.rs` | A real `wrosecode` process against a local mock OpenAI-compatible server and a mock CTFd: tool round trips, `--summary json` usage numbers, `--until` exit codes, `ctfd verify` retries and exit codes |
-
-The end-to-end tests bind `127.0.0.1` on an ephemeral port, point the child
-process at a temporary `HOME`, and never touch the network or a real provider.
-
-The release-mode budgets in `src/benchmarks.rs` (output shaping, SSE
-draining, repo-map build) fail on regressions; `./scripts/benchmark.sh`
-records test-suite latency and corpus size to `.ctf/reports/benchmark.json`.
-
-## Permissions
-
-`--permission ask` prompts for mutating tool calls. `auto-safe` runs them automatically except risky shell commands. `yolo` removes normal prompts. A destructive shell-command blocklist prompts in every tier. `/plan` changes to read-only mode; `/build` returns to edit mode. The shell blocklist is a convenience guard, not an isolation boundary — for real isolation set `[sandbox] engine = "docker"` below, which moves every `shell` call into a container.
-
-Tool output, web content, and file text are untrusted data: scope and approval checks inspect structured tool-call arguments before dispatch, so result prose cannot change policy, approvals, or scope. Credential-shaped values and configured provider keys are redacted from displayed and persisted copies — transcript cells, streamed text, dashboard processes, events NDJSON, session JSON/SQLite payloads, crash reports, and memory facts — while the live model context keeps full fidelity.
-
-## Skills and memory
-
-Skills are `SKILL.md` files with YAML frontmatter:
-
-```yaml
----
-name: my-skill
-description: What it helps with
-fork: true
-keywords: [kubernetes, kubectl]
----
-Instructions for the agent.
-```
-
-Skills load from bundled `skills/`, project `skills/`, `~/.wrosecode/skills/`, and `--skills DIR`, with later paths overriding names. Skill packages install from a git URL or a directory — `/skills install <url#ref | path>`, or `--install-skill` headless — into `~/.wrosecode/skills/`, versioned in `~/.wrosecode/packages.json`; `/skills list` and `/skills uninstall <pkg>` manage them. `keywords:` (a YAML list or a comma-separated string) makes a skill fire on its own: a short knowledge snippet loads as soon as one of those whole words appears in the prompt, without the skill name being mentioned — the keyword gate sits below the name match, so a prompt naming the skill still wins. Use `#fact text` for project memory and `#!fact text` for personal memory. `/memory` lists saved facts. Matching facts are recalled automatically. Obvious secret patterns are redacted on save.
-
-`/harness minimal|swe|claude` switches prompt style without clearing history. `wrosecode acp` starts a basic ACP stdio agent.
-
-## Your own commands and agents
-
-Markdown files with YAML frontmatter extend the shell without recompiling anything. Commands load from `.wrosecode/commands/*.md` (project) and `~/.wrosecode/commands/` (personal); the project file wins on a name clash:
-
-```markdown
----
-description: Commit and push the branch
-category: Project
----
-Review the working tree, write one imperative commit message, commit, and push $ARGUMENTS.
-```
-
-`/ship the fix` expands `$ARGUMENTS` and runs the body as a normal turn — in the TUI and in `wrosecode --headless '/ship the fix'`. Your commands appear in `/help` and the `Ctrl+P` palette, and typing `/` completes them.
-
-Agents load from `.wrosecode/agents/*.md` and `~/.wrosecode/agents/`:
-
-```markdown
----
-description: Reviews diffs, never edits
-mode: plan
-thinking: deep
----
-Always quote the file and line you are criticising.
-```
-
-`wrosecode --agent reviewer 'review the diff'` activates one for a run; in the TUI it is listed in `/agents`. Its body is injected into every system prompt, `mode:` picks `build`, `plan`, or `general`, and `thinking:` sets the level. `/build`, `/plan`, or `/agents` on a built-in drops the custom agent.
-
-## Recipes
-
-A recipe is a saved multi-step workflow: a YAML (or Markdown) file with parameters and an ordered list of prompt and command steps, in the spirit of goose's recipes. `.wrosecode/recipes/` holds the project's recipes, `~/.wrosecode/recipes/` the personal ones, and the project file wins a name clash.
-
-```yaml
-name: audit
-description: Two-step audit
-version: "1"
-params:
-  target:
-    description: host to audit
-    default: localhost
-steps:
-  - prompt: "Recon {{target}} and list open ports."
-  - command: "echo ports-open-for-{{target}}"
-  - prompt: "Given {{prev}}, write the one-line verdict."
-```
-
-`params` may also be a plain list of required names. `{{key}}` placeholders take the resolved parameter values (defaults fill in, an unknown key is an error), `{{prev}}` is the previous step's output, and `{{steps}}` is the accumulated history — bounded, oldest output dropped first. A Markdown recipe uses frontmatter for `name`/`description`/`params` and its body as a single prompt step.
+Release benchmark regression tests:
 
 ```bash
-wrosecode recipe list
-wrosecode recipe run audit --set target=attackme.local
+cargo test --release benchmarks -- --nocapture
 ```
 
-`recipe run` behaves like any other headless run: it prints the answer, honours `--summary json`, `--goal`, `--until`, `--until-cmd`, `--events`, and exits `2` when the verification flags say the answer was wrong. Prompt steps run as ordinary turns — full tool use, permissions, and steering apply — while command steps are the recipe author's own shell commands, run with the project's shell timeout. In the TUI, `/recipe` opens a picker, asks for each parameter the recipe does not default, and streams every step; `/recipe NAME` skips the picker.
+---
 
-## Slash commands
+## Security
 
-`/help` shows the full command list, generated from the same registry as the palette.
+- Never commit `.env` files, API keys, npm tokens, GitHub tokens, passwords, or private keys.
+- Prefer environment variables, stdin-based secret entry, or built-in credential storage.
+- Use `--permission ask` for conservative workflows.
+- Use Docker sandboxing for stronger shell isolation.
+- Treat repository content, tool output, and web content as untrusted input.
+- Native release binaries are verified using SHA-256 checksums.
 
-| Area | Commands |
-| --- | --- |
-| Agents | `/agents`, `/build`, `/plan`, `/harness`, `/skills` |
-| Providers | `/connect`, `/providers`, `/models`, `/mcps`, `/mcp` |
-| Session | `/new`, `/sessions`, `/resume`, `/fork`, `/history`, `/tree`, `/move`, `/editor`, `/memory`, `/greet`, `/debug`, `/stats`, `/dashboard`, `/verbosity`, `/think`, `/theme`, `/compact`, `/export`, `/help`, `/exit`, `/quit` |
-| Project | `/init`, `/diff`, `/review`, `/commit`, `/issues`, `/rmslop`, `/undo`, `/redo`, `/add`, `/drop`, `/recipe`, `/coverage`, `/flags`, `/writeup`, `/ctf`, `/sandbox` |
+---
 
-`/providers` opens a searchable provider screen with the built-in entries and their connection status. Enter configures or selects a provider; `a` adds, `e` edits, `d` deletes any provider (built-ins included — deleting the active one switches to another configured provider first), and `t` tests a connection. `/connect` opens the custom provider form directly; `/connect openai` offers "Sign in with ChatGPT" (browser loopback or device-code OAuth, tokens stored owner-only at `~/.wrosecode/credentials/openai.json`) next to the plain API-key path. The API key field is masked. `/models` lists models across connected providers and switches to the picked one.
+## MIT License
 
-Provider definitions are saved in `~/.wrosecode/providers.toml` without keys. Keys go to the OS keyring when available, otherwise to `~/.wrosecode/auth.json` with mode `0600`. Environment variables override stored keys. Custom provider keys can use `WROSECODE_NAME_API_KEY` (replace dashes in the name with underscores), or a saved `env:VARIABLE` reference. Custom providers support `openai_compat` and `anthropic` APIs; both support streamed replies and tool calls. Each profile can also set `think` (its default thinking level) and `think_map` (per-level provider values) — see *Thinking levels* above. Providers that need cloud-specific signing or URLs can use an OpenAI-compatible gateway as their base URL.
+WROSECODE is released under the **MIT License**.
 
-The same registry is available without the TUI:
+```text
+MIT License
 
-```bash
-wrosecode providers list
-printf '%s\n' "$MY_API_KEY" | wrosecode providers add my-gateway \
-  --base-url https://llm.example.com/v1 --stdin --model my-model
-wrosecode providers set-key my-gateway --api-key env:MY_API_KEY
-wrosecode providers edit my-gateway --model other-model
-wrosecode providers test my-gateway
-wrosecode --provider my-gateway 'Explain this project'
-wrosecode providers remove my-gateway
+Copyright (c) WROSECODE contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
-OAuth sign-in (ChatGPT-style) is available alongside API keys. It needs a
-client ID from your own OAuth client registration — nothing first-party is
-bundled:
+See [`LICENSE`](LICENSE) for the full license text.
 
-```bash
-wrosecode providers add openai --base-url https://api.openai.com/v1 \
-  --model gpt-5 --oauth --oauth-client-id YOUR_CLIENT_ID
-wrosecode providers add openai --base-url https://api.openai.com/v1 \
-  --model gpt-5 --oauth --device --oauth-client-id YOUR_CLIENT_ID
-```
+---
 
-The browser flow opens the issuer's authorize URL and waits on a short-lived
-`127.0.0.1:1455` callback (paste the redirect URL instead when the browser
-cannot reach this machine); `--device` prints a code to enter at the
-issuer's verification page instead. Tokens land owner-only (`0600`) at
-`~/.wrosecode/credentials/<name>.json`, the profile records
-`auth_method = "oauth"`, and refresh happens automatically before use.
+## Links
 
-Use `--stdin` or `--api-key env:VARIABLE` to keep keys out of shell history. You can add repeated `--header K=V` options for non-secret custom headers.
+- **GitHub:** https://github.com/whiterose717/WROSECODE-CLI
+- **npm:** https://www.npmjs.com/package/wrosecode
+- **Releases:** https://github.com/whiterose717/WROSECODE-CLI/releases
+- **Issues:** https://github.com/whiterose717/WROSECODE-CLI/issues
 
-`/new` archives the current conversation to `~/.wrosecode/sessions/` and begins a new one. Long conversations are summarized automatically before the next request once they pass 180 000 characters of history (`WROSECODE_COMPACT_CHARS` changes the threshold), with the newest request carried through the cut verbatim so the ask you just made can never be summarized away; `/compact` runs that summary immediately and reports how much context it freed. `/sessions` (or `/resume`) resumes a saved conversation, and `/move NAME` renames the current session. `/fork [name]` keeps the current session on disk and continues in a copy of it — both sides share the history up to the fork and diverge from there — and `--session ID --fork` does the same from a headless run. `/fork <n> [name]` (and headless `--fork-at N`) branches from an earlier message instead, keeping only the first n messages; `/history` prints every message with the number `/fork <n>` would branch at, and a partial fork rebuilds its visible transcript to match the shortened context. `/tree` draws the resulting forest, indenting each fork under its parent and marking the session you are in. Every run, headless or not, is written to both the SQLite store (`--session`) and the JSON files under `~/.wrosecode/sessions/` that the pickers list. `/editor` opens `$EDITOR` (default `vi`) on a temporary prompt; saving and exiting submits it.
+---
 
-`/init` creates `.wrosecode/project.toml` and `WROSECODE.md` in the current repository without replacing existing files. `AGENTS.md` files from the repository root up through its parent directories are loaded with `WROSECODE.md` and injected into every system prompt (8 KB per file, 32 KB per chain). `/diff` includes tracked and untracked changes. `/review` asks the model for findings without applying changes. `/commit` shows the diff, proposes a message, allows edits, and requires an explicit confirmation before staging and committing. `/issues` reads open GitHub or GitLab issues from the `origin` remote; private repositories can use `GITHUB_TOKEN` or `GITLAB_TOKEN`. `/rmslop` lists untracked scratch files and empty directories created by this session's file tool, then requires confirmation before deleting them. Every batch of `write_file`, `edit_file`, and `apply_patch` calls first captures the pre-edit bytes of exactly those paths under `.wrosecode/snapshots/undo/`; `/undo` restores the newest snapshot (removing files the edit created) and keeps the replaced tree on the redo stack, `/redo` reverses that, and a failed turn that changed nothing discards its own snapshot. Git is never touched, so snapshots work in a repository you did not initialise.
-
-`/add PATH` pins a project file into every prompt: its contents ride along in the system prompt (capped at 6 000 characters per file and 24 000 in total) so the model never has to re-read it, `/add` alone lists the pins, and `/drop PATH` (or `/drop all`) removes them. The pin list is stored with the session, so `/sessions` and `--session` restore it, and headless runs accept the same thing as a repeatable `--add PATH` flag. For `/`-less prompting the repo map ranks files by query relevance blended with a PageRank over cross-file symbol references and stops at a 1 024-token budget.
+<p align="center">
+  <strong>WROSECODE</strong><br>
+  Native AI coding workflows for the terminal.
+</p>
