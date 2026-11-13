@@ -5,6 +5,9 @@ mod attach;
 mod autopilot;
 #[cfg(test)]
 mod benchmarks;
+mod bridge;
+mod bugbounty;
+mod chatgpt_auth;
 mod commands;
 mod config;
 mod coverage;
@@ -19,7 +22,9 @@ mod memory;
 mod metrics;
 mod oauth;
 mod package;
+mod pairing;
 mod project;
+mod prompt;
 mod provider;
 mod provider_cli;
 mod recipe;
@@ -60,12 +65,16 @@ struct Cli {
     /// at medium and adapts to progress). Cycles live with Ctrl+T.
     #[arg(long, value_enum)]
     think: Option<ThinkLevel>,
-    #[arg(long, default_value = "anthropic")]
-    provider: String,
+    #[arg(long)]
+    provider: Option<String>,
     #[arg(long)]
     model: Option<String>,
-    #[arg(long, default_value = "claude")]
+    #[arg(long, default_value = "minimal")]
     harness: String,
+    /// Agent mode: general | ctf | bounty | build | plan. The interactive
+    /// equivalent is `/mode`.
+    #[arg(long)]
+    mode: Option<String>,
     #[arg(long, default_value_t = 3)]
     repair_retries: usize,
     #[arg(long)]
@@ -82,6 +91,10 @@ struct Cli {
     mcp_args: Vec<String>,
     #[arg(long)]
     quiet: bool,
+    /// Tool and process visibility: on/verbose (default), off/normal, compact.
+    /// An explicit flag overrides a project's config.toml for this launch.
+    #[arg(long, value_parser = ["on", "off", "compact", "normal", "verbose"])]
+    verbosity: Option<String>,
     #[arg(long)]
     until: Option<String>,
     #[arg(long)]
@@ -156,12 +169,24 @@ struct Cli {
     /// CTF autopilot: allow this remote host (host or host:port)
     #[arg(long, value_name = "HOST[:PORT]")]
     remote: Option<String>,
-    /// CTF autopilot: run budget — bare steps, or steps=…,tokens=…,seconds=…
-    #[arg(long, value_name = "STEPS|steps=…,tokens=…,seconds=…")]
+    /// CTF autopilot: optional limit — unlimited by default; use steps=…,tokens=…,seconds=…
+    #[arg(long, value_name = "unlimited|STEPS|steps=…,tokens=…,seconds=…")]
     budget: Option<String>,
     /// CTF autopilot: max parallel hypothesis subagents
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 3)]
     parallel: usize,
+    /// Bug bounty: in-scope host, URL, or `*.wildcard` (repeatable or comma-separated)
+    #[arg(long = "scope", value_name = "HOST")]
+    scope: Vec<String>,
+    /// Bug bounty: scope file with one include/exclude per line
+    #[arg(long = "scope-file", value_name = "PATH")]
+    scope_file: Option<PathBuf>,
+    /// Bug bounty: out-of-scope host or `*.wildcard` (repeatable or comma-separated)
+    #[arg(long = "exclude", value_name = "HOST")]
+    exclude: Vec<String>,
+    /// Bug bounty: program name recorded in `.bugbounty/findings.json`
+    #[arg(long)]
+    program: Option<String>,
 }
 
 #[tokio::main]
@@ -217,9 +242,168 @@ async fn main() -> Result<()> {
         attach::run(attach_cli).await?;
         return Ok(());
     }
+    // `wrosecode bridge pair [--name NAME]` issues a one-time pairing code;
+    // `wrosecode bridge login --relay WSS_URL [--id ID --secret SECRET]`
+    // stores cloud-relay credentials for automatic reconnects;
+    // `wrosecode bridge status` shows paired devices and relay config.
+    if raw_args.get(1).is_some_and(|argument| argument == "bridge") {
+        let mut name = std::env::var("WROSECODE_DEVICE_NAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Kali Linux".to_string());
+        let mut args = raw_args.iter().skip(2).peekable();
+        let sub = args.next().map(String::as_str).unwrap_or("status");
+        // Allow `bridge --name X pair` or `bridge pair --name X`.
+        let extra: Vec<String> = raw_args.iter().skip(2).cloned().collect();
+        if extra.iter().any(|a| a == "--name") {
+            if let Some(i) = extra.iter().position(|a| a == "--name") {
+                if let Some(v) = extra.get(i + 1) {
+                    name = v.clone();
+                }
+            }
+        }
+        let flag_value = |flag: &str| -> Option<String> {
+            extra
+                .iter()
+                .position(|a| a == flag)
+                .and_then(|i| extra.get(i + 1).cloned())
+        };
+        match sub {
+            "pair" | "--name" => {
+                if sub == "--name" {
+                    // `bridge --name X pair` form: find `pair` token.
+                    if !extra.iter().any(|a| a == "pair") {
+                        eprintln!("usage: wrosecode bridge pair [--name NAME]");
+                        std::process::exit(1);
+                    }
+                }
+                let (device, pending) = pairing::new_pairing_code(&name)?;
+                println!("PAIR WROSECODE DEVICE\n");
+                println!("Device        {}", name);
+                println!("Device ID     {}", device.device_id);
+                println!("Pairing Code  {}", pending.code);
+                println!("Expires       In 10 minutes (one-time use)");
+                println!("\nEnter this code on your authenticated");
+                println!("WROSECODE website to pair this device.");
+                println!("\nThen start the server:");
+                println!("  wrosecode server --hostname 127.0.0.1 --port 4076");
+                return Ok(());
+            }
+            "status" => {
+                let devices = pairing::list_devices();
+                println!("WROSECODE BRIDGE STATUS\n");
+                match bridge::relay_config() {
+                    Some((url, device_id, _)) => {
+                        let host = url.split('?').next().unwrap_or(&url);
+                        println!("Cloud relay   CONFIGURED ({host})");
+                        println!("Device ID     {device_id}");
+                    }
+                    None => {
+                        println!("Cloud relay   NOT CONFIGURED");
+                        println!("Set WROSECODE_RELAY_URL, WROSECODE_DEVICE_ID, WROSECODE_DEVICE_SECRET,");
+                        println!(
+                            "or run `wrosecode bridge login --relay wss://<worker>/relay/device`."
+                        );
+                    }
+                }
+                println!("Paired devices: {}", devices.len());
+                for d in devices {
+                    println!(
+                        "  • {} ({}) account={} last_seen={}",
+                        d.device_name, d.device_id, d.account_id, d.last_seen
+                    );
+                }
+                println!("Pending codes: {}", pairing::pending_count());
+                return Ok(());
+            }
+            "login" => {
+                let url = flag_value("--relay")
+                    .unwrap_or_else(|| std::env::var("WROSECODE_RELAY_URL").unwrap_or_default());
+                if url.trim().is_empty() {
+                    eprintln!(
+                        "usage: wrosecode bridge login --relay wss://<your-worker>/relay/device [--id ID --secret SECRET]"
+                    );
+                    std::process::exit(1);
+                }
+                let device = pairing::local_device(&name)?;
+                let id = flag_value("--id").unwrap_or(device.device_id.clone());
+                let secret = match flag_value("--secret") {
+                    Some(s) if !s.trim().is_empty() => s,
+                    _ => {
+                        let mut bytes = [0u8; 32];
+                        ring::rand::SecureRandom::fill(
+                            &ring::rand::SystemRandom::new(),
+                            &mut bytes,
+                        )
+                        .map_err(|_| anyhow::anyhow!("secure random generation failed"))?;
+                        use base64::Engine;
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+                    }
+                };
+                bridge::save_relay_config(&url, &id, &secret)?;
+                println!("Relay credentials saved to ~/.wrosecode/relay.json");
+                println!("Device ID  {id}");
+                println!("Relay URL  {}", url.split('?').next().unwrap_or(&url));
+                println!("\nStart the server to connect automatically:");
+                println!("  wrosecode server --hostname 127.0.0.1 --port 4076");
+                return Ok(());
+            }
+            _ => {
+                eprintln!("usage: wrosecode bridge pair [--name NAME]");
+                eprintln!(
+                    "       wrosecode bridge login --relay WSS_URL [--id ID --secret SECRET]"
+                );
+                eprintln!("       wrosecode bridge status");
+                std::process::exit(1);
+            }
+        }
+    }
     let mut exec_json = false;
     let mut ctf_mode = false;
-    let cli_args: Vec<String> = if raw_args.get(1).is_some_and(|argument| argument == "exec") {
+    let mut bugbounty_mode = false;
+    let cli_args: Vec<String> = if raw_args.get(1).is_some_and(|argument| argument == "server") {
+        if raw_args.iter().skip(2).any(|a| a == "--help" || a == "-h") {
+            println!("wrosecode server — start the local agent API server\n");
+            println!("USAGE:");
+            println!("  wrosecode server [--hostname HOST] [--port PORT]\n");
+            println!("EXAMPLES:");
+            println!(
+                "  wrosecode server --hostname 127.0.0.1 --port 4076   # loopback only (default)"
+            );
+            println!("  wrosecode server --hostname 0.0.0.0 --port 4076     # LAN (warns; keep auth on)\n");
+            println!("AUTH:");
+            println!("  Bearer token in ~/.wrosecode/server.token, or per-device tokens from `wrosecode bridge pair`.");
+            println!("  Binding beyond localhost prints a network-exposure warning.");
+            return Ok(());
+        }
+        // `wrosecode server --hostname 0.0.0.0 --port 4076` is the stable
+        // server spelling. Keep the older `--web --listen` flags working.
+        let mut hostname = "127.0.0.1".to_string();
+        let mut port = "4076".to_string();
+        let mut extra = Vec::new();
+        let mut args = raw_args.iter().skip(2);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--hostname" => {
+                    hostname = args.next().context("--hostname requires a value")?.clone()
+                }
+                "--port" => port = args.next().context("--port requires a value")?.clone(),
+                other => extra.push(other.to_string()),
+            }
+        }
+        let address = format!("{hostname}:{port}");
+        address
+            .parse::<std::net::SocketAddr>()
+            .context("invalid server host or port")?;
+        let mut rewritten = vec![
+            "wrosecode".to_string(),
+            "--web".to_string(),
+            "--listen".to_string(),
+            address,
+        ];
+        rewritten.extend(extra);
+        rewritten
+    } else if raw_args.get(1).is_some_and(|argument| argument == "exec") {
         let mut rewritten = vec!["wrosecode".to_string(), "--headless".to_string()];
         for argument in raw_args.iter().skip(2) {
             if argument == "--json" {
@@ -233,6 +417,16 @@ async fn main() -> Result<()> {
         // Spec PHASE 5: `wrosecode ctf <file|dir|url|description>` always runs
         // headless (the TUI path is `/ctf`), so mirror the `exec` rewrite.
         ctf_mode = true;
+        let mut rewritten = vec!["wrosecode".to_string(), "--headless".to_string()];
+        rewritten.extend(raw_args.iter().skip(2).cloned());
+        rewritten
+    } else if raw_args
+        .get(1)
+        .is_some_and(|argument| argument == "bugbounty" || argument == "bug-bounty")
+    {
+        // Same contract as `ctf`: the subcommand always runs headless and the
+        // interactive workflow lives behind `/bugbounty` in the TUI.
+        bugbounty_mode = true;
         let mut rewritten = vec!["wrosecode".to_string(), "--headless".to_string()];
         rewritten.extend(raw_args.iter().skip(2).cloned());
         rewritten
@@ -304,25 +498,50 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let runtime = config::RuntimeConfig::load(&root);
+    let effective_verbosity = cli
+        .verbosity
+        .as_deref()
+        .map(config::normalize_verbosity)
+        .unwrap_or(runtime.ui.verbosity.as_str())
+        .to_owned();
     let mut settings = settings::Settings::load()?;
+    let provider_name = cli
+        .provider
+        .clone()
+        .or_else(|| {
+            settings
+                .last_selection()
+                .filter(|selection| settings.profile(&selection.provider).is_some())
+                .map(|selection| selection.provider)
+        })
+        .or_else(|| settings.first_usable().map(|profile| profile.name.clone()))
+        // Keep a fresh install's TUI usable even before a model is selected.
+        // This is only an empty-model shell; it never silently selects a
+        // model or changes a user's saved provider.
+        .or_else(|| {
+            settings
+                .profile("openai")
+                .map(|profile| profile.name.clone())
+        })
+        .unwrap_or_else(|| "openai".into());
     let explicit_model = cli.model.clone();
     let selected_model = cli.model.unwrap_or_else(|| {
         settings
-            .profile(&cli.provider)
-            .map(|profile| profile.model.clone())
-            .filter(|model| !model.is_empty())
-            .unwrap_or_else(|| {
-                if cli.provider == "anthropic" {
-                    "claude-sonnet-5".into()
-                } else {
-                    "local-model".into()
-                }
+            .last_selection()
+            .filter(|selection| selection.provider == provider_name)
+            .map(|selection| selection.model)
+            .or_else(|| {
+                settings
+                    .profile(&provider_name)
+                    .map(|profile| profile.model.clone())
+                    .filter(|model| !model.is_empty())
             })
+            .unwrap_or_default()
     });
     // An explicit model is a deliberate selection. Save it so a later
     // invocation without `--model` starts with the model actually used.
-    if explicit_model.is_some() && settings.profile(&cli.provider).is_some() {
-        settings.set_default_model(&cli.provider, &selected_model)?;
+    if explicit_model.is_some() && settings.profile(&provider_name).is_some() {
+        settings.set_default_model(&provider_name, &selected_model)?;
     }
     // Thinking mode precedence: --think > the provider profile's think key
     // (model-specific) > [agent].think from config.toml > derived from the
@@ -332,7 +551,7 @@ async fn main() -> Result<()> {
         .think
         .or_else(|| {
             settings
-                .profile(&cli.provider)
+                .profile(&provider_name)
                 .and_then(|profile| profile.think)
         })
         .or(runtime.agent.think);
@@ -342,13 +561,13 @@ async fn main() -> Result<()> {
     // (or a bare model, keeping the worker's provider).
     let (planner_provider, planner_model) = runtime
         .agent
-        .planner_split(&cli.provider)
+        .planner_split(&provider_name)
         .unwrap_or_else(|| (String::new(), String::new()));
     let config = Arc::new(Config {
         root,
         permission: cli.permission.unwrap_or(runtime.agent.permission),
         model: selected_model,
-        provider: cli.provider,
+        provider: provider_name,
         harness: cli.harness,
         repair_retries: cli.repair_retries,
         check_command: cli.check_command,
@@ -376,7 +595,7 @@ async fn main() -> Result<()> {
         budget_usd: runtime.agent.budget_usd.max(0.0),
         qdrant_url: runtime.cache.qdrant_url,
         ui_theme: runtime.ui.theme,
-        verbosity: runtime.ui.verbosity,
+        verbosity: effective_verbosity,
         alternate_screen: runtime.ui.alternate_screen,
         mouse_capture: runtime.ui.mouse_capture,
         alert_bell: runtime.ui.alert_bell,
@@ -391,6 +610,7 @@ async fn main() -> Result<()> {
     let tui_mode = cli.prompt.is_none()
         && !cli.headless
         && !ctf_mode
+        && !bugbounty_mode
         && cli.recipe.is_none()
         && !cli.recipe_list
         && std::io::stdin().is_terminal()
@@ -401,20 +621,35 @@ async fn main() -> Result<()> {
         cli.no_color,
     );
     let guard = if tui_mode {
-        let guard = tui::TerminalGuard::enter(profile)?;
+        let guard = tui::TerminalGuard::enter_painting(profile)?;
         splash::paint_stage(profile, &boot, 0)?;
         Some(guard)
     } else {
         None
     };
-    let client = provider::shared_client(10, 120)?;
+    // Do not enable raw mode until startup I/O is done. In raw mode Ctrl+C is
+    // a key event rather than SIGINT; entering raw here would make a slow
+    // OAuth/MCP/provider startup impossible to interrupt. Painting the splash
+    // still happens immediately — only keyboard ownership waits.
+    let control_client = provider::shared_client(5, 15)?;
+    let client = provider::streaming_client(7)?;
     if let Some(profile) = settings.profile(&config.provider) {
         // OAuth tokens refresh here so the first turn never starts on an
-        // expired credential.
+        // expired credential, but a broken identity endpoint cannot freeze
+        // terminal startup indefinitely.
         settings
-            .refresh_oauth_if_needed(profile, &client)
+            .refresh_oauth_if_needed(profile, &control_client)
             .await
             .context("OAuth token refresh failed")?;
+        if profile.kind == "openai_chatgpt_plan" {
+            chatgpt_auth::refresh_if_needed(
+                &control_client,
+                &chatgpt_auth::Store::current()?,
+                &profile.name,
+            )
+            .await
+            .context("ChatGPT token refresh failed")?;
+        }
     }
     let mut config = (*config).clone();
     if settings.profile(&config.provider).is_none() {
@@ -459,7 +694,30 @@ async fn main() -> Result<()> {
             eprintln!("installed {} skill(s): {}", names.len(), names.join(", "));
         }
     }
+    if !cli.install_skill.is_empty() {
+        skills::invalidate_cache(&config.root, &config.skill_dirs);
+    }
     let mut agent = Agent::new(config, provider, client)?;
+    if let Some(mode) = cli.mode.as_deref() {
+        agent
+            .set_mode(mode)
+            .with_context(|| format!("--mode {mode}"))?;
+        // Headless mode selection has to arm the same scope the TUI's
+        // `/mode` does, or every CTF tool call is denied before the model
+        // sees a turn. Bounty scopes still come only from `--scope`/
+        // `--scope-file` via the `bugbounty` subcommand.
+        if matches!(mode, "ctf") {
+            let root = agent.config.root.clone();
+            let scope = autopilot::Scope::for_target("", &root, None);
+            agent.tools.set_scope(Some(scope));
+        }
+    }
+    if ctf_mode {
+        agent.set_mode("ctf")?;
+    }
+    if bugbounty_mode {
+        agent.set_mode("bugbounty")?;
+    }
     agent.trace = crate::trace::TraceSink::open(cli.trace);
     if agent.trace.enabled() && !cli.quiet {
         eprintln!("tracing per-step timings to ~/.wrosecode/trace.log");
@@ -523,15 +781,31 @@ async fn main() -> Result<()> {
             tools::mcp::Mcp::connect(binary, &cli.mcp_args).await?,
         ));
     }
-    for server in &settings.mcps {
-        if let Ok(mcp) = tools::mcp::Mcp::connect_def(server).await {
-            agent.tools.mcps.push((server.name.clone(), mcp));
+    // MCP servers connect concurrently (spawn + handshake each) instead of
+    // one by one: with N servers this turns N sequential round trips into
+    // one. Order and error tolerance are unchanged — failures are skipped,
+    // successes land in configuration order.
+    if !settings.mcps.is_empty() {
+        let connections = futures::future::join_all(settings.mcps.iter().map(|server| {
+            let name = server.name.clone();
+            let definition = server.clone();
+            async move {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tools::mcp::Mcp::connect_def(&definition),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("MCP startup timed out after 5s"))
+                .and_then(|result| result);
+                (name, result)
+            }
+        }))
+        .await;
+        for (name, connection) in connections {
+            if let Ok(mcp) = connection {
+                agent.tools.mcps.push((name, mcp));
+            }
         }
-    }
-    if tui_mode {
-        // Final reveal stage: the full banner is showing before the TUI
-        // loop takes over the screen.
-        let _ = splash::paint_stage(profile, &boot, 2);
     }
     if let Some(name) = cli.agent.as_deref() {
         let user_agents = markdown::discover_agents(&agent.config.root);
@@ -680,6 +954,56 @@ async fn main() -> Result<()> {
             }
         }
     }
+    if bugbounty_mode {
+        // Exit 0 when at least one finding verified with intact evidence,
+        // exit 2 when the run ended without one, exit 1 on a hard error.
+        let mut options = bugbounty::Options::with_default_budget();
+        options.target = cli.prompt.clone().unwrap_or_else(|| ".".into());
+        options.includes = cli.scope.clone();
+        options.excludes = cli.exclude.clone();
+        options.scope_file = cli.scope_file.clone();
+        options.program = cli.program.clone().unwrap_or_default();
+        options.parallel = cli.parallel.max(1);
+        if let Some(budget) = &cli.budget {
+            options.budget = autopilot::Budget::parse(budget)?;
+        }
+        let options = bugbounty::finalize(options)?;
+        write_event(
+            &event_sink,
+            &events::start_frame(&format!("bugbounty {}", options.target), "bugbounty"),
+        );
+        let outcome = bugbounty::run(&mut agent, &options).await?;
+        let mut session = resumed_session.unwrap_or_else(session::Session::fresh);
+        session.messages = agent.messages.clone();
+        session.provider_name = agent.config.provider.clone();
+        session.model = agent.config.model.clone();
+        session.summary = format!("bugbounty {}", options.target);
+        persist_session(&store, &session)?;
+        let answer = bugbounty::stop_report(&outcome);
+        if let Some(stream) = &mut event_sink {
+            stream.quiesce(&mut agent).await;
+        }
+        write_event(
+            &event_sink,
+            &events::result_frame(
+                &answer,
+                outcome.verified > 0,
+                &agent.usage,
+                agent.model_turns,
+            ),
+        );
+        println!(
+            "VERIFIED {} · REPRODUCED {} · OPEN {}",
+            outcome.verified, outcome.reproduced, outcome.potential
+        );
+        for path in &outcome.report {
+            println!("REPORT  {}", path.display());
+        }
+        if outcome.verified == 0 {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     if cli.prompt.as_deref() == Some("acp") {
         return acp::serve(agent).await;
     }
@@ -770,6 +1094,10 @@ async fn main() -> Result<()> {
         anyhow::bail!("--headless requires a prompt argument or piped input");
     }
     if let Some(guard) = guard {
+        // Startup network/disk work has completed. From this point onward the
+        // TUI event loop owns Ctrl+C and TerminalGuard guarantees restoration.
+        guard.start_input()?;
+        splash::paint_stage(profile, &boot, 2)?;
         return tui::run(agent, resumed_session, store, guard).await;
     }
     println!("WROSECODE  /plan /build /harness NAME /memory /quit");
@@ -971,6 +1299,70 @@ fn persist_session(store: &store::Store, session: &session::Session) -> Result<(
 
 /// `--goal`, `--until`, and `--until-cmd` over a model answer — the same
 /// verdict the prompt branch, `exec`, and `recipe run` all report.
+fn text_goals_match(goal: Option<&str>, until: Option<&str>, response: &str) -> Result<bool> {
+    // The criteria are conjunctive: a successful verification command must
+    // not overwrite a failing flag-pattern test, and vice versa.
+    if goal.is_some_and(|text| !response.contains(text)) {
+        return Ok(false);
+    }
+    if let Some(pattern) = until {
+        return Ok(regex::Regex::new(pattern)?.is_match(response));
+    }
+    Ok(true)
+}
+
+fn verification_requested(
+    goal: Option<&String>,
+    until: Option<&String>,
+    until_cmd: Option<&String>,
+) -> bool {
+    goal.is_some() || until.is_some() || until_cmd.is_some()
+}
+
+async fn run_bounded_goal_command(
+    root: &Path,
+    command: &str,
+    max_duration: std::time::Duration,
+) -> Result<bool> {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Isolate child scripts in their own process group so a blocked
+        // shell, Python interpreter, and descendants all get terminated.
+        cmd.as_std_mut().process_group(0);
+    }
+    let mut child = cmd
+        .spawn()
+        .context("verification command could not execute")?;
+    let result = tokio::time::timeout(max_duration, child.wait()).await;
+    match result {
+        Ok(Ok(status)) => Ok(status.success()),
+        Ok(Err(error)) => Err(error).context("verification command wait failed"),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                // A new group was created with the child's PID above.
+                // No arbitrary user process groups are ever targeted.
+                if pid <= i32::MAX as u32 {
+                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                }
+            }
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            eprintln!(
+                "verification command exceeded {}s; goal remains unverified",
+                max_duration.as_secs()
+            );
+            Ok(false)
+        }
+    }
+}
+
 async fn check_goal(
     agent: &Agent,
     goal: Option<&String>,
@@ -978,20 +1370,29 @@ async fn check_goal(
     until_cmd: Option<&String>,
     response: &str,
 ) -> Result<bool> {
-    let mut verified = goal.is_none_or(|goal| response.contains(goal));
-    if let Some(pattern) = until {
-        verified = regex::Regex::new(pattern)?.is_match(response);
+    // A successful model response is not proof of a tested solution.
+    // Without an explicit goal/pattern/check, finish normally but report
+    // unverified rather than a misleading Solved & verified.
+    if !verification_requested(goal, until, until_cmd) {
+        return Ok(false);
+    }
+    if !text_goals_match(
+        goal.map(String::as_str),
+        until.map(String::as_str),
+        response,
+    )? {
+        return Ok(false);
     }
     if let Some(command) = until_cmd {
-        verified = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&agent.config.root)
-            .status()
-            .await?
-            .success();
+        // Verification is bounded independently from the main model turn.
+        return run_bounded_goal_command(
+            &agent.config.root,
+            command,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
     }
-    Ok(verified)
+    Ok(true)
 }
 
 fn attach_events(agent: &mut Agent, path: Option<&Path>) -> Result<Option<EventStream>> {
@@ -1024,5 +1425,76 @@ fn write_event(stream: &Option<EventStream>, frame: &serde_json::Value) {
         if let Ok(mut sink) = stream.sink.lock() {
             let _ = sink.write(frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod verbosity_cli_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn model_answer_alone_is_not_externally_verified() {
+        use super::verification_requested;
+        assert!(!verification_requested(None, None, None));
+        let goal = "HTB{".to_string();
+        assert!(verification_requested(Some(&goal), None, None));
+        let checker = "python3 solve.py".to_string();
+        assert!(verification_requested(None, None, Some(&checker)));
+    }
+
+    #[test]
+    fn all_requested_ctf_proof_checks_must_match() {
+        use super::text_goals_match;
+        assert!(text_goals_match(
+            Some("HTB{"),
+            Some(r"HTB\{[a-z0-9]+\}"),
+            "verified HTB{a1b2}"
+        )
+        .unwrap());
+        assert!(!text_goals_match(Some("HTB{"), Some(r"FLAG\{[a-z0-9]+\}"), "HTB{a1b2}").unwrap());
+        assert!(!text_goals_match(Some("HTB{"), Some(r"FLAG\{[a-z0-9]+\}"), "FLAG{a1b2}").unwrap());
+        assert!(text_goals_match(None, None, "ordinary chat").unwrap());
+        assert!(text_goals_match(None, Some(r"success"), "success").unwrap());
+    }
+
+    #[tokio::test]
+    async fn verification_processes_do_not_freeze_on_hanging_scripts() {
+        use super::run_bounded_goal_command;
+        use std::time::{Duration, Instant};
+        let root = std::path::Path::new("/tmp");
+        assert!(
+            run_bounded_goal_command(root, "true", Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !run_bounded_goal_command(root, "false", Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+        let started = Instant::now();
+        assert!(
+            !run_bounded_goal_command(root, "while :; do :; done", Duration::from_millis(70))
+                .await
+                .unwrap()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "verification timeout failed to interrupt a blocked shell"
+        );
+    }
+
+    #[test]
+    fn users_can_override_global_verbose_default_per_launch() {
+        let default = Cli::try_parse_from(["wrosecode"]).expect("default CLI parses");
+        assert_eq!(default.verbosity, None);
+        let off = Cli::try_parse_from(["wrosecode", "--verbosity", "off"])
+            .expect("explicit opt-out parses");
+        assert_eq!(off.verbosity.as_deref(), Some("off"));
+        let on = Cli::try_parse_from(["wrosecode", "--verbosity", "on"])
+            .expect("explicit opt-in parses");
+        assert_eq!(on.verbosity.as_deref(), Some("on"));
+        assert!(Cli::try_parse_from(["wrosecode", "--verbosity", "invalid"]).is_err());
     }
 }

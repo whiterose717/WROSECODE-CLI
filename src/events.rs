@@ -155,7 +155,10 @@ pub fn frame(event: &Progress) -> Option<Value> {
             "reasoning": usage.reasoning,
             "estimated": usage.estimated,
         }),
-        Progress::ResetText | Progress::Metrics(_) => return None,
+        Progress::ModelStage(stage) => {
+            json!({"type": "step", "phase": "model", "status": stage})
+        }
+        Progress::Heartbeat | Progress::ResetText | Progress::Metrics(_) => return None,
     };
     Some(value)
 }
@@ -327,6 +330,7 @@ mod tests {
     #[test]
     fn tool_call_frames_round_trip_through_json() {
         let _call = ToolCall {
+            item_id: None,
             id: "1".into(),
             name: "read_file".into(),
             input: json!({"path": "a.txt"}),

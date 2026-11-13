@@ -9,6 +9,9 @@ use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderProfile {
     pub name: String,
+    /// Human-facing label shown in the model picker and provider screen.
+    /// Empty (and all older files) fall back to `name` via [`display`].
+    pub display_name: String,
     pub kind: String,
     pub base_url: String,
     pub model: String,
@@ -74,14 +77,13 @@ pub struct Settings {
     pub last_tests: HashMap<String, std::result::Result<Duration, String>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelection {
+    pub provider: String,
+    pub model: String,
+}
+
 const DEFAULTS: &[(&str, &str, &str, &str, &str)] = &[
-    (
-        "anthropic",
-        "anthropic",
-        "https://api.anthropic.com",
-        "claude-sonnet-5",
-        "ANTHROPIC_API_KEY",
-    ),
     (
         "openai",
         "openai_compat",
@@ -113,13 +115,6 @@ const DEFAULTS: &[(&str, &str, &str, &str, &str)] = &[
         "GROQ_API_KEY",
     ),
     (
-        "ollama",
-        "openai_compat",
-        "http://localhost:11434/v1",
-        "",
-        "",
-    ),
-    (
         "openrouter",
         "openai_compat",
         "https://openrouter.ai/api/v1",
@@ -148,7 +143,32 @@ impl Settings {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .context("HOME is not set")?;
-        Self::load_at(home.join(".wrosecode"))
+        let mut settings = Self::load_at(home.join(".wrosecode"))?;
+        settings.migrate_legacy_keyrings();
+        Ok(settings)
+    }
+    /// One-time, best-effort upgrade of credentials saved by older versions
+    /// exclusively in a session-dependent desktop keyring. We migrate only
+    /// when that keyring is currently unlocked; no login prompt is generated.
+    fn migrate_legacy_keyrings(&mut self) {
+        let legacy = self
+            .providers
+            .iter()
+            .filter(|profile| {
+                profile.auth_method == "api_key" && profile.key_ref.starts_with("keyring:")
+            })
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>();
+        for name in legacy {
+            let secret = keyring::Entry::new("wrosecode", &name)
+                .and_then(|entry| entry.get_password())
+                .ok();
+            if let Some(secret) = secret.filter(|value| !value.is_empty()) {
+                if let Err(error) = self.set_key(&name, &secret) {
+                    eprintln!("warning: could not persist credentials for {name}: {error}");
+                }
+            }
+        }
     }
     pub fn load_at(dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
@@ -165,9 +185,13 @@ impl Settings {
                     .iter()
                     .filter_map(|table| {
                         let name = table["name"].as_str()?.to_string();
+                        if matches!(name.as_str(), "anthropic" | "ollama") {
+                            return None;
+                        }
                         Some(ProviderProfile {
                             builtin: Self::builtin(&name),
                             name,
+                            display_name: String::new(),
                             kind: match table["kind"].as_str().unwrap_or("openai-compatible") {
                                 "openai-compatible" | "openai" | "ollama" => "openai_compat",
                                 other => other,
@@ -197,11 +221,16 @@ impl Settings {
         let array = doc["provider"]
             .as_array_of_tables_mut()
             .context("provider must be an array of tables")?;
+        // Remove only the legacy built-in profiles. Custom provider names
+        // and custom Anthropic-compatible profiles are left untouched.
+        let before = array.len();
+        array.retain(|table| !matches!(table["name"].as_str(), Some("anthropic" | "ollama")));
+        let removed_legacy = array.len() != before;
         // An existing file is authoritative: seed the built-in catalogue
-        // only for a fresh file, so removing a default (even `anthropic`)
+        // only for a fresh file, so removing a default
         // sticks instead of being resurrected on the next load.
         let fresh = !file.exists();
-        let mut changed = fresh;
+        let mut changed = fresh || removed_legacy;
         for profile in legacy {
             if !array
                 .iter()
@@ -219,6 +248,7 @@ impl Settings {
             {
                 array.push(profile_table(&ProviderProfile {
                     name: name.into(),
+                    display_name: String::new(),
                     kind: kind.into(),
                     base_url: base_url.into(),
                     model: model.into(),
@@ -260,6 +290,42 @@ impl Settings {
                 "lm-studio" => self.providers.iter().find(|p| p.name == "litellm"),
                 _ => None,
             })
+    }
+
+    /// Human-facing label for pickers and screens. Falls back to the stable
+    /// `name` when empty, which is also what every pre-display-name file
+    /// loads as — so existing configs render exactly as before.
+    pub fn display(profile: &ProviderProfile) -> &str {
+        if profile.display_name.trim().is_empty() {
+            &profile.name
+        } else {
+            &profile.display_name
+        }
+    }
+
+    /// Last active provider/model, kept separately from provider defaults so
+    /// switching models also determines the next startup provider.
+    pub fn last_selection(&self) -> Option<ModelSelection> {
+        let path = self.dir.join("active_model.toml");
+        let value = toml::from_str::<ModelSelection>(&std::fs::read_to_string(path).ok()?).ok()?;
+        (!value.provider.is_empty() && !value.model.is_empty()).then_some(value)
+    }
+
+    pub fn set_last_selection(&self, provider: &str, model: &str) -> Result<()> {
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return Ok(());
+        }
+        let path = self.dir.join("active_model.toml");
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(
+            &tmp,
+            toml::to_string(&ModelSelection {
+                provider: provider.trim().into(),
+                model: model.trim().into(),
+            })?,
+        )?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
     }
     pub fn builtin(name: &str) -> bool {
         DEFAULTS.iter().any(|entry| entry.0 == name)
@@ -305,8 +371,11 @@ impl Settings {
     pub fn upsert_provider(&mut self, mut profile: ProviderProfile) -> Result<()> {
         Self::validate_name(&profile.name)?;
         profile.base_url = Self::normalize_url(&profile.base_url)?;
-        if !matches!(profile.kind.as_str(), "openai_compat" | "anthropic") {
-            bail!("kind must be openai_compat or anthropic");
+        if !matches!(
+            profile.kind.as_str(),
+            "openai_compat" | "anthropic" | "openai_chatgpt_plan"
+        ) {
+            bail!("kind must be openai_compat, anthropic, or openai_chatgpt_plan");
         }
         let path = self.dir.join("providers.toml");
         let mut doc = std::fs::read_to_string(&path)?.parse::<DocumentMut>()?;
@@ -454,7 +523,9 @@ impl Settings {
                 }
             }
         }
-        if profile.key_ref == "file" {
+        // Previous versions could lose access to an unlocked keyring after
+        // logout/reboot. Use the private on-disk copy when available.
+        if profile.key_ref == "file" || profile.key_ref.starts_with("keyring:") {
             return self
                 .auth_file()
                 .ok()
@@ -479,12 +550,10 @@ impl Settings {
             }
             if value.is_empty() {
                 profile.key_ref.clear();
-            } else if keyring::Entry::new("wrosecode", name)
-                .and_then(|entry| entry.set_password(value))
-                .is_ok()
-            {
-                profile.key_ref = format!("keyring:{name}");
             } else {
+                // A desktop keyring may be inaccessible in a new terminal,
+                // on reboot, or via sudo. Persist one owner-only file whose
+                // lifetime is independent of this process and CLI binaries.
                 let mut auth = self.auth_file()?;
                 auth.insert(name.into(), value.into());
                 self.save_auth(&auth)?;
@@ -520,12 +589,41 @@ impl Settings {
         }
     }
     pub fn no_key_needed(&self, profile: &ProviderProfile) -> bool {
-        matches!(profile.name.as_str(), "ollama" | "litellm")
+        profile.kind == "openai_chatgpt_plan"
+            || profile.name == "litellm"
             || reqwest::Url::parse(&profile.base_url)
                 .ok()
                 .is_some_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
     }
+    /// A saved model alone never means its provider is configured.
+    pub fn can_use(&self, profile: &ProviderProfile) -> bool {
+        if profile.base_url.trim().is_empty() {
+            return false;
+        }
+        if profile.kind == "openai_chatgpt_plan" {
+            return crate::chatgpt_auth::Store::current()
+                .ok()
+                .and_then(|store| store.account(&profile.name).ok().flatten())
+                .is_some_and(|account| account.plan_enabled());
+        }
+        self.no_key_needed(profile) || self.key(profile).is_some()
+    }
     pub fn status(&self, profile: &ProviderProfile) -> String {
+        if profile.kind == "openai_chatgpt_plan" {
+            return match crate::chatgpt_auth::Store::current()
+                .ok()
+                .and_then(|store| store.account(&profile.name).ok().flatten())
+            {
+                Some(credentials) if credentials.plan_enabled() && !credentials.expires_soon() => {
+                    "ChatGPT plan connected".into()
+                }
+                Some(credentials) if credentials.plan_enabled() => {
+                    "ChatGPT plan token expiring".into()
+                }
+                Some(_) => "identity connected · plan not authorized".into(),
+                None => "ChatGPT sign-in required".into(),
+            };
+        }
         if profile.base_url.is_empty() {
             return "needs setup".into();
         }
@@ -561,20 +659,41 @@ impl Settings {
     fn save_auth(&self, auth: &BTreeMap<String, String>) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join("auth.json");
+        let bytes = serde_json::to_vec(auth)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)?;
-            std::io::Write::write_all(&mut file, &serde_json::to_vec(auth)?)?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let temp = self
+                .dir
+                .join(format!(".auth.{}.{stamp}.tmp", std::process::id()));
+            let result = (|| -> Result<()> {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&temp)?;
+                std::io::Write::write_all(&mut file, &bytes)?;
+                file.sync_all()?;
+                std::fs::rename(&temp, &path)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp);
+            }
+            result?;
         }
         #[cfg(not(unix))]
-        std::fs::write(path, serde_json::to_vec(auth)?)?;
+        {
+            let temp = path.with_extension("json.tmp");
+            std::fs::write(&temp, bytes)?;
+            std::fs::rename(temp, path)?;
+        }
         Ok(())
     }
     pub fn upsert_mcp(&mut self, server: McpServerDef) -> Result<()> {
@@ -610,6 +729,11 @@ fn profile_table(profile: &ProviderProfile) -> Table {
 }
 fn update_table(table: &mut Table, profile: &ProviderProfile) {
     table["name"] = value(&profile.name);
+    if profile.display_name.trim().is_empty() {
+        table.remove("display_name");
+    } else {
+        table["display_name"] = value(&profile.display_name);
+    }
     table["kind"] = value(&profile.kind);
     table["base_url"] = value(&profile.base_url);
     table["model"] = value(&profile.model);
@@ -694,6 +818,11 @@ fn parse_profiles(doc: &DocumentMut) -> Result<Vec<ProviderProfile>> {
             profiles.push(ProviderProfile {
                 builtin: Settings::builtin(&name),
                 name,
+                display_name: table
+                    .get("display_name")
+                    .and_then(Item::as_str)
+                    .unwrap_or_default()
+                    .into(),
                 kind: table["kind"].as_str().unwrap_or("openai_compat").into(),
                 base_url: table["base_url"].as_str().unwrap_or_default().into(),
                 model: table["model"].as_str().unwrap_or_default().into(),
@@ -758,15 +887,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wrose-remove-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut settings = Settings::load_at(dir.clone()).unwrap();
-        assert!(settings.profile("anthropic").is_some(), "seeded by default");
-        settings
-            .remove_provider("anthropic")
-            .expect("remove builtin");
-        assert!(settings.profile("anthropic").is_none());
+        assert!(settings.profile("openai").is_some(), "seeded by default");
+        settings.remove_provider("openai").expect("remove builtin");
+        assert!(settings.profile("openai").is_none());
         // A reload must not resurrect the removed default: an existing
         // catalogue file is authoritative.
         let mut settings = Settings::load_at(dir.clone()).unwrap();
-        assert!(settings.profile("anthropic").is_none());
+        assert!(settings.profile("openai").is_none());
         assert!(settings.remove_provider("nope").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -777,13 +904,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut settings = Settings::load_at(dir.clone()).unwrap();
         settings
-            .set_default_model("anthropic", "claude-last-used")
+            .set_default_model("groq", "last-used-model")
             .unwrap();
 
         let reloaded = Settings::load_at(dir.clone()).unwrap();
+        assert_eq!(reloaded.profile("groq").unwrap().model, "last-used-model");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_catalog_has_no_hidden_sonnet_default_and_last_selection_round_trips() {
+        let dir = std::env::temp_dir().join(format!("wrose-active-model-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings = Settings::load_at(dir.clone()).unwrap();
+        assert!(settings.profile("openai").unwrap().model.is_empty());
+        assert!(settings.last_selection().is_none());
+        settings
+            .set_last_selection("groq", "openai/gpt-oss-120b")
+            .unwrap();
         assert_eq!(
-            reloaded.profile("anthropic").unwrap().model,
-            "claude-last-used"
+            settings.last_selection(),
+            Some(ModelSelection {
+                provider: "groq".into(),
+                model: "openai/gpt-oss-120b".into(),
+            })
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -857,6 +1001,7 @@ args = ["--stdio"]
         std::fs::write(&path, format!("# my comment\n{source}")).unwrap();
         s.upsert_provider(ProviderProfile {
             name: "test".into(),
+            display_name: String::new(),
             kind: "openai_compat".into(),
             base_url: "https://example.com/v1".into(),
             model: "x".into(),
@@ -883,6 +1028,63 @@ args = ["--stdio"]
             "x"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn api_key_survives_reload_without_a_desktop_keyring() {
+        let dir = std::env::temp_dir().join(format!(
+            "wrose-persistent-api-key-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut settings = Settings::load_at(dir.clone()).unwrap();
+        settings
+            .upsert_provider(ProviderProfile {
+                name: "persistent-test".into(),
+                display_name: String::new(),
+                kind: "openai_compat".into(),
+                base_url: "https://example.test/v1".into(),
+                model: "test-model".into(),
+                key_ref: String::new(),
+                headers: BTreeMap::new(),
+                auth_method: "api_key".into(),
+                oauth_client_id: String::new(),
+                oauth_issuer: String::new(),
+                oauth_scope: String::new(),
+                think: None,
+                think_map: None,
+                builtin: false,
+            })
+            .unwrap();
+        settings
+            .set_key("persistent-test", "test-secret-rotation-1")
+            .unwrap();
+        assert_eq!(settings.profile("persistent-test").unwrap().key_ref, "file");
+        let reloaded = Settings::load_at(dir.clone()).unwrap();
+        assert_eq!(
+            reloaded.key(reloaded.profile("persistent-test").unwrap()),
+            Some("test-secret-rotation-1".into())
+        );
+        assert!(!std::fs::read_to_string(dir.join("providers.toml"))
+            .unwrap()
+            .contains("test-secret-rotation-1"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.join("auth.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -929,6 +1131,7 @@ args = ["--stdio"]
         settings
             .upsert_provider(ProviderProfile {
                 name: "thinkful".into(),
+                display_name: String::new(),
                 kind: "openai_compat".into(),
                 base_url: "https://example.com/v1".into(),
                 model: "x".into(),
@@ -960,6 +1163,58 @@ args = ["--stdio"]
             Settings::load_at(dir.clone()).is_err(),
             "unknown think level must fail the load"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn display_name_round_trips_and_defaults_to_id() {
+        let dir = std::env::temp_dir().join(format!("wrose-display-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut settings = Settings::load_at(dir.clone()).unwrap();
+        // Files written before display names existed load with the id.
+        assert_eq!(
+            Settings::display(settings.profile("openai").unwrap()),
+            "openai"
+        );
+        settings
+            .upsert_provider(ProviderProfile {
+                name: "mine".into(),
+                display_name: "My Provider".into(),
+                kind: "openai_compat".into(),
+                base_url: "https://example.com/v1".into(),
+                model: "m1".into(),
+                key_ref: String::new(),
+                headers: BTreeMap::new(),
+                think: None,
+                think_map: None,
+                builtin: false,
+                auth_method: "api_key".into(),
+                oauth_client_id: String::new(),
+                oauth_issuer: String::new(),
+                oauth_scope: String::new(),
+            })
+            .unwrap();
+        let reloaded = Settings::load_at(dir.clone()).unwrap();
+        let profile = reloaded.profile("mine").expect("profile persists");
+        assert_eq!(Settings::display(profile), "My Provider");
+        assert!(
+            std::fs::read_to_string(dir.join("providers.toml"))
+                .unwrap()
+                .contains("display_name"),
+            "label persists in toml"
+        );
+        // Clearing the label removes the key and restores the id fallback.
+        let mut cleared = profile.clone();
+        cleared.display_name.clear();
+        let mut settings = reloaded;
+        settings.upsert_provider(cleared).unwrap();
+        let text = std::fs::read_to_string(dir.join("providers.toml")).unwrap();
+        assert!(
+            !text.contains("display_name"),
+            "stale label removed: {text}"
+        );
+        let reloaded = Settings::load_at(dir.clone()).unwrap();
+        assert_eq!(Settings::display(reloaded.profile("mine").unwrap()), "mine");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

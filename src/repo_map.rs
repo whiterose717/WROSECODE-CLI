@@ -3,7 +3,7 @@ use regex::Regex;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
 /// Token budget for the repo map inside the system prompt (~4 chars/token),
@@ -15,6 +15,11 @@ const TOKENS_PER_FILE: usize = 400;
 /// PageRank power-iteration rounds: the graph is small and converges fast.
 const PAGERANK_ROUNDS: usize = 15;
 const DAMPING: f64 = 0.85;
+// Repo context is optional. Never index an entire Desktop/home directory or
+// allow the reference graph to grow quadratically without a bound.
+const MAX_MAP_FILES: usize = 256;
+const MAX_WALK_ENTRIES: usize = 4096;
+const MAP_SCAN_BUDGET: Duration = Duration::from_millis(150);
 
 /// Per file: mtime, defined symbols, and the lowercase identifier tokens the
 /// file mentions (the edges of the reference graph).
@@ -23,6 +28,26 @@ type Entry = (SystemTime, Vec<String>, Vec<String>);
 #[derive(Default)]
 pub struct RepoMap {
     entries: HashMap<PathBuf, Entry>,
+    /// Bumped on every mutation; lets `render` cache per (query, revision)
+    /// so repeated turns over unchanged trees skip PageRank entirely.
+    revision: u64,
+    /// Last rendered query and the revision it was built from.
+    render_cache: Option<(String, u64, String)>,
+    /// Graph ranks depend only on the indexed files, not on the user's query.
+    /// Reuse them across turns until an update changes the map revision.
+    rank_cache: Option<(u64, Vec<f64>)>,
+}
+
+/// The symbol-line pattern, compiled once per process instead of on every
+/// `update()` call.
+fn symbol_pattern() -> &'static Regex {
+    static PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait|class|def|function|interface)\s+([A-Za-z_][A-Za-z_0-9]*)",
+        )
+        .expect("symbol pattern is static and valid")
+    })
 }
 
 impl RepoMap {
@@ -30,21 +55,51 @@ impl RepoMap {
         self.entries.len()
     }
     pub fn update(&mut self, root: &Path) -> Result<()> {
-        let symbol = Regex::new(
-            r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait|class|def|function|interface)\s+([A-Za-z_][A-Za-z_0-9]*)",
-        )?;
+        let started = Instant::now();
+        let symbol = symbol_pattern();
+        if self.entries.len() > MAX_MAP_FILES {
+            self.entries.clear();
+            self.revision = self.revision.wrapping_add(1);
+            self.render_cache = None;
+            self.rank_cache = None;
+        }
+        let before = self.entries.len();
+        let mut inserted = false;
         let mut seen = std::collections::HashSet::new();
-        for entry in WalkDir::new(root)
+        let mut complete_scan = true;
+        for (visited, entry) in WalkDir::new(root)
+            .max_depth(8)
             .into_iter()
             .filter_entry(|e| {
                 !matches!(
                     e.file_name().to_str(),
-                    Some(".git" | "target" | "node_modules" | ".wrosecode")
+                    Some(
+                        ".git"
+                            | "target"
+                            | "node_modules"
+                            | ".wrosecode"
+                            | ".venv"
+                            | "venv"
+                            | "__pycache__"
+                            | ".ctf"
+                            | "dist"
+                            | "vendor"
+                    )
                 )
             })
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
+            .enumerate()
         {
+            if visited >= MAX_WALK_ENTRIES
+                || started.elapsed() >= MAP_SCAN_BUDGET
+                || seen.len() >= MAX_MAP_FILES
+            {
+                complete_scan = false;
+                break;
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
             let path = entry.path();
             if !matches!(
                 path.extension().and_then(|s| s.to_str()),
@@ -52,12 +107,13 @@ impl RepoMap {
             ) {
                 continue;
             }
-            if entry.metadata()?.len() > 1_000_000 {
+            let metadata = entry.metadata()?;
+            if metadata.len() > 128 * 1024 {
                 continue;
             }
             let relative = path.strip_prefix(root)?.to_path_buf();
             seen.insert(relative.clone());
-            let modified = entry.metadata()?.modified()?;
+            let modified = metadata.modified()?;
             if self
                 .entries
                 .get(&relative)
@@ -80,15 +136,33 @@ impl RepoMap {
                     .collect()
             };
             let tokens = identifier_tokens(&text);
+            if !self.entries.contains_key(&relative) && self.entries.len() >= MAX_MAP_FILES {
+                complete_scan = false;
+                break;
+            }
             self.entries.insert(relative, (modified, symbols, tokens));
+            inserted = true;
         }
-        self.entries.retain(|path, _| seen.contains(path));
+        if complete_scan {
+            self.entries.retain(|path, _| seen.contains(path));
+        }
+        if inserted || self.entries.len() != before {
+            // Any mutation (or deletion) invalidates the cached render.
+            self.revision = self.revision.wrapping_add(1);
+            self.render_cache = None;
+            self.rank_cache = None;
+        }
         Ok(())
     }
     /// The system-prompt map: files ranked by query relevance *and* by how
     /// central they are in the symbol-reference graph (PageRank), emitted
     /// until the token budget runs out.
-    pub fn render(&self, query: &str) -> String {
+    pub fn render(&mut self, query: &str) -> String {
+        if let Some((cached_query, cached_revision, cached)) = &self.render_cache {
+            if *cached_revision == self.revision && cached_query == query {
+                return cached.clone();
+            }
+        }
         let words: Vec<String> = query
             .split_whitespace()
             .map(|word| word.to_ascii_lowercase())
@@ -110,7 +184,14 @@ impl RepoMap {
                     .count() as f64
             })
             .collect();
-        let ranks = self.pagerank(&paths);
+        if self
+            .rank_cache
+            .as_ref()
+            .is_none_or(|(revision, _)| *revision != self.revision)
+        {
+            self.rank_cache = Some((self.revision, self.pagerank(&paths)));
+        }
+        let ranks = &self.rank_cache.as_ref().expect("ranks populated").1;
         let peak = ranks.iter().cloned().fold(0.0_f64, f64::max).max(1e-9);
         let mut ranked: Vec<(f64, &PathBuf, &[String])> = paths
             .iter()
@@ -138,6 +219,7 @@ impl RepoMap {
             }
             output.push_str(&line);
         }
+        self.render_cache = Some((query.to_string(), self.revision, output.clone()));
         output
     }
 
@@ -204,16 +286,17 @@ impl RepoMap {
 /// — enough to notice "that file uses `snapshot::capture`" without keeping
 /// whole sources in memory.
 fn identifier_tokens(text: &str) -> Vec<String> {
-    let Ok(regex) = Regex::new(r"[A-Za-z_][A-Za-z_0-9_]{3,}") else {
-        return Vec::new();
-    };
+    static IDENTIFIERS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let regex = IDENTIFIERS.get_or_init(|| {
+        Regex::new(r"[A-Za-z_][A-Za-z_0-9_]{3,}").expect("static identifier pattern")
+    });
     let mut seen = HashSet::new();
     let mut tokens: Vec<String> = regex
         .find_iter(text)
         .map(|found| found.as_str().to_ascii_lowercase())
         .filter(|token| seen.insert(token.clone()))
+        .take(TOKENS_PER_FILE)
         .collect();
-    tokens.truncate(TOKENS_PER_FILE);
     tokens.sort();
     tokens
 }
@@ -244,6 +327,69 @@ fn rust_symbols(text: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_caches_per_query_and_revision() {
+        let root = workspace("cache");
+        std::fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let mut map = RepoMap::default();
+        map.update(&root).expect("update");
+        let revision = map.revision;
+        assert!(revision > 0, "cold update bumps the revision");
+        let first = map.render("alpha");
+        assert!(map.render_cache.is_some(), "render populates the cache");
+        let second = map.render("alpha");
+        assert_eq!(first, second, "same query and revision reuses the cache");
+        // Touching a file invalidates: new content, new revision, no cache.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(root.join("a.rs"), "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
+        map.update(&root).expect("re-update");
+        assert!(
+            map.revision > revision,
+            "changed content bumps the revision"
+        );
+        assert!(
+            map.render_cache.is_none(),
+            "mutation drops the cached render"
+        );
+        let third = map.render("alpha");
+        assert!(
+            third.contains("beta"),
+            "re-render picks up the new symbol: {third}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn graph_ranks_survive_query_changes_and_refresh_after_edits_and_deletes() {
+        let root = workspace("rank-reuse");
+        std::fs::write(root.join("alpha.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("beta.rs"), "pub fn beta() { alpha(); }\n").unwrap();
+        let mut map = RepoMap::default();
+        map.update(&root).unwrap();
+        let first = map.render("alpha");
+        assert!(first.starts_with("alpha.rs:"));
+        let (revision, ranks) = map.rank_cache.clone().unwrap();
+        let second = map.render("beta");
+        assert!(second.starts_with("beta.rs:"), "{second}");
+        assert_eq!(map.rank_cache.as_ref().unwrap(), &(revision, ranks));
+        // A stable update must retain the query-independent graph cache.
+        map.update(&root).unwrap();
+        assert_eq!(map.rank_cache.as_ref().unwrap().0, revision);
+
+        std::fs::write(root.join("gamma.rs"), "pub fn gamma() { beta(); }\n").unwrap();
+        map.update(&root).unwrap();
+        assert!(map.rank_cache.is_none());
+        assert!(map.render("gamma").starts_with("gamma.rs:"));
+        assert_eq!(map.rank_cache.as_ref().unwrap().1.len(), 3);
+
+        std::fs::remove_file(root.join("alpha.rs")).unwrap();
+        map.update(&root).unwrap();
+        assert!(map.rank_cache.is_none());
+        assert!(!map.render("alpha").contains("alpha.rs:"));
+        assert_eq!(map.rank_cache.as_ref().unwrap().1.len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn workspace(label: &str) -> PathBuf {
         let root =
@@ -304,5 +450,25 @@ mod tests {
             render.lines().count()
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn indexing_a_large_workspace_has_a_hard_file_limit() {
+        let root = workspace("bounded-desktop");
+        for i in 0..(MAX_MAP_FILES + 80) {
+            std::fs::write(
+                root.join(format!("file_{i}.py")),
+                format!("def function_{i}(): return shared_value\n"),
+            )
+            .unwrap();
+        }
+        let mut map = RepoMap::default();
+        map.update(&root).unwrap();
+        assert!(map.len() > 0);
+        assert!(
+            map.len() <= MAX_MAP_FILES,
+            "optional context must be bounded"
+        );
+        assert!(map.render("function").chars().count() <= BUDGET_CHARS);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

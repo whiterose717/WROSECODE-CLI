@@ -587,15 +587,18 @@ async fn decompress(bytes: &[u8], root: &Path) -> Result<Option<(String, String)
 /// Flag-shaped strings inside sweep outputs: the usual prefixes plus the
 /// generic `word{…}` shape so custom formats still surface.
 fn flag_candidate(value: &str) -> Option<String> {
-    let strict = regex::Regex::new(
+    static STRICT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static GENERIC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let strict = STRICT.get_or_init(|| regex::Regex::new(
         r"(?i)\b(?:flag|ctf|htb|picoctf|gctf|ductf|wrose|hitcon|defcon|justctf)\s*\{[^\s{}]{1,120}\}",
-    )
-    .ok()?;
+    ).expect("static flag pattern"));
     if let Some(found) = strict.find(value) {
         return Some(found.as_str().to_string());
     }
-    let generic =
-        regex::Regex::new(r"\b[A-Za-z][A-Za-z0-9_]{2,15}\{[\w!@#$%^&*+=:./?-]{4,80}\}").ok()?;
+    let generic = GENERIC.get_or_init(|| {
+        regex::Regex::new(r"\b[A-Za-z][A-Za-z0-9_]{2,15}\{[\w!@#$%^&*+=:./?-]{4,80}\}")
+            .expect("static generic flag pattern")
+    });
     generic.find(value).map(|found| found.as_str().to_string())
 }
 

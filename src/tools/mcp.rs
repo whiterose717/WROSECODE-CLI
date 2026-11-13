@@ -47,7 +47,10 @@ impl Mcp {
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            // MCP diagnostics must never bypass the WROSECODE renderer and
+            // corrupt the active TUI. The JSON-RPC stdout remains the only
+            // protocol stream; stderr is intentionally detached.
+            .stderr(std::process::Stdio::null())
             .spawn()
             .with_context(|| format!("failed to start MCP server {binary}"))?;
         let stdin = child.stdin.take().context("MCP stdin unavailable")?;
@@ -482,5 +485,53 @@ mod tests {
         );
         assert_eq!(sse_data(": keep-alive\n\n"), None);
         assert_eq!(sse_data("event: ping\n"), None);
+    }
+
+    /// Startup connects MCP servers with one `join_all`, so N slow servers
+    /// must cost ~one stall, not N sequential stalls. This test measures
+    /// both shapes back to back: the parallel span must stay well under the
+    /// sequential span on any machine, however fast or loaded.
+    #[tokio::test]
+    async fn concurrent_connects_share_one_time_span() {
+        let dir = std::env::temp_dir().join(format!("wrose-mcp-slow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("slow_server.py");
+        std::fs::write(
+            &script,
+            "import sys, json, time\n\
+             for line in sys.stdin:\n\
+             \x20   try:\n\
+             \x20       msg = json.loads(line)\n\
+             \x20   except Exception:\n\
+             \x20       continue\n\
+             \x20   time.sleep(0.5)\n\
+             \x20   method = msg.get('method')\n\
+             \x20   if method == 'initialize':\n\
+             \x20       out = {'jsonrpc': '2.0', 'id': msg.get('id'), 'result': {'protocolVersion': '2025-03-26', 'capabilities': {}}}\n\
+             \x20   elif method == 'tools/list':\n\
+             \x20       out = {'jsonrpc': '2.0', 'id': msg.get('id'), 'result': {'tools': []}}\n\
+             \x20   else:\n\
+             \x20       continue\n\
+             \x20   sys.stdout.write(json.dumps(out) + chr(10))\n\
+             \x20   sys.stdout.flush()\n",
+        )
+        .unwrap();
+        let args = vec!["-u".to_string(), script.to_string_lossy().to_string()];
+        let connect = || Mcp::connect("python3", &args);
+        let started = std::time::Instant::now();
+        assert!(connect().await.is_ok(), "first sequential connect");
+        assert!(connect().await.is_ok(), "second sequential connect");
+        let sequential = started.elapsed();
+        let started = std::time::Instant::now();
+        let (first, second) = tokio::join!(connect(), connect());
+        let parallel = started.elapsed();
+        assert!(first.is_ok(), "first parallel connect");
+        assert!(second.is_ok(), "second parallel connect");
+        assert!(
+            parallel < sequential.mul_f32(0.8),
+            "parallel {parallel:?} shares the stall instead of stacking it (sequential {sequential:?})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -46,19 +46,29 @@ fn output_shaping_stays_within_budget() {
 
 #[test]
 fn sse_parsing_stays_within_budget() {
-    // 1000 streamed events drained one by one from a single buffer, the
-    // exact shape of a long tool-call stream.
-    let mut filled: Vec<u8> = Vec::new();
+    let mut filled = Vec::new();
     for index in 0..1_000 {
         filled.extend_from_slice(format!("data: {{\"i\":{index}}}\n\n").as_bytes());
     }
     budget("drain 1000 SSE events", 50, 5, || {
         let mut pending = filled.clone();
-        let mut count = 0;
-        while crate::provider::take_sse_event(&mut pending).is_some() {
-            count += 1;
-        }
-        assert_eq!(count, 1_000, "every event must survive the drain");
+        let events = crate::provider::take_sse_events(&mut pending).unwrap();
+        assert_eq!(events.len(), 1_000, "every event must survive the drain");
+        assert!(pending.is_empty());
+    });
+}
+
+#[test]
+fn batched_sse_20k_events_stays_linear() {
+    let mut filled = Vec::new();
+    for index in 0..20_000 {
+        filled.extend_from_slice(format!("data: {{\"i\":{index}}}\n\n").as_bytes());
+    }
+    budget("drain 20k SSE events", 150, 5, || {
+        let mut pending = filled.clone();
+        let events = crate::provider::take_sse_events(&mut pending).unwrap();
+        assert_eq!(events.len(), 20_000);
+        assert!(pending.is_empty());
     });
 }
 
@@ -71,5 +81,21 @@ fn repo_map_build_stays_within_budget() {
         let mut map = crate::repo_map::RepoMap::default();
         map.update(root).expect("repo map update");
         assert_ne!(map.len(), 0, "the walk must find symbols");
+    });
+}
+
+#[test]
+fn batched_crlf_sse_20k_events_stays_linear() {
+    let mut filled = Vec::new();
+    for index in 0..20_000 {
+        filled.extend_from_slice(format!("data: {{\"i\":{index}}}\r\n\r\n").as_bytes());
+    }
+    budget("drain 20k CRLF SSE events", 150, 5, || {
+        let mut pending = filled.clone();
+        let events = crate::provider::take_sse_events(&mut pending).unwrap();
+        assert_eq!(events.len(), 20_000);
+        assert_eq!(events[0], "data: {\"i\":0}");
+        assert_eq!(events[19_999], "data: {\"i\":19999}");
+        assert!(pending.is_empty());
     });
 }

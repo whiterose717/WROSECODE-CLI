@@ -1,6 +1,8 @@
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -14,6 +16,10 @@ pub struct Skill {
     /// those words is mentioned, even if the name never appears.
     pub keywords: Vec<String>,
     pub body: String,
+    /// External skill bodies are loaded only when selected/matched. Startup
+    /// indexes frontmatter only so thousands of skills do not require tens of
+    /// megabytes of synchronous reads before the first prompt.
+    source: Option<PathBuf>,
 }
 
 #[derive(Default, Deserialize)]
@@ -22,6 +28,26 @@ struct Frontmatter {
     description: Option<String>,
     fork: Option<bool>,
     keywords: Option<serde_yaml::Value>,
+}
+
+const SKILL_INDEX_VERSION: u8 = 1;
+const DEFAULT_SKILL_INDEX_TTL_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Serialize, Deserialize)]
+struct SkillIndex {
+    version: u8,
+    generated_at: u64,
+    roots: Vec<PathBuf>,
+    skills: Vec<IndexedSkill>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexedSkill {
+    name: String,
+    description: String,
+    fork: bool,
+    keywords: Vec<String>,
+    source: PathBuf,
 }
 
 /// `~/.wrosecode/skills` — where hand-placed skills and installed packages
@@ -34,12 +60,89 @@ pub fn default_skills_dir() -> PathBuf {
 }
 
 pub fn discover(root: &Path, extra: &[PathBuf]) -> Result<HashMap<String, Skill>> {
+    let dirs = skill_dirs(root, extra);
+    let mut found = builtin_skills()?;
+
+    if let Some(cached) = load_skill_index(root, &dirs) {
+        found.extend(cached.into_iter().map(|skill| (skill.name.clone(), skill)));
+        return Ok(found);
+    }
+
+    // Walking is cheap; opening hundreds or thousands of metadata files is
+    // not. Collect paths in precedence order, then parse frontmatter with a
+    // small bounded I/O pool before replaying that order into the map.
+    let mut candidates = Vec::new();
+    for dir in &dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(dir)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_name() != "SKILL.md" {
+                continue;
+            }
+            let fallback = entry
+                .path()
+                .parent()
+                .unwrap_or(entry.path())
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            candidates.push((candidates.len(), entry.path().to_path_buf(), fallback));
+        }
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(2)
+        .clamp(1, 8)
+        .min(candidates.len().max(1));
+    let chunk_size = candidates.len().div_ceil(workers).max(1);
+    let mut handles = Vec::new();
+    for chunk in candidates.chunks(chunk_size) {
+        let owned = chunk.to_vec();
+        handles.push(std::thread::spawn(move || {
+            owned
+                .into_iter()
+                .map(|(order, path, fallback)| {
+                    parse_skill_file(&path, &fallback).map(|skill| (order, skill))
+                })
+                .collect::<Vec<_>>()
+        }));
+    }
+    let mut parsed = Vec::with_capacity(candidates.len());
+    for handle in handles {
+        for item in handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("skill metadata worker panicked"))?
+        {
+            parsed.push(item?);
+        }
+    }
+    parsed.sort_by_key(|(order, _)| *order);
+    let mut external = HashMap::new();
+    for (_, skill) in parsed {
+        external.insert(skill.name.clone(), skill);
+    }
+    save_skill_index(root, &dirs, external.values());
+    found.extend(external);
+    Ok(found)
+}
+
+fn skill_dirs(root: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut dirs = vec![
         root.join("skills"),
         root.join(".ctf/skills"),
         default_skills_dir(),
     ];
     dirs.extend_from_slice(extra);
+    dirs
+}
+
+fn builtin_skills() -> Result<HashMap<String, Skill>> {
     let mut found = HashMap::new();
     for (fallback, raw) in [
         ("coding", include_str!("../skills/coding/SKILL.md")),
@@ -67,31 +170,95 @@ pub fn discover(root: &Path, extra: &[PathBuf]) -> Result<HashMap<String, Skill>
         let skill = parse_skill(raw, fallback)?;
         found.insert(skill.name.clone(), skill);
     }
-    for dir in dirs {
-        if !dir.exists() {
-            continue;
-        }
-        for entry in WalkDir::new(dir)
-            .max_depth(3)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if entry.file_name() != "SKILL.md" {
-                continue;
-            }
-            let raw = std::fs::read_to_string(entry.path())?;
-            let fallback = entry
-                .path()
-                .parent()
-                .unwrap_or(entry.path())
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
-            let skill = parse_skill(&raw, &fallback)?;
-            found.insert(skill.name.clone(), skill);
-        }
-    }
     Ok(found)
+}
+
+fn skill_index_ttl_secs() -> u64 {
+    std::env::var("WROSECODE_SKILL_INDEX_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SKILL_INDEX_TTL_SECS)
+}
+
+fn skill_index_path(root: &Path, dirs: &[PathBuf]) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    dirs.hash(&mut hasher);
+    root.join(".wrosecode/cache")
+        .join(format!("skills-{:016x}.json", hasher.finish()))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn load_skill_index(root: &Path, dirs: &[PathBuf]) -> Option<Vec<Skill>> {
+    let raw = std::fs::read_to_string(skill_index_path(root, dirs)).ok()?;
+    let index: SkillIndex = serde_json::from_str(&raw).ok()?;
+    if index.version != SKILL_INDEX_VERSION || index.roots != dirs {
+        return None;
+    }
+    if now_secs().saturating_sub(index.generated_at) > skill_index_ttl_secs() {
+        return None;
+    }
+    Some(
+        index
+            .skills
+            .into_iter()
+            .map(|skill| Skill {
+                name: skill.name,
+                description: skill.description,
+                fork: skill.fork,
+                keywords: skill.keywords,
+                body: String::new(),
+                source: Some(skill.source),
+            })
+            .collect(),
+    )
+}
+
+fn save_skill_index<'a>(root: &Path, dirs: &[PathBuf], skills: impl Iterator<Item = &'a Skill>) {
+    let path = skill_index_path(root, dirs);
+    let entries = skills
+        .filter_map(|skill| {
+            Some(IndexedSkill {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                fork: skill.fork,
+                keywords: skill.keywords.clone(),
+                source: skill.source.clone()?,
+            })
+        })
+        .collect();
+    let index = SkillIndex {
+        version: SKILL_INDEX_VERSION,
+        generated_at: now_secs(),
+        roots: dirs.to_vec(),
+        skills: entries,
+    };
+    let Ok(raw) = serde_json::to_vec(&index) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, raw).is_ok() {
+        let _ = std::fs::rename(tmp, path);
+    }
+}
+
+/// Force the next discovery to rescan metadata. Package installation/removal
+/// calls this automatically; manual skill edits can use `/skills reload`.
+pub fn invalidate_cache(root: &Path, extra: &[PathBuf]) {
+    let dirs = skill_dirs(root, extra);
+    let _ = std::fs::remove_file(skill_index_path(root, &dirs));
 }
 
 pub(crate) fn parse_skill(raw: &str, fallback: &str) -> Result<Skill> {
@@ -110,7 +277,66 @@ pub(crate) fn parse_skill(raw: &str, fallback: &str) -> Result<Skill> {
         fork: meta.fork.unwrap_or(false),
         keywords: normalize_keywords(meta.keywords),
         body,
+        source: None,
     })
+}
+
+/// Index only the YAML frontmatter of an external skill. Reading stops at the
+/// closing `---`, so a 500 KB reference-heavy skill costs only a few hundred
+/// bytes at startup. Files without frontmatter remain usable by fallback name.
+fn parse_skill_file(path: &Path, fallback: &str) -> Result<Skill> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut first = String::new();
+    reader.read_line(&mut first)?;
+    let meta = if first.trim_end() == "---" {
+        let mut yaml = String::new();
+        let mut line = String::new();
+        let mut closed = false;
+        while yaml.len() < 32 * 1024 {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if line.trim_end() == "---" {
+                closed = true;
+                break;
+            }
+            yaml.push_str(&line);
+        }
+        if closed {
+            serde_yaml::from_str::<Frontmatter>(&yaml)?
+        } else {
+            Frontmatter::default()
+        }
+    } else {
+        Frontmatter::default()
+    };
+    Ok(Skill {
+        name: meta.name.unwrap_or_else(|| fallback.into()),
+        description: meta.description.unwrap_or_default(),
+        fork: meta.fork.unwrap_or(false),
+        keywords: normalize_keywords(meta.keywords),
+        body: String::new(),
+        source: Some(path.to_path_buf()),
+    })
+}
+
+impl Skill {
+    /// Return the current body. Built-ins are already resident; external skill
+    /// bodies are read on demand and never contribute to cold-start cost.
+    pub fn body_text(&self) -> Result<String> {
+        let Some(path) = &self.source else {
+            return Ok(self.body.clone());
+        };
+        let raw = std::fs::read_to_string(path)?;
+        if let Some(rest) = raw.strip_prefix("---\n") {
+            if let Some((_, body)) = rest.split_once("\n---\n") {
+                return Ok(body.to_string());
+            }
+        }
+        Ok(raw)
+    }
 }
 
 pub fn match_skill<'a>(skills: &'a HashMap<String, Skill>, text: &str) -> Option<&'a Skill> {
@@ -198,6 +424,68 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(skill.name.clone(), skill);
         map
+    }
+
+    #[test]
+    fn discovery_cache_avoids_rescanning_until_explicit_reload() {
+        let root = std::env::temp_dir().join(format!("wrose-skill-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("skills/cached");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: cached-skill\ndescription: first\n---\nFIRST-BODY",
+        )
+        .unwrap();
+        let first = discover(&root, &[]).unwrap();
+        assert_eq!(first["cached-skill"].description, "first");
+        let cache_dir = root.join(".wrosecode/cache");
+        assert!(cache_dir.exists());
+
+        std::fs::write(
+            &path,
+            "---\nname: cached-skill\ndescription: second\n---\nSECOND-BODY",
+        )
+        .unwrap();
+        let cached = discover(&root, &[]).unwrap();
+        assert_eq!(cached["cached-skill"].description, "first");
+        // Body stays lazy and reads the current file even while metadata is cached.
+        assert!(cached["cached-skill"]
+            .body_text()
+            .unwrap()
+            .contains("SECOND-BODY"));
+
+        invalidate_cache(&root, &[]);
+        let refreshed = discover(&root, &[]).unwrap();
+        assert_eq!(refreshed["cached-skill"].description, "second");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_skill_bodies_are_loaded_lazily() {
+        let root = std::env::temp_dir().join(format!("wrose-skill-lazy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("fast-skill")).unwrap();
+        let path = root.join("fast-skill/SKILL.md");
+        let body = format!(
+            "---\nname: fast-skill\ndescription: lazy body test\nkeywords: [fastword]\n---\nLAZY-BODY-MARKER\n{}",
+            "x".repeat(256 * 1024)
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let skill = parse_skill_file(&path, "fallback").unwrap();
+        assert_eq!(skill.name, "fast-skill");
+        assert_eq!(skill.description, "lazy body test");
+        assert!(skill.keywords.contains(&"fastword".to_string()));
+        assert!(
+            skill.body.is_empty(),
+            "startup must not retain the large body"
+        );
+        let loaded = skill.body_text().unwrap();
+        assert!(loaded.starts_with("LAZY-BODY-MARKER"));
+        assert!(loaded.len() > 256 * 1024);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

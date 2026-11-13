@@ -67,12 +67,12 @@ impl ProcEntry {
     }
 
     fn finish(&self, exit_code: Option<i32>, timed_out: bool) {
-        self.running.store(false, Ordering::Relaxed);
         *match self.exit_code.lock() {
             Ok(code) => code,
             Err(poisoned) => poisoned.into_inner(),
         } = exit_code;
         self.timed_out.store(timed_out, Ordering::Relaxed);
+        self.running.store(false, Ordering::Release);
     }
 
     fn retain_tail(&self) {
@@ -103,7 +103,16 @@ pub struct ProcSnapshot {
 
 impl ProcSnapshot {
     fn of(entry: &ProcEntry) -> Self {
-        let (cpu_pct, rss_kb) = proc_usage(entry.pid);
+        let running = entry.running.load(Ordering::Acquire);
+        // Sampling an exited PID could show stats for an unrelated process
+        // after the kernel reuses its PID. It also wastes two procfs reads.
+        let (cpu_pct, rss_kb) = if running {
+            // Include active script subprocesses rather than only the
+            // sh -c wrapper (which often uses nearly zero CPU itself).
+            proc_usage_tree(entry.pid)
+        } else {
+            (None, None)
+        };
         let live = entry
             .live
             .lock()
@@ -114,7 +123,7 @@ impl ProcSnapshot {
             command: entry.command.clone(),
             cwd: entry.cwd.clone(),
             started: entry.started,
-            running: entry.running.load(Ordering::Relaxed),
+            running,
             exit_code: *entry.exit_code.lock().unwrap_or_else(|p| p.into_inner()),
             timed_out: entry.timed_out.load(Ordering::Relaxed),
             cpu_pct,
@@ -132,37 +141,31 @@ fn registry() -> &'static Mutex<Vec<Arc<ProcEntry>>> {
 fn register(entry: Arc<ProcEntry>) {
     let mut procs = registry().lock().unwrap_or_else(|p| p.into_inner());
     procs.push(entry);
-    if procs.len() > PROC_CAP {
-        let running = procs
+    // Retain the newest commands. Remove the oldest *finished* entry first,
+    // and never lose a running child that the user may need to cancel.
+    while procs.len() > PROC_CAP {
+        let Some(oldest_finished) = procs
             .iter()
-            .filter(|p| p.running.load(Ordering::Relaxed))
-            .count();
-        let mut kept_done = 0usize;
-        let target_done = PROC_CAP.saturating_sub(running);
-        let mut index = 0;
-        while index < procs.len() {
-            let is_running = procs[index].running.load(Ordering::Relaxed);
-            let drop_it = if is_running {
-                false
-            } else if kept_done < target_done {
-                kept_done += 1;
-                false
-            } else {
-                true
-            };
-            if drop_it {
-                procs.remove(index);
-            } else {
-                index += 1;
-            }
-        }
+            .position(|entry| !entry.running.load(Ordering::Relaxed))
+        else {
+            break;
+        };
+        procs.remove(oldest_finished);
     }
 }
 
 /// Newest-last snapshot of every tracked command (bounded by [`PROC_CAP`]).
 pub fn proc_snapshots() -> Vec<ProcSnapshot> {
-    let procs = registry().lock().unwrap_or_else(|p| p.into_inner());
-    procs.iter().map(|entry| ProcSnapshot::of(entry)).collect()
+    // Read process status outside the registry lock: procfs calls and text
+    // conversion should never block other commands from registering.
+    let entries = registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    entries
+        .iter()
+        .map(|entry| ProcSnapshot::of(entry))
+        .collect()
 }
 
 /// Send SIGINT (or SIGTERM when `kill` is set) to a tracked process.
@@ -172,35 +175,62 @@ pub fn proc_snapshots() -> Vec<ProcSnapshot> {
 /// outlive a dashboard kill. A plain-pid delivery is the fallback when the
 /// group signal is refused (foreign pid, platform without group signalling).
 pub fn signal(pid: u32, kill: bool) -> Result<String> {
-    let flag = if kill { "-TERM" } else { "-INT" };
     if pid == 0 {
         return Err(anyhow::anyhow!("cannot signal an unknown pid"));
     }
-    let group = format!("-{pid}");
-    let mut output = std::process::Command::new("kill")
-        .args([flag, "--", &group])
-        .output()?;
-    if !output.status.success() {
-        output = std::process::Command::new("kill")
-            .arg(flag)
-            .arg(pid.to_string())
-            .output()?;
+    let tracked = registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|entry| entry.pid == pid)
+        .cloned();
+    if tracked
+        .as_ref()
+        .is_some_and(|entry| !entry.running.load(Ordering::Acquire))
+    {
+        return Ok(format!("process {pid} already exited"));
     }
-    if output.status.success() {
-        Ok(format!(
-            "SIG{} sent to pid {pid}",
-            if kill { "TERM" } else { "INT" }
-        ))
-    } else {
+
+    #[cfg(unix)]
+    {
+        let signal = if kill { libc::SIGTERM } else { libc::SIGINT };
+        // The supervisor owns the process group. ESRCH is a normal race with
+        // a child that exited between the state check and the signal. A
+        // manually attached dashboard row may be a plain child, so fall back
+        // to its pid without invoking an external `kill` utility.
+        let group_result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+        let group_errno = std::io::Error::last_os_error().raw_os_error();
+        let result = if group_result == 0 {
+            0
+        } else if group_errno == Some(libc::ESRCH) {
+            unsafe { libc::kill(pid as libc::pid_t, signal) }
+        } else {
+            group_result
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        if result == 0 || errno == Some(libc::ESRCH) {
+            if let Some(entry) = tracked {
+                entry.running.store(false, Ordering::Release);
+            }
+            return Ok(format!(
+                "SIG{} sent to pid {pid}",
+                if kill { "TERM" } else { "INT" }
+            ));
+        }
+        Err(std::io::Error::last_os_error().into())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (kill, tracked);
         Err(anyhow::anyhow!(
-            "kill {flag} {pid} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "process cancellation is unavailable on this platform"
         ))
     }
 }
 
 /// Average CPU percent since spawn and resident set size, read from procfs.
 /// Non-Linux platforms get `(None, None)` and the panel prints `n/a`.
+#[cfg(test)]
 pub fn proc_usage(pid: u32) -> (Option<f64>, Option<u64>) {
     #[cfg(target_os = "linux")]
     {
@@ -241,6 +271,78 @@ pub fn proc_usage(pid: u32) -> (Option<f64>, Option<u64>) {
         let _ = pid;
         (None, None)
     }
+}
+
+/// Approximate CPU and resident memory of the tracked command's active
+/// process tree. The procfs task children file avoids scanning all OS
+/// processes each time a WROSECODE tool live status refreshes.
+#[cfg(target_os = "linux")]
+fn proc_usage_tree(root_pid: u32) -> (Option<f64>, Option<u64>) {
+    use std::collections::HashSet;
+
+    let mut pending = vec![root_pid];
+    let mut seen = HashSet::new();
+    let mut cpu_ticks = 0u64;
+    let mut rss_kb = 0u64;
+    let mut sampled = 0u32;
+    let page_kb = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1024) as u64) / 1024;
+
+    while let Some(pid) = pending.pop() {
+        // Hard cap limits procfs work under fork-heavy scripts while leaving
+        // the live rendering responsive.
+        if seen.len() >= 96 || !seen.insert(pid) {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(_) => continue,
+        };
+        let fields: Vec<&str> = stat
+            .rsplit(')')
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        if fields.len() < 13 {
+            continue;
+        }
+        let ticks = fields[11]
+            .parse::<u64>()
+            .ok()
+            .zip(fields[12].parse::<u64>().ok())
+            .map(|(user, system)| user.saturating_add(system));
+        if let Some(ticks) = ticks {
+            cpu_ticks = cpu_ticks.saturating_add(ticks);
+            sampled += 1;
+        }
+        if let Ok(mem) = std::fs::read_to_string(format!("/proc/{pid}/statm")) {
+            if let Some(pages) = mem
+                .split_whitespace()
+                .nth(1)
+                .and_then(|pages| pages.parse::<u64>().ok())
+            {
+                rss_kb = rss_kb.saturating_add(pages.saturating_mul(page_kb));
+            }
+        }
+        if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+            pending.extend(
+                children
+                    .split_whitespace()
+                    .filter_map(|value| value.parse::<u32>().ok()),
+            );
+        }
+    }
+    if sampled == 0 {
+        return (None, None);
+    }
+    let hz = (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as f64;
+    let elapsed = pid_started(root_pid)
+        .map(|start| start.elapsed().as_secs_f64())
+        .filter(|seconds| *seconds > 0.0)
+        .unwrap_or(1.0);
+    // CPU is a process-lifetime average; RSS sums current processes and
+    // may include shared pages more than once. Both are approximate.
+    (Some(cpu_ticks as f64 / hz / elapsed * 100.0), Some(rss_kb))
 }
 
 #[cfg(target_os = "linux")]
@@ -312,7 +414,26 @@ pub fn read_only(command: &str) -> bool {
 }
 
 pub async fn run(command: &str, cwd: &Path) -> Result<String> {
-    run_with_timeout(command, cwd, 30).await
+    run_with_timeout(command, cwd, crate::config::DEFAULT_SHELL_TIMEOUT_SECONDS).await
+}
+
+/// Validate a command's syntax without running it. Returns the first stderr
+/// line of `bash -n` on failure, `None` when the command parses or when
+/// `bash` itself cannot be spawned.
+fn bash_syntax_error(command: &str) -> Option<String> {
+    let checked = std::process::Command::new("bash")
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg("-n")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .ok()?;
+    if checked.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    Some(stderr.lines().next().unwrap_or("syntax error").to_string())
 }
 
 /// SIGKILL an entire process group; a no-op once nothing remains (ESRCH is
@@ -323,9 +444,10 @@ fn kill_group(pid: u32) {
     if pid == 0 {
         return;
     }
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pid}")])
-        .status();
+    // Do not shell out to `kill`: its diagnostic stderr used to leak into the
+    // managed TUI when the process group had already exited. ESRCH is the
+    // expected outcome of a cancellation race and is intentionally ignored.
+    let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
 }
 
 /// Kills the command's whole process group on drop unless disarmed.
@@ -365,6 +487,17 @@ async fn reap(mut reader: tokio::task::JoinHandle<()>) {
 }
 
 pub async fn run_with_timeout(command: &str, cwd: &Path, timeout_seconds: u64) -> Result<String> {
+    // Rectifier step (SWE-agent pattern): reject generated commands that
+    // cannot parse before spawning anything. `bash -n` validates syntax
+    // without executing, so a hallucinated one-liner fails here with the
+    // compiler's own message instead of burning a turn on `sh: syntax error`
+    // output. A missing `bash` binary skips the check rather than breaking
+    // execution on exotic hosts.
+    if let Some(error) = bash_syntax_error(command) {
+        return Err(anyhow::anyhow!(
+            "command failed the `bash -n` syntax check: {error} — fix the syntax instead of retrying"
+        ));
+    }
     let mut process = tokio::process::Command::new("sh");
     process
         .arg("-c")
@@ -393,7 +526,6 @@ pub async fn run_with_timeout(command: &str, cwd: &Path, timeout_seconds: u64) -
     let stdout_reader = spawn_reader(entry.clone(), stdout_pipe, true);
     let stderr_reader = spawn_reader(entry.clone(), stderr_pipe, false);
     let outcome = tokio::time::timeout(Duration::from_secs(timeout_seconds), child.wait()).await;
-    let timed_out = outcome.is_err();
     let exit_code = match outcome {
         Ok(Ok(status)) => status.code(),
         Ok(Err(error)) => {
@@ -403,19 +535,32 @@ pub async fn run_with_timeout(command: &str, cwd: &Path, timeout_seconds: u64) -
             return Err(error.into());
         }
         Err(_) => {
-            // Kill the whole tree *before* awaiting the readers: grandchildren
-            // inheriting the pipes would otherwise keep them open forever.
-            #[cfg(unix)]
-            kill_group(pid);
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            entry.finish(None, true);
-            reap(stdout_reader).await;
-            reap(stderr_reader).await;
-            entry.retain_tail();
-            return Err(anyhow::anyhow!(
-                "command timed out after {timeout_seconds} seconds and was terminated"
-            ));
+            // A SIGCHLD notification can be coalesced while another runtime in
+            // the same process is reaping, or arrive before the wait future is
+            // registered. If the child has already exited, report its real
+            // status instead of a false timeout; only kill when it is genuinely
+            // still running.
+            match child.try_wait() {
+                Ok(Some(status)) => status.code(),
+                _ => {
+                    // Kill the whole tree *before* awaiting the readers:
+                    // grandchildren inheriting the pipes would otherwise keep
+                    // them open forever.
+                    #[cfg(unix)]
+                    kill_group(pid);
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    entry.finish(None, true);
+                    reap(stdout_reader).await;
+                    reap(stderr_reader).await;
+                    entry.retain_tail();
+                    return Err(anyhow::anyhow!(
+                        "command timed out after {timeout_seconds} seconds and was terminated; \
+                         for a legitimately long command, retry with a larger timeout \
+                         in seconds (up to 3600), or raise [agent] shell_timeout_seconds"
+                    ));
+                }
+            }
         }
     };
     reap(stdout_reader).await;
@@ -433,7 +578,7 @@ pub async fn run_with_timeout(command: &str, cwd: &Path, timeout_seconds: u64) -
             .unwrap_or_default();
         format!("exit={}\n{stdout}{stderr}", exit_code.unwrap_or(-1))
     };
-    entry.finish(exit_code, timed_out);
+    entry.finish(exit_code, false);
     entry.retain_tail();
     group.armed = false;
     Ok(text)
@@ -495,6 +640,32 @@ mod tests {
         dir
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_process_tree_cpu_and_ram_sampling_is_available() {
+        let (cpu, memory_kb) = proc_usage_tree(std::process::id());
+        assert!(cpu.is_some(), "own procfs CPU counters should be available");
+        assert!(
+            memory_kb.unwrap_or(0) > 0,
+            "own procfs RAM should be visible"
+        );
+        assert_eq!(proc_usage_tree(u32::MAX), (None, None));
+    }
+
+    #[tokio::test]
+    async fn malformed_commands_fail_the_bash_n_check_before_spawn() {
+        let dir = tmp();
+        let error = run_with_timeout("echo \"unterminated", &dir, 5)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bash -n"), "unexpected error: {error}");
+        // A well-formed multi-line command still passes the check.
+        let text = run_with_timeout("echo a\necho b", &dir, 5).await.unwrap();
+        assert_eq!(text, "exit=0\na\nb\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn streaming_keeps_stdout_before_stderr_and_registers() {
         let dir = tmp();
@@ -536,12 +707,34 @@ mod tests {
     async fn registry_stays_within_its_cap() {
         let dir = tmp();
         for index in 0..(PROC_CAP + 10) {
-            let _ = run_with_timeout(&format!("true # {index}"), &dir, 5)
+            run_with_timeout(&format!("true # {index}"), &dir, 30)
                 .await
-                .unwrap();
+                .unwrap_or_else(|error| panic!("iteration {index} failed: {error}"));
         }
         assert!(proc_snapshots().len() <= PROC_CAP);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_keeps_newest_finished_commands() {
+        let tag = format!(
+            "wrose-registry-retention-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        for index in 0..(PROC_CAP + 3) {
+            let entry = Arc::new(ProcEntry::new(0, &format!("{tag}-{index}"), "."));
+            entry.finish(Some(0), false);
+            register(entry);
+        }
+        let latest = format!("{tag}-{}", PROC_CAP + 2);
+        assert!(
+            proc_snapshots().iter().any(|entry| entry.command == latest),
+            "the newest finished command disappeared from the dashboard"
+        );
     }
 
     #[tokio::test]
@@ -614,6 +807,23 @@ mod tests {
         );
         assert!(text.contains('y'));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finished_process_snapshot_does_not_sample_reused_pid() {
+        // The PID belongs to this still-running test process, while the
+        // dashboard entry deliberately represents an exited child. Reading
+        // /proc for the entry would display this unrelated process's RSS.
+        let pid = std::process::id();
+        assert!(proc_usage(pid).1.is_some(), "test process should have RSS");
+        let entry = ProcEntry::new(pid, "already completed", ".");
+        entry.finish(Some(0), false);
+        let snapshot = ProcSnapshot::of(&entry);
+        assert!(!snapshot.running);
+        assert_eq!(snapshot.exit_code, Some(0));
+        assert_eq!(snapshot.cpu_pct, None);
+        assert_eq!(snapshot.rss_kb, None);
     }
 
     #[test]

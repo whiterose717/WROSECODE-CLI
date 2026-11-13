@@ -89,6 +89,9 @@ pub struct Agent {
     /// One short line per tool call executed by the current turn, for the
     /// end-of-task summary block (TUI result block and headless outcome).
     pub step_log: Vec<String>,
+    /// Per-query goal, strike ledger, and search trigger. The recitation is
+    /// rebuilt from this on every request and never enters the transcript.
+    pub prompt: crate::prompt::PromptState,
 }
 
 /// Whether this turn runs on the configured planner model: the goose
@@ -98,13 +101,119 @@ fn plan_phase_uses_planner(mode: &str, config: &Config) -> bool {
     mode == "plan" && !config.planner_model.is_empty() && !config.planner_provider.is_empty()
 }
 
+/// Dispatch independent read-only probes and CTF hypothesis workers without
+/// unnecessarily serializing them when the thinking level is low. Mutating
+/// batches keep the existing conservative limits.
+fn tool_batch_parallelism(
+    mode: &str,
+    thinking_level: u8,
+    configured_max: usize,
+    calls: &[ToolCall],
+) -> usize {
+    // All mutations in a model-issued batch must keep original call order.
+    // At high think levels the old base could be 20, contradicting the
+    // dispatcher's assumption that mutating batches are serialized. Concurrent
+    // write_file/apply_patch/shell mutations can corrupt each other's state
+    // and make the final answer inaccurate.
+    if calls
+        .iter()
+        .any(|call| matches!(tools::classify(call), tools::ToolClass::Mutating))
+    {
+        return 1;
+    }
+    let base = match thinking_level {
+        0..=3 => 1,
+        4..=7 => 3,
+        8..=12 => 5,
+        _ => configured_max,
+    };
+    let read_only = calls.iter().all(|call| {
+        matches!(
+            call.name.as_str(),
+            "read_file"
+                | "grep"
+                | "glob"
+                | "decode"
+                | "web_search"
+                | "web_fetch"
+                | "search_writeups"
+        )
+    });
+    let ctf_hypotheses = mode == "ctf" && calls.iter().all(|call| call.name == "delegate_task");
+    let floor = if read_only {
+        8
+    } else if ctf_hypotheses {
+        4
+    } else {
+        1
+    };
+    base.max(floor)
+        .min(configured_max.max(1))
+        .min(calls.len().max(1))
+}
+
+/// Provider failures caused by transport/server conditions may recover on a
+/// retry. Authentication and configuration failures will not, so repeating
+/// them only freezes the UI and burns latency.
+fn retryable_provider_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ![
+        "bad or missing api key",
+        "invalid api key",
+        "invalid_api_key",
+        "unauthorized",
+        "forbidden",
+        "insufficient_quota",
+        "billing hard limit",
+        "not signed in",
+        "not authorized",
+        "plan usage is not authorized",
+        "base url returned 404",
+        "unknown provider",
+        "unsupported provider",
+        "needs a base url",
+        "provider payload validation failed",
+        "model is empty",
+        "empty tool name",
+        "unknown tool requested",
+        "http 400",
+        "http 401",
+        "http 402",
+        "http 403",
+        "http 405",
+        "http 413",
+        "http 422",
+        "model not found",
+        "model does not exist",
+        "context length exceeded",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 impl Agent {
     pub fn set_mode(&mut self, mode: &str) -> Result<()> {
-        if !matches!(mode, "build" | "plan" | "general") {
+        // `/mode bounty` is the short form used by the mode table; the
+        // internal name predates it and the tools key off `bugbounty`.
+        let mode = if mode == "bounty" { "bugbounty" } else { mode };
+        if !matches!(mode, "build" | "plan" | "general" | "ctf" | "bugbounty") {
             bail!("unknown agent: {mode}");
         }
+        if mode != "ctf" {
+            self.ctf.unlock_category();
+        } else if self.mode != "ctf" {
+            self.ctf.begin_run();
+        }
+        // CTF and bug-bounty runs arm their own allowlist after this call;
+        // every other mode must start with no inherited scope.
+        if mode != "ctf" && mode != "bugbounty" {
+            self.tools.set_scope(None);
+        }
         self.mode = mode.into();
-        self.tools.plan = mode != "build";
+        // Only Plan is read-only. General has always been able to edit; a
+        // regression here silently bricked file changes in General mode.
+        self.tools.plan = mode == "plan";
+        self.tools.bugbounty_mode = mode == "bugbounty";
         // The built-in modes carry no extra system prompt: selecting one drops
         // an active user-defined agent.
         self.agent_name.clear();
@@ -267,7 +376,7 @@ impl Agent {
     ) -> Result<Self> {
         let skills = skills::discover(&config.root, &config.skill_dirs)?;
         let memory = Memory::new(&config.root);
-        let harness = Harness::parse(&config.harness).unwrap_or(Harness::Claude);
+        let harness = Harness::parse(&config.harness).unwrap_or(Harness::Minimal);
         Ok(Self {
             config: config.clone(),
             provider,
@@ -301,28 +410,28 @@ impl Agent {
             pinned: Vec::new(),
             step_log: Vec::new(),
             trace: crate::trace::TraceSink::default(),
+            prompt: crate::prompt::PromptState::default(),
         })
     }
 
     pub async fn turn(&mut self, text: &str) -> Result<String> {
         self.step_log.clear();
-        let _trace = self
+        let _turn = self
             .trace
-            .guard("turn", text.chars().take(80).collect::<String>());
+            .begin_turn(&text.chars().take(80).collect::<String>());
+        self.repair_tool_history();
         self.compact_if_needed().await;
+        // General/build prompts may also be CTF tasks. New tasks must not
+        // reuse a previous challenge's flag as evidence.
+        if self.mode != "ctf" && crate::prompt::is_ctf_intent(text) {
+            self.ctf.begin_run();
+        }
         if !self.ctf.category_locked() {
             self.ctf.category = crate::ctf::categorize(&self.config.root, text);
         }
-        if self.messages.is_empty() {
-            for hit in self.ctf.scan_project() {
-                if let Some(tx) = &self.event_tx {
-                    let _ = tx.send(Progress::FlagFound {
-                        flag: hit.flag,
-                        source: hit.source,
-                    });
-                }
-            }
-        }
+        // CTF entry points preflight the selected target. An eager scan of
+        // the whole cwd here can mistake an unrelated solved challenge's
+        // artifact for the current flag and delays the first model request.
         self.messages.push(Message {
             role: "user".into(),
             content: vec![Content::Text(text.into())],
@@ -332,14 +441,16 @@ impl Agent {
             .as_ref()
             .and_then(|name| self.skills.get(name))
             .or_else(|| skills::match_skill(&self.skills, text))
-            .filter(|skill| skill.fork)
+            // Bug-bounty briefs mention network verbs; forking a CTF skill
+            // there would spend model calls on an unrelated child agent.
+            .filter(|skill| skill.fork && self.mode != "bugbounty")
             .cloned()
         {
             let mut child_skills = self.skills.clone();
             if let Some(child_skill) = child_skills.get_mut(&skill.name) {
                 child_skill.fork = false;
             }
-            let task = format!("{}\n\nTask: {text}", skill.body);
+            let task = format!("{}\n\nTask: {text}", skill.body_text()?);
             let mut child = Agent {
                 config: self.config.clone(),
                 provider: self.provider.clone(),
@@ -378,6 +489,7 @@ impl Agent {
                 step_log: Vec::new(),
                 trace: self.trace.clone(),
                 store: self.store.clone(),
+                prompt: crate::prompt::PromptState::default(),
             };
             let summary = child.run(&task).await?;
             self.messages.push(Message {
@@ -389,6 +501,35 @@ impl Agent {
             });
         }
         self.run(text).await
+    }
+
+    /// A cancelled tool batch may leave assistant calls without results.
+    /// Close those protocol entries before the next request; never replay
+    /// unknown side effects just to repair the provider's message format.
+    fn repair_tool_history(&mut self) {
+        let mut pending = std::collections::BTreeMap::new();
+        for message in &self.messages {
+            for content in &message.content {
+                match content {
+                    Content::Call(call) => {
+                        pending.insert(call.id.clone(), call.name.clone());
+                    }
+                    Content::Result { id, .. } => {
+                        pending.remove(id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !pending.is_empty() {
+            self.messages.push(Message {
+                role: "user".into(),
+                content: pending.into_iter().map(|(id, name)| Content::Result {
+                    id, is_error: true,
+                    output: format!("{name} was interrupted before its result was recorded. Inspect actual state before retrying; side effects may already have occurred."),
+                }).collect(),
+            });
+        }
     }
 
     /// True once the conversation has outgrown `compact_at_chars` and the
@@ -591,13 +732,98 @@ impl Agent {
         looped
     }
 
+    /// Handle narrowly defined, read-only directory queries with one real
+    /// shell tool invocation. This avoids model/tool/model loops and returns
+    /// the exact captured bytes instead of a potentially incomplete summary.
+    async fn run_quick_directory(&mut self, command: &str) -> Result<String> {
+        let call = ToolCall {
+            item_id: None,
+            id: format!("fast-directory-{}", self.messages.len()),
+            name: "shell".into(),
+            input: serde_json::json!({"command": command, "timeout": "10"}),
+        };
+        let started = Instant::now();
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(Progress::ToolBegin {
+                id: call.id.clone(),
+                title: "Reading directories".into(),
+            });
+        }
+        let output = self.tools.execute(&call).await;
+        let ok = output.as_ref().is_ok_and(|s| s.starts_with("exit=0\n"));
+        self.metrics.record_tool(ok);
+        self.step_log.push(step_title(&call, ok));
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(Progress::ToolEnd {
+                id: call.id.clone(),
+                ok,
+                output: crate::crash::redact(match &output {
+                    Ok(value) => value,
+                    Err(_) => "directory probe failed",
+                }),
+                elapsed_ms: started.elapsed().as_millis(),
+            });
+        }
+        let output = output?;
+        let Some(exact) = output.strip_prefix("exit=0\n") else {
+            bail!("directory probe failed: {}", tools::truncate(output, 1_000));
+        };
+        // A silent truncation would be an accuracy bug. Tell the caller to
+        // narrow an unusually large listing instead of presenting partial data.
+        if exact.len() > 64_000 {
+            bail!("directory listing exceeds 64 KiB; narrow the target directory");
+        }
+        let answer = if exact.trim().is_empty() {
+            "(no directories found)".to_string()
+        } else {
+            exact.trim_end_matches('\n').to_string()
+        };
+        self.last_api_latency = None;
+        self.last_turn_reasoning = 0;
+        self.messages.push(Message {
+            role: "assistant".into(),
+            content: vec![Content::Text(answer.clone())],
+        });
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(Progress::TextDelta(answer.clone()));
+        }
+        self.auto_finish(true);
+        Ok(answer)
+    }
+
     async fn run(&mut self, query: &str) -> Result<String> {
-        // The loop detector is per query: a repeated setup across user
-        // turns is not a stuck model.
+        // The loop detector and the strike ledger are per query: a repeated
+        // setup across user turns is not a stuck model.
         self.recent_calls.clear();
+        self.prompt.begin(query);
+        self.trace.event(
+            "prompt_submitted",
+            &format!("chars={} mode={}", query.chars().count(), self.mode),
+        );
+        // Preserve user-defined agent/skill behavior and CTF orchestration;
+        // only standalone, unambiguous read-only probes take this fast path.
+        if self.mode == "build"
+            && self.agent_name.is_empty()
+            && self.active_skill.is_none()
+            && self.pinned.is_empty()
+        {
+            if let Some(command) = quick_directory_command(query, &self.config.root) {
+                return self.run_quick_directory(&command).await;
+            }
+        }
         let mut last_text = String::new();
         let mut repairs = 0;
         let mut used_tools_this_turn = false;
+        let ctf_task = self.mode == "ctf" || crate::prompt::is_ctf_intent(query);
+        let mut ctf_verification_reprompted = false;
+        // Greetings never need a repo walk, skill expansion, dozens of tool
+        // schemas, or medium/high reasoning. Keep explicit /think unchanged
+        // for substantive Build and CTF requests.
+        let quick_greeting = self.agent_name.is_empty() && is_quick_greeting(query);
+        let quick_listing =
+            self.agent_name.is_empty() && self.mode != "ctf" && is_directory_listing(query);
+        let lightweight = quick_greeting || quick_listing;
+        let mut turn_map: Option<String> = None;
         // The goose planner/worker split: in the read-only `plan` mode a
         // separately configured planner model does the thinking; every
         // other mode runs the worker (the main provider). Built once per
@@ -613,32 +839,73 @@ impl Agent {
             None
         };
         loop {
-            let map = {
-                let mut guard = self
-                    .repo_map
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("repo map poisoned"))?;
-                guard.update(&self.config.root)?;
-                guard.render(query)
-            };
-            let memory = self.memory.recall(query)?;
-            let skill = self
-                .active_skill
-                .as_ref()
-                .and_then(|name| self.skills.get(name))
-                .or_else(|| skills::match_skill(&self.skills, query));
-            let skill_text = skill
-                .map(|s| {
-                    if s.fork {
-                        format!(
-                            "Skill {} is forked; use delegate_task for it. {}",
-                            s.name, s.description
-                        )
-                    } else {
-                        s.body.clone()
+            let context_started = Instant::now();
+            // Filesystem walk plus PageRank stay off the async executor: a
+            // cold tree costs seconds, and blocking here would stall model
+            // streams, tool I/O, and cancellation on every worker. The map
+            // is taken out of its mutex, moved through a blocking worker,
+            // and restored — the render cache inside makes repeated turns
+            // over unchanged trees nearly free.
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(Progress::ModelStage("Preparing request context…".into()));
+            }
+            let map = if lightweight || ctf_task {
+                // Standalone CTF source/protocol problems do not benefit
+                // from a broad repository symbol walk every model turn.
+                String::new()
+            } else if let Some(cached) = &turn_map {
+                cached.clone()
+            } else {
+                let taken = {
+                    let mut guard = self
+                        .repo_map
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("repo map poisoned"))?;
+                    std::mem::take(&mut *guard)
+                };
+                let root = self.config.root.clone();
+                let query_owned = query.to_string();
+                let maps = self.repo_map.clone();
+                let _map_trace = self.trace.guard("repo_map", String::new());
+                let worker = tokio::task::spawn_blocking(move || {
+                    let mut taken = taken;
+                    let result = taken.update(&root).map(|()| taken.render(&query_owned));
+                    // Restore ownership inside the worker even if the caller
+                    // cancels or its context deadline expires.
+                    if let Ok(mut guard) = maps.lock() {
+                        *guard = taken;
                     }
-                })
-                .unwrap_or_default();
+                    result
+                });
+                // Optional context cannot hold a user request hostage.
+                let map = match tokio::time::timeout(Duration::from_millis(500), worker).await {
+                    Ok(Ok(Ok(map))) => map,
+                    _ => String::new(),
+                };
+                turn_map = Some(map.clone());
+                map
+            };
+            let memory = if lightweight {
+                String::new()
+            } else {
+                self.memory.recall(query)?
+            };
+            let skill = if lightweight || self.mode == "bugbounty" {
+                None
+            } else {
+                self.active_skill
+                    .as_ref()
+                    .and_then(|name| self.skills.get(name))
+                    .or_else(|| skills::match_skill(&self.skills, query))
+            };
+            let skill_text = match skill {
+                Some(s) if s.fork => format!(
+                    "Skill {} is forked; use delegate_task for it. {}",
+                    s.name, s.description
+                ),
+                Some(s) => s.body_text()?,
+                None => String::new(),
+            };
             let instructions = if self.instructions.is_empty() {
                 String::new()
             } else {
@@ -663,7 +930,7 @@ impl Agent {
             // tail — think level, recall, repo map, skill — follows the
             // boundary marker.
             let stable = format!(
-                "{}\n{}{}{}Project: {}\nMode: {}\nCTF category: {}\nRules:\n{}\n",
+                "{}\n{}{}{}Project: {}\nMode: {}\nCTF category: {}\n{}\n",
                 self.harness.prompt(),
                 overlay,
                 instructions,
@@ -671,56 +938,199 @@ impl Agent {
                 self.config.root.display(),
                 self.mode,
                 self.ctf.category,
-                AGENTIC_ORCHESTRATOR_DOCTRINE,
+                crate::prompt::constitution(&self.mode),
+            );
+            let ctf_mode = if self.mode == "ctf" {
+                "CTF MODE: operate only in the approved scope. Prioritize a working reproducible solver and observed flag evidence; verify the solver's exit status and recovered bytes, never claim a flag from model text alone.\n"
+            } else if crate::prompt::is_ctf_intent(query) {
+                crate::prompt::CTF_GENERAL_TASK_GUIDANCE
+            } else {
+                ""
+            };
+            let bounty_mode = if self.mode == "bugbounty" {
+                crate::bugbounty::doctrine()
+            } else {
+                ""
+            };
+            let plan_items = self
+                .tools
+                .checklist
+                .lock()
+                .map(|items| items.clone())
+                .unwrap_or_default();
+            // Recency anchor: environment, task tree, and the one pending
+            // directive sit at the very end of the prompt, after the cheap
+            // volatile fields. Nothing here may move into the stable prefix
+            // (the date, plan, and strike counts change between requests).
+            let tail = crate::prompt::volatile_tail(
+                &self.prompt,
+                &plan_items,
+                &self.config.root,
+                &self.mode,
+                self.tools.plan,
             );
             let volatile = format!(
-                "Thinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}",
+                "{ctf_mode}{bounty_mode}Thinking level: {}/20 (mode {}). At higher levels, use independent delegate_task calls, checker tasks, and race strategies when useful; never exceed 20 concurrent tasks.\nRelevant memory:\n{}\nRepo map:\n{}\nSkill:\n{}\n{}",
                 self.thinking_level,
                 self.think.name(),
                 memory,
                 map,
-                skill_text
+                skill_text,
+                tail
             );
-            let system = format!(
-                "{stable}{}{volatile}",
-                crate::provider::SYSTEM_VOLATILE_MARK
+            let system = if quick_greeting {
+                format!("You are WROSECODE, a helpful coding and CTF assistant. Respond warmly and very briefly to this greeting. Do not use tools.\n{instructions}{overlay}{pinned}")
+            } else if quick_listing {
+                format!("You are WROSECODE. Inspect the requested directory using shell or glob and report actual results. Do not analyze repositories or delegate this simple listing.\nProject: {}\n{instructions}{overlay}{pinned}", self.config.root.display())
+            } else {
+                format!(
+                    "{stable}{}{volatile}",
+                    crate::provider::SYSTEM_VOLATILE_MARK
+                )
+            };
+            self.trace.log(
+                "context_build",
+                context_started.elapsed().as_millis(),
+                &format!(
+                    "system_chars={} messages={} schemas_pending=1",
+                    system.len(),
+                    self.messages.len()
+                ),
             );
             if let Some(tx) = &self.event_tx {
                 let _ = tx.send(Progress::ResetText);
             }
             let started = Instant::now();
-            let schemas = self.tools.schemas();
+            let schemas = if quick_greeting {
+                Vec::new()
+            } else if quick_listing {
+                self.tools
+                    .schemas()
+                    .into_iter()
+                    .filter(|schema| {
+                        matches!(
+                            schema["name"].as_str(),
+                            Some("shell" | "glob" | "read_file")
+                        )
+                    })
+                    .collect()
+            } else {
+                self.tools.schemas()
+            };
             let mut selected_provider = planner.clone().unwrap_or_else(|| self.provider.clone());
+            let mut retry_think = if lightweight {
+                ThinkLevel::Off
+            } else {
+                self.provider_think()
+            };
             let mut response = None;
             let mut last_error = None;
+            let mut capabilities_logged = false;
             for attempt in 0..3 {
-                let prompt = if attempt == 2 {
-                    format!(
-                        "{}\nProject: {}\nComplete the user task directly. Use tools only when required.",
-                        self.harness.prompt(),
-                        self.config.root.display()
-                    )
-                } else {
-                    system.clone()
-                };
+                if !capabilities_logged {
+                    capabilities_logged = true;
+                    let caps = selected_provider.capabilities();
+                    self.trace.event(
+                        "provider_capabilities",
+                        &format!(
+                            "model={} streaming={} tools={} parallel_tools={} cache={} reasoning={} usage={}",
+                            self.config.model,
+                            caps.streaming,
+                            caps.tool_calling,
+                            caps.parallel_tool_calls,
+                            caps.prompt_cache,
+                            caps.reasoning_controls,
+                            caps.usage_reporting
+                        ),
+                    );
+                }
+                let attempt_started = Instant::now();
+                self.trace.event(
+                    "provider_request_started",
+                    &format!(
+                        "attempt={} schemas={} messages={} think={}",
+                        attempt + 1,
+                        schemas.len(),
+                        self.messages.len(),
+                        retry_think.name()
+                    ),
+                );
+                if let Some(tx) = &self.event_tx {
+                    let stage = if attempt == 0 {
+                        "Sending prompt to model".to_string()
+                    } else {
+                        format!(
+                            "Retrying model request ({}/3) · think {}",
+                            attempt + 1,
+                            retry_think.name()
+                        )
+                    };
+                    let _ = tx.send(Progress::ModelStage(stage));
+                }
+                if attempt > 0 {
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(Progress::ResetText);
+                    }
+                }
+                // Recovery must preserve project instructions, CTF scope,
+                // pinned files and the user's task context on every attempt.
+                let prompt = system.clone();
                 match selected_provider
                     .complete_with_think(
                         &prompt,
                         &self.messages,
                         &schemas,
-                        false,
+                        quick_listing && !used_tools_this_turn && !schemas.is_empty(),
                         self.event_tx.as_ref(),
-                        self.provider_think(),
+                        retry_think,
                     )
                     .await
                 {
                     Ok(value) => {
+                        let tool_calls = value
+                            .content
+                            .iter()
+                            .filter(|content| matches!(content, Content::Call(_)))
+                            .count();
+                        self.trace.log(
+                            "provider_response",
+                            attempt_started.elapsed().as_millis(),
+                            &format!(
+                                "attempt={} tool_calls={} input={} output={} reasoning={} cache_read={} estimated={}",
+                                attempt + 1,
+                                tool_calls,
+                                value.usage.input,
+                                value.usage.output,
+                                value.usage.reasoning,
+                                value.usage.cache_read,
+                                value.usage.estimated
+                            ),
+                        );
                         response = Some(value);
                         break;
                     }
                     Err(error) => {
+                        let message = error.to_string();
+                        let kind = crate::provider::classify_error(&message);
+                        let lower = message.to_ascii_lowercase();
+                        let rate_limited = lower.contains("rate limited") || lower.contains("429");
+                        let retryable = retryable_provider_error(&message);
+                        self.trace.log(
+                            kind.as_str(),
+                            attempt_started.elapsed().as_millis(),
+                            &format!(
+                                "attempt={} retryable={} {}",
+                                attempt + 1,
+                                retryable,
+                                message
+                            ),
+                        );
                         last_error = Some(error);
-                        if attempt == 1
+
+                        // Fail over after the first failed primary request, not
+                        // after two full failures. This is especially important
+                        // when a dead endpoint consumes the inactivity timeout.
+                        if attempt == 0
                             && !self.config.fallback_provider.is_empty()
                             && !self.config.fallback_model.is_empty()
                         {
@@ -730,9 +1140,41 @@ impl Agent {
                                 self.tools.client.clone(),
                             ) {
                                 selected_provider = provider;
+                                retry_think = self.provider_think();
+                                continue;
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+
+                        if !retryable {
+                            break;
+                        }
+                        if !rate_limited
+                            && (lower.contains("timeout")
+                                || lower.contains("timed out")
+                                || lower.contains("stalled"))
+                        {
+                            retry_think = match retry_think {
+                                ThinkLevel::Max | ThinkLevel::High => ThinkLevel::Medium,
+                                ThinkLevel::Medium => ThinkLevel::Low,
+                                ThinkLevel::Low | ThinkLevel::Off | ThinkLevel::Auto => {
+                                    ThinkLevel::Off
+                                }
+                            };
+                        }
+                        let delay = if rate_limited {
+                            // A lower thinking budget often turns a provider
+                            // token-rate 429 into a successful retry. Keep
+                            // the configured level unchanged for later turns.
+                            retry_think = ThinkLevel::from_level(
+                                self.thinking_level.saturating_sub(5 * (attempt as u8 + 1)),
+                            );
+                            Duration::from_secs(2_u64 << attempt.min(4))
+                        } else {
+                            Duration::from_millis(250 * (1 << attempt))
+                        };
+                        if attempt < 2 {
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                 }
             }
@@ -793,11 +1235,19 @@ impl Agent {
                 .collect();
             // Loop detector: the fourth identical (name, input) call in a
             // row fails locally with a clear message instead of burning
-            // another identical round-trip.
+            // another identical round-trip. The strike ledger closes a path
+            // that already failed three times while it stays in that state.
             let mut looped = HashSet::new();
+            let mut tripped = HashSet::new();
             for call in &calls {
                 if self.register_call(call) {
                     looped.insert(call.id.clone());
+                } else if self
+                    .prompt
+                    .strikes
+                    .exhausted(&crate::prompt::signature(&call.name, &call.input))
+                {
+                    tripped.insert(call.id.clone());
                 }
             }
             let text = response
@@ -814,15 +1264,51 @@ impl Agent {
                 .join("\n");
             if !text.is_empty() {
                 last_text = text;
-                self.emit_flags("model response", &last_text).await;
+                // Generic CTF prompts must not persist or auto-copy
+                // model-only guesses as verified challenge flags.
+                self.emit_flags(self.mode == "ctf", "model response", &last_text)
+                    .await;
             }
             self.messages.push(Message {
                 role: "assistant".into(),
                 content: response.content,
             });
             if calls.is_empty() {
-                // Answer-only runs leave `auto` at low so trivial reads and
-                // short replies never sit above it (spec PHASE 4).
+                if ctf_task {
+                    // A model claim alone is not evidence. Require a
+                    // matching recorded tool output or re-derived artifact.
+                    if let Some(found) =
+                        crate::autopilot::verify(&self.ctf, &self.ctf.current_hits())
+                    {
+                        self.auto_finish(used_tools_this_turn);
+                        return Ok(format!(
+                            "Verified flag: {} ({})",
+                            found.flag, found.evidence
+                        ));
+                    }
+                    if !self.ctf.detect("model response", &last_text).is_empty() {
+                        if used_tools_this_turn && !ctf_verification_reprompted {
+                            // One final chance to execute a real check. Do
+                            // not incur extra model calls for plainly unsolved
+                            // tasks, or repeat this verification indefinitely.
+                            ctf_verification_reprompted = true;
+                            self.messages.push(Message {
+                                role: "user".into(),
+                                content: vec![Content::Text(
+                                    "CTF VERIFICATION GATE: The previous answer contains a flag                                      candidate but no successful tool execution or reproducible                                      artifact supports it. Run the authorized dynamic solver                                      or checker, inspect exit status and actual output.                                      If verification fails, report UNSOLVED with the error."
+                                        .into(),
+                                )],
+                            });
+                            continue;
+                        }
+                        self.auto_finish(used_tools_this_turn);
+                        return Ok(format!(
+                            "UNVERIFIED CTF candidate — no tool or artifact evidence.\n\n{}",
+                            last_text
+                        ));
+                    }
+                }
+                // Answer-only turns can finish without an extra provider call.
                 self.auto_finish(used_tools_this_turn);
                 return Ok(last_text);
             }
@@ -863,21 +1349,29 @@ impl Agent {
             // startup defaults, so `auto` escalations reach them too.
             let think = self.think;
             let live_level = self.thinking_level;
-            let dynamic_parallel = match live_level {
-                0..=3 => 1,
-                4..=7 => 3,
-                8..=12 => 5,
-                _ => self.config.max_parallel_tasks,
-            };
-            let parallel_limit = Arc::new(Semaphore::new(
-                dynamic_parallel.min(self.config.max_parallel_tasks),
-            ));
+            let parallel_limit = Arc::new(Semaphore::new(tool_batch_parallelism(
+                &self.mode,
+                live_level,
+                self.config.max_parallel_tasks,
+                &calls,
+            )));
+            // Per-resource-class gates apply only to batches that contain no
+            // mutation. Mutating batches are already serialized by
+            // `tool_batch_parallelism`, and keeping their dispatch on one
+            // permit preserves the existing ordering guarantees.
+            let batch_mutating = calls
+                .iter()
+                .any(|call| matches!(tools::classify(call), tools::ToolClass::Mutating));
+            let class_limits = (!batch_mutating)
+                .then(|| tools::ToolClassLimits::new(self.config.max_parallel_tasks));
             let task_results = self.task_results.clone();
             let metrics = self.metrics.clone();
             let store = self.store.clone();
             let agent_system = self.agent_system.clone();
             let agent_name = self.agent_name.clone();
             let trace = self.trace.clone();
+            let child_mode = self.mode.clone();
+            let child_ctf = self.ctf.clone();
             // Snapshot every file this batch is about to touch, so `/undo`
             // can restore the pre-edit state (`src/snapshot.rs`).
             let mut snapshot_paths: Vec<std::path::PathBuf> = Vec::new();
@@ -920,9 +1414,28 @@ impl Agent {
                 let agent_system = agent_system.clone();
                 let trace = trace.clone();
                 let agent_name = agent_name.clone();
+                let child_mode = child_mode.clone();
+                let child_ctf = child_ctf.clone();
+                let class_limits = class_limits.clone();
                 let looped = looped.clone();
+                let tripped = tripped.clone();
                 async move {
+                    if tripped.contains(&call.id) {
+                        trace.event("tool_skipped", &format!("{} circuit_breaker", call.name));
+                        return (
+                            call.id.clone(),
+                            Err(anyhow::anyhow!(
+                                "circuit breaker: `{}` has already failed three times with these exact arguments and is refused for this query — mark the step blocked and pivot or call web_search for an alternative",
+                                call.name
+                            )),
+                            0,
+                        );
+                    }
                     if looped.contains(&call.id) {
+                        trace.event(
+                            "tool_skipped",
+                            &format!("{} loop_detected", call.name),
+                        );
                         return (
                             call.id.clone(),
                             Err(anyhow::anyhow!(
@@ -932,6 +1445,17 @@ impl Agent {
                             0,
                         );
                     }
+                    let class = crate::tools::classify(call);
+                    let queued = Instant::now();
+                    let _class_permit = match &class_limits {
+                        Some(limits) => limits.for_call(class).acquire_owned().await.ok(),
+                        None => None,
+                    };
+                    trace.log(
+                        "tool_queue",
+                        queued.elapsed().as_millis(),
+                        &format!("{} class={}", call.name, class.as_str()),
+                    );
                     let _permit = parallel_limit.acquire_owned().await.ok();
                     let started = Instant::now();
                     let result = if call.name == "delegate_task" {
@@ -1017,11 +1541,14 @@ impl Agent {
                                 skills: skills::discover(&config.root, &config.skill_dirs)
                                     .unwrap_or_default(),
                                 event_tx: child_tx,
-                                mode: "build".into(),
+                                // Delegated CTF hypotheses must keep the CTF
+                                // doctrine, category, flag regex, and shared hit
+                                // registry. Build/plan children keep their parent
+                                // mode as well instead of silently becoming build.
+                                mode: child_mode,
                                 active_skill: None,
                                 last_api_latency: None,
-                                ctf: CtfEngine::new(&config.root)
-                                    .with_alert_bell(config.alert_bell),
+                                ctf: child_ctf,
                                 think,
                                 thinking_level: live_level,
                                 think_fail_streak: 0,
@@ -1041,6 +1568,7 @@ impl Agent {
                                 pinned: Vec::new(),
                                 step_log: Vec::new(),
                                 trace: trace.clone(),
+                                prompt: crate::prompt::PromptState::default(),
                             };
                             let result = child.run(task).await;
                             if let Ok(summary) = &result {
@@ -1064,14 +1592,36 @@ impl Agent {
                         }
                         result
                     };
-                    (call.id.clone(), result, started.elapsed().as_millis())
+                    let elapsed = started.elapsed().as_millis();
+                    trace.log(
+                        "tool",
+                        elapsed,
+                        &format!(
+                            "{} class={} ok={}",
+                            call.name,
+                            class.as_str(),
+                            result.is_ok()
+                        ),
+                    );
+                    (call.id.clone(), result, elapsed)
                 }
             }))
             .await;
+            let mut class_counts: HashMap<&'static str, usize> = HashMap::new();
+            for call in &calls {
+                *class_counts
+                    .entry(crate::tools::classify(call).as_str())
+                    .or_default() += 1;
+            }
+            let class_summary = class_counts
+                .iter()
+                .map(|(class, count)| format!("{class}={count}"))
+                .collect::<Vec<_>>()
+                .join(",");
             self.trace.log(
                 "tools",
                 batch_started.elapsed().as_millis(),
-                &format!("{} calls", calls.len()),
+                &format!("{} calls {class_summary}", calls.len()),
             );
             let mut edited_paths: Vec<String> = calls
                 .iter()
@@ -1103,8 +1653,12 @@ impl Agent {
                 self.metrics.record_tool(result.is_ok());
                 self.step_log.push(step_title(call, result.is_ok()));
                 if let Ok(output) = result {
-                    self.emit_flags(&format!("tool:{}", call.name), output)
-                        .await;
+                    // Shell may return Ok(exit=1 ...) for a failed process.
+                    // Failed output is not successful CTF proof.
+                    if usable_ctf_tool_evidence(&call.name, output) {
+                        self.emit_flags(ctf_task, &format!("tool:{}", call.name), output)
+                            .await;
+                    }
                 }
                 if let Some(tx) = &self.event_tx {
                     let _ = tx.send(Progress::ToolEnd {
@@ -1127,20 +1681,47 @@ impl Agent {
                     }
                 }
             }
+            // Feed the circuit breaker and search detector before the next
+            // request is built. Summaries are bounded: the breaker only needs
+            // the error text or the banner, not the whole observation.
+            let observations: Vec<crate::prompt::Observation> = calls
+                .iter()
+                .zip(results.iter())
+                .map(|(call, (_, result, _))| crate::prompt::Observation {
+                    signature: crate::prompt::signature(&call.name, &call.input),
+                    name: call.name.clone(),
+                    ok: result.is_ok(),
+                    summary: match result {
+                        Ok(output) => tools::truncate(output.clone(), 4_000),
+                        Err(error) => error.to_string(),
+                    },
+                })
+                .collect();
+            self.prompt.observe(&observations, &self.mode);
             // Failures drive the `auto` thinking controller: three
             // consecutive failing steps escalate the level.
             let failures = results
                 .iter()
                 .filter(|(_, result, _)| result.is_err())
                 .count();
-            let mut blocks: Vec<Content> = results
-                .into_iter()
-                .map(|(id, result, _)| match result {
-                    Ok(output) => Content::Result {
-                        id,
-                        output,
-                        is_error: false,
-                    },
+            let mut blocks: Vec<Content> = calls
+                .iter()
+                .zip(results)
+                .map(|(call, (id, result, _))| match result {
+                    Ok(output) => {
+                        // Network text is attacker-influenceable data. Frame
+                        // it so the model treats it as evidence, not orders.
+                        let output = if crate::prompt::is_external_tool(&call.name) {
+                            crate::prompt::wrap_untrusted(&call.name, &call.input, output)
+                        } else {
+                            output
+                        };
+                        Content::Result {
+                            id,
+                            output,
+                            is_error: false,
+                        }
+                    }
                     Err(error) => Content::Result {
                         id,
                         output: error.to_string(),
@@ -1182,10 +1763,46 @@ impl Agent {
                     }
                 }
             }
+            if !edited_paths.is_empty()
+                || calls
+                    .iter()
+                    .any(|call| matches!(call.name.as_str(), "shell" | "delegate_task"))
+            {
+                turn_map = None;
+            }
             self.messages.push(Message {
                 role: "user".into(),
                 content: blocks,
             });
+            self.trace.event(
+                "continuation_ready",
+                &format!(
+                    "blocks={} failures={} repairs={}",
+                    self.messages
+                        .last()
+                        .map_or(0, |message| message.content.len()),
+                    failures,
+                    repairs
+                ),
+            );
+            // A verified artifact or deterministic decode is already a solve.
+            // Skip another provider round-trip just to restate the flag.
+            if self.mode == "ctf" {
+                let verify_started = Instant::now();
+                let verified = crate::autopilot::verify(&self.ctf, &self.ctf.current_hits());
+                self.trace.log(
+                    "verification",
+                    verify_started.elapsed().as_millis(),
+                    &format!("ctf found={}", verified.is_some()),
+                );
+                if let Some(verified) = verified {
+                    self.auto_finish(used_tools_this_turn);
+                    return Ok(format!(
+                        "Verified flag: {} ({})",
+                        verified.flag, verified.evidence
+                    ));
+                }
+            }
             self.auto_step(failures);
         }
     }
@@ -1282,8 +1899,11 @@ impl Agent {
         }
     }
 
-    async fn emit_flags(&self, source: &str, text: &str) {
-        if let Ok(hits) = self.ctf.scan(source, text) {
+    async fn emit_flags(&self, ctf_task: bool, source: &str, text: &str) {
+        if !ctf_task {
+            return;
+        }
+        if let Ok(hits) = self.ctf.scan_stream(source, text) {
             if let Some(tx) = &self.event_tx {
                 for hit in &hits {
                     let _ = tx.send(Progress::FlagFound {
@@ -1300,7 +1920,8 @@ impl Agent {
                     &hit.source,
                     &format!("{verdict:?}").to_ascii_uppercase(),
                 );
-                if matches!(verdict, crate::report::Verdict::Verified) {
+                // Never auto-submit flags from generic-mode CTF prompts.
+                if self.mode == "ctf" && matches!(verdict, crate::report::Verdict::Verified) {
                     if let Ok(Some(status)) =
                         self.ctf.auto_submit(&self.tools.client, &hit.flag).await
                     {
@@ -1324,6 +1945,13 @@ impl Agent {
             self.started_at.elapsed().as_secs()
         )
     }
+}
+
+/// A tool transport may succeed even when a subprocess returned exit 1.
+/// Do not treat that output as proof of a solved challenge. A checker must
+/// actually complete successfully before its flag bytes are trusted.
+fn usable_ctf_tool_evidence(name: &str, output: &str) -> bool {
+    name != "shell" || output.starts_with("exit=0\n")
 }
 
 fn format_tool_title(name: &str, detail: &str) -> String {
@@ -1369,7 +1997,136 @@ pub(crate) fn step_title(call: &ToolCall, ok: bool) -> String {
     }
 }
 
+/// Fixed, injection-free command templates for small directory requests.
+/// Unknown paths, multi-action prompts and CTF sessions retain model routing.
+fn quick_directory_command(query: &str, project_root: &std::path::Path) -> Option<String> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.len() > 360 || query.contains([';', '\n', '/', '`']) || query.contains("..") {
+        return None;
+    }
+    let words: Vec<&str> = query
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.iter().any(|word| {
+        matches!(
+            *word,
+            "delete"
+                | "remove"
+                | "edit"
+                | "write"
+                | "create"
+                | "fix"
+                | "update"
+                | "implement"
+                | "recursive"
+                | "recursively"
+        )
+    }) {
+        return None;
+    }
+    let dirs = words.iter().any(|word| {
+        matches!(
+            *word,
+            "dir" | "die" | "dirs" | "directory" | "directories" | "folder" | "folders"
+        )
+    });
+    if !dirs || words.iter().any(|word| matches!(*word, "file" | "files")) {
+        return None;
+    }
+    let count = words.contains(&"count");
+    let list = words.contains(&"list") || words.contains(&"show");
+    if !count && !list {
+        return None;
+    }
+    let desktop = words.contains(&"desktop");
+    if (query.contains(" in ") || query.contains(" inside ") || query.contains(" under "))
+        && !desktop
+        && !words.contains(&"current")
+        && !words.contains(&"working")
+        && !words.contains(&"this")
+        && !words.contains(&"here")
+    {
+        return None;
+    }
+    let root = if desktop {
+        if project_root.join("Desktop").is_dir() {
+            "Desktop"
+        } else {
+            "\"$HOME/Desktop\""
+        }
+    } else {
+        "."
+    };
+    if count {
+        Some(format!(
+            "find {root} -mindepth 1 -maxdepth 1 -type d | wc -l"
+        ))
+    } else {
+        // 'list dir' is an ordinary listing of files and folders. Explicit
+        // 'directories/dirs/folders' asks for folders only.
+        let only_dirs = words
+            .iter()
+            .any(|word| matches!(*word, "dirs" | "directories" | "folders"));
+        let filter = if only_dirs { "-type d " } else { "" };
+        Some(format!(
+            "find {root} -mindepth 1 -maxdepth 1 {filter}-printf '%f\\n' | LC_ALL=C sort"
+        ))
+    }
+}
+
+/// Only obvious salutations use the minimal no-tool request. Real CTF or
+/// coding questions, even short ones, always retain the normal agent path.
+fn is_quick_greeting(query: &str) -> bool {
+    let cleaned = query
+        .trim()
+        .trim_matches(|ch: char| ch.is_ascii_punctuation());
+    let cleaned = cleaned.to_ascii_lowercase();
+    matches!(
+        cleaned.trim(),
+        "hi" | "hii"
+            | "hiii"
+            | "hiiii"
+            | "hello"
+            | "hey"
+            | "yo"
+            | "hey there"
+            | "hello there"
+            | "good morning"
+            | "good evening"
+    )
+}
+
+/// A narrow single-operation routing decision, not a canned answer:
+/// the provider must still issue a real filesystem tool call.
+fn is_directory_listing(query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.len() > 180 || query.split_whitespace().count() > 14 || query.contains([';', '\n']) {
+        return false;
+    }
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.iter().any(|word| {
+        matches!(
+            *word,
+            "delete" | "remove" | "edit" | "write" | "create" | "fix" | "update" | "implement"
+        )
+    }) {
+        return false;
+    }
+    matches!(words.first(), Some(&"list" | &"show"))
+        && (words.iter().any(|word| {
+            matches!(
+                *word,
+                "dir" | "dirs" | "directory" | "directories" | "files" | "folders"
+            )
+        }) || query.starts_with("list desktop")
+            || query == "list die in desktop")
+}
+
 fn task_requires_tool(query: &str) -> bool {
+    if is_directory_listing(query) {
+        return true;
+    }
     let query = query.to_ascii_lowercase();
     [
         "use the shell",
@@ -1390,19 +2147,6 @@ fn task_requires_tool(query: &str) -> bool {
     .iter()
     .any(|needle| query.contains(needle))
 }
-
-/// Stable operating doctrine for the coding loop. Kept as one constant so it
-/// sits above the volatile prompt boundary and remains prefix-cache friendly.
-const AGENTIC_ORCHESTRATOR_DOCTRINE: &str = "\
-Research first: use the repo map, hot memory, and explicit file reads; do not mutate from guesses.
-Gate protocol: before read_file/grep/glob, check whether the answer is already in memory, pinned files, or the repo map.
-Parallelism: batch independent read-only tools and independent delegate_task calls in one response. Sequential calls are only for true dependencies.
-Delegation: for broad exploration, spawn focused delegate_task children and consume their summaries instead of flooding the main context.
-Editing: prefer search_replace for code changes. Read the file first, use a unique exact search_block with surrounding context, preserve indentation, and keep edits atomic. Use apply_patch only for multi-file add/delete/move patches.
-Verification: after edits, run the relevant build, test, linter, or configured check. If it fails, ingest the error and repair without waiting.
-Latency discipline: keep narration minimal, avoid repeated unchanged calls, choose cheap probes first, and change strategy after two low-information steps.
-Safety: destructive shell commands still require approval. Plan mode is read-only.
-Completion: finish with a concise summary of what changed and what passed.";
 
 /// The summarizer's instructions (Codex compaction, clai's state-preserving
 /// summary): what to keep, in what order, and nothing else.
@@ -1498,11 +2242,145 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn quick_directory_routing_rejects_ambiguous_or_mutating_tasks() {
+        let root = Path::new(".");
+        assert!(quick_directory_command("list dir in desktop", root).is_some());
+        assert!(quick_directory_command("list die in desktop", root).is_some());
+        assert!(quick_directory_command(
+            "Use the shell tool to count the immediate child directories of the current working directory",
+            root,
+        ).is_some());
+        assert!(quick_directory_command("list directories in /tmp", root).is_none());
+        assert!(quick_directory_command("list files and folders", root).is_none());
+        assert!(quick_directory_command("list and delete directories", root).is_none());
+    }
+
+    #[tokio::test]
+    async fn fast_directory_queries_are_exact_and_do_not_call_the_model() {
+        let root = std::env::temp_dir().join(format!(
+            "wrosecode-fast-directory-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("not-a-directory.txt"), "ignored").unwrap();
+        let (mut agent, mock) = agent_with_mock(&root);
+        let listed = agent
+            .turn("List directories directly inside the current working directory")
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.lines().collect::<Vec<_>>(),
+            vec![".hidden", "alpha", "beta"]
+        );
+        let counted = agent
+            .turn("Use the shell tool to count immediate child directories of the current working directory")
+            .await
+            .unwrap();
+        assert_eq!(counted, "3");
+        assert_eq!(agent.model_turns, 0);
+        assert!(mock.requests().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_only_and_ctf_hypothesis_batches_dispatch_in_parallel() {
+        let call = |name: &str| ToolCall {
+            item_id: None,
+            id: format!("call-{name}"),
+            name: name.into(),
+            input: serde_json::Value::Null,
+        };
+        let reads = vec![call("read_file"), call("grep"), call("decode")];
+        assert_eq!(tool_batch_parallelism("build", 0, 20, &reads), 3);
+        assert_eq!(tool_batch_parallelism("build", 0, 2, &reads), 2);
+
+        let hypotheses = vec![call("delegate_task"), call("delegate_task")];
+        assert_eq!(tool_batch_parallelism("ctf", 0, 20, &hypotheses), 2);
+        assert_eq!(tool_batch_parallelism("build", 0, 20, &hypotheses), 1);
+
+        let mutations = vec![call("shell"), call("write_file")];
+        assert_eq!(tool_batch_parallelism("ctf", 0, 20, &mutations), 1);
+        assert_eq!(
+            tool_batch_parallelism("build", 20, 20, &mutations),
+            1,
+            "high reasoning must not parallelize mutating files"
+        );
+        let mixed = vec![call("grep"), call("apply_patch"), call("read_file")];
+        assert_eq!(
+            tool_batch_parallelism("build", 20, 20, &mixed),
+            1,
+            "mixed batch needs mutation ordering"
+        );
+        assert_eq!(
+            tool_batch_parallelism("build", 20, 20, &reads),
+            reads.len(),
+            "independent read-only calls remain parallel"
+        );
+    }
+
+    #[test]
+    fn ctf_evidence_rejects_failed_shell_and_model_only_flag_claims() {
+        use crate::autopilot;
+        let directory =
+            std::env::temp_dir().join(format!("wrose-ctf-proof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let engine = crate::ctf::CtfEngine::new(&directory);
+        let flag = "HTB{f93a1b2c3d4e5f6a7b8c9d0e1234abcd}";
+        engine.scan("model response", flag).unwrap();
+        assert!(
+            autopilot::verify(&engine, &engine.current_hits()).is_none(),
+            "a model's flag claim is never proof"
+        );
+        assert!(!usable_ctf_tool_evidence(
+            "shell",
+            &format!("exit=1\n{flag}")
+        ));
+        assert!(!usable_ctf_tool_evidence(
+            "shell",
+            &format!("exit=124\n{flag}")
+        ));
+        assert!(usable_ctf_tool_evidence(
+            "shell",
+            &format!("exit=0\n{flag}")
+        ));
+        engine
+            .scan("tool:shell", &format!("exit=0\n{flag}"))
+            .unwrap();
+        let verified = autopilot::verify(&engine, &engine.current_hits()).unwrap();
+        assert_eq!(verified.flag, flag);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn action_requests_require_a_tool_but_chat_does_not() {
         assert!(task_requires_tool("Use the shell tool to run printf ok"));
         assert!(task_requires_tool("fix the scroll bug"));
         assert!(!task_requires_tool("hii"));
         assert!(!task_requires_tool("explain Rust ownership"));
+    }
+
+    #[test]
+    fn provider_retries_skip_permanent_configuration_failures() {
+        assert!(!retryable_provider_error("bad or missing API key"));
+        assert!(!retryable_provider_error(
+            "Base URL returned 404. Did you forget /v1?"
+        ));
+        assert!(!retryable_provider_error("ChatGPT is not signed in"));
+        assert!(!retryable_provider_error("HTTP 401 unauthorized"));
+        assert!(!retryable_provider_error("HTTP 403 forbidden"));
+        assert!(!retryable_provider_error("invalid api key"));
+        assert!(!retryable_provider_error("insufficient_quota"));
+        assert!(retryable_provider_error(
+            "cannot connect to provider (DNS, TLS, or server error)"
+        ));
+        assert!(retryable_provider_error(
+            "provider stream timed out while waiting for output"
+        ));
+        assert!(retryable_provider_error("rate limited (429)"));
     }
 
     /// Records what the summarizer was asked and answers with a fixed summary.
@@ -1615,6 +2493,7 @@ mod tests {
     /// were in flight at once.
     struct ScriptedProvider {
         script: Mutex<std::collections::VecDeque<Response>>,
+        systems: Mutex<Vec<String>>,
         inflight: std::sync::atomic::AtomicUsize,
         peak_inflight: std::sync::atomic::AtomicUsize,
     }
@@ -1623,6 +2502,7 @@ mod tests {
         fn new(script: Vec<Response>) -> Arc<Self> {
             Arc::new(Self {
                 script: Mutex::new(script.into_iter().collect()),
+                systems: Mutex::new(Vec::new()),
                 inflight: std::sync::atomic::AtomicUsize::new(0),
                 peak_inflight: std::sync::atomic::AtomicUsize::new(0),
             })
@@ -1631,13 +2511,17 @@ mod tests {
         fn peak(&self) -> usize {
             self.peak_inflight.load(std::sync::atomic::Ordering::SeqCst)
         }
+
+        fn systems(&self) -> Vec<String> {
+            self.systems.lock().expect("systems lock").clone()
+        }
     }
 
     #[async_trait]
     impl Provider for ScriptedProvider {
         async fn chat_stream_with_think(
             &self,
-            _system: &str,
+            system: &str,
             _messages: &[Message],
             _tools: &[serde_json::Value],
             _require_tool: bool,
@@ -1645,6 +2529,10 @@ mod tests {
             _think: ThinkLevel,
         ) -> anyhow::Result<Response> {
             use std::sync::atomic::Ordering;
+            self.systems
+                .lock()
+                .expect("systems lock")
+                .push(system.to_string());
             let active = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak_inflight.fetch_max(active, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -1671,6 +2559,7 @@ mod tests {
     fn writes(path: &str) -> Response {
         Response {
             content: vec![Content::Call(ToolCall {
+                item_id: None,
                 id: "call-1".into(),
                 name: "write_file".into(),
                 input: serde_json::json!({"path": path, "content": "hello from the agent"}),
@@ -1775,6 +2664,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn general_mode_writes_files_and_only_plan_is_read_only() {
+        let dir = std::env::temp_dir().join(format!("wrose-general-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut agent, _mock) = agent_with_mock(&dir);
+        agent.set_mode("general").expect("general mode");
+        assert!(!agent.tools.plan, "General mode must be able to edit");
+        assert!(!agent.tools.bugbounty_mode);
+
+        agent.provider = ScriptedProvider::new(vec![
+            writes("general.txt"),
+            said("wrote general.txt"),
+            said("done"),
+        ]) as Arc<dyn Provider>;
+        let reply = agent
+            .turn("create general.txt with the known content")
+            .await
+            .expect("general turn");
+        assert!(!reply.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("general.txt")).unwrap(),
+            "hello from the agent",
+            "General mode silently stopped executing writes"
+        );
+
+        agent.set_mode("plan").expect("plan mode");
+        assert!(agent.tools.plan, "Plan mode is read-only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mode_switch_sets_plan_and_bounds_scope_by_mode() {
+        let dir = std::env::temp_dir().join(format!("wrose-mode-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut agent, _mock) = agent_with_mock(&dir);
+        let scope = crate::autopilot::Scope::for_bounty(
+            &dir,
+            "https://app.example.test",
+            ["app.example.test"],
+            std::iter::empty::<&str>(),
+        );
+        agent.tools.set_scope(Some(scope));
+
+        agent.set_mode("bugbounty").expect("bug-bounty mode");
+        assert!(agent.tools.bugbounty_mode);
+        assert!(
+            !agent.tools.plan,
+            "bug-bounty mode must be able to record evidence"
+        );
+        assert!(
+            agent.tools.scope.is_some(),
+            "bug-bounty mode must keep the armed program scope"
+        );
+
+        agent.set_mode("general").expect("general mode");
+        assert!(!agent.tools.bugbounty_mode);
+        assert!(!agent.tools.plan);
+        assert!(
+            agent.tools.scope.is_none(),
+            "a program allowlist must not leak into General mode"
+        );
+
+        agent.set_mode("plan").expect("plan mode");
+        assert!(agent.tools.plan);
+        agent.set_mode("build").expect("build mode");
+        assert!(!agent.tools.plan);
+        assert!(agent.set_mode("bogus").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Two `delegate_task` calls issued in one batch must actually overlap:
     /// both children run through the same provider, and the peak-inflight
     /// counter proves they were inside a chat call at the same time — the
@@ -1788,11 +2749,13 @@ mod tests {
         let provider = ScriptedProvider::new(vec![Response {
             content: vec![
                 Content::Call(ToolCall {
+                    item_id: None,
                     id: "call-1".into(),
                     name: "delegate_task".into(),
                     input: serde_json::json!({"task": "summarize part a", "task_id": "part-a"}),
                 }),
                 Content::Call(ToolCall {
+                    item_id: None,
                     id: "call-2".into(),
                     name: "delegate_task".into(),
                     input: serde_json::json!({"task": "summarize part b", "task_id": "part-b"}),
@@ -1815,9 +2778,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn delegate_children_inherit_ctf_mode_and_category() {
+        let dir = std::env::temp_dir().join(format!("wrose-delegate-ctf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut agent, _mock) = agent_with_mock(&dir);
+        agent.set_mode("ctf").unwrap();
+        agent.ctf.category = "crypto".into();
+        agent.ctf.lock_category();
+        let provider = ScriptedProvider::new(vec![Response {
+            content: vec![Content::Call(ToolCall {
+                item_id: None,
+                id: "call-ctf".into(),
+                name: "delegate_task".into(),
+                input: serde_json::json!({"task": "test the crypto hypothesis", "task_id": "crypto-a"}),
+            })],
+            usage: Usage::default(),
+        }]);
+        agent.provider = provider.clone() as Arc<dyn Provider>;
+
+        let _ = agent
+            .turn("solve this challenge with a child hypothesis")
+            .await
+            .unwrap();
+        let systems = provider.systems();
+        assert!(
+            systems
+                .iter()
+                .skip(1)
+                .any(|system| system.contains("Mode: ctf")
+                    && system.contains("CTF category: crypto")
+                    && system.contains("CTF MODE:")),
+            "child lost CTF doctrine/category: {systems:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn step_titles_name_the_call_and_cap_long_commands() {
         let call = ToolCall {
+            item_id: None,
             id: "1".into(),
             name: "shell".into(),
             input: serde_json::json!({"command": "echo hi"}),
@@ -1825,6 +2826,7 @@ mod tests {
         assert_eq!(step_title(&call, true), "shell echo hi");
         assert_eq!(step_title(&call, false), "shell echo hi (failed)");
         let long = ToolCall {
+            item_id: None,
             id: "2".into(),
             name: "shell".into(),
             input: serde_json::json!({"command": "x".repeat(200)}),
@@ -1905,6 +2907,7 @@ mod tests {
             pinned: Vec::new(),
             step_log: Vec::new(),
             trace: crate::trace::TraceSink::default(),
+            prompt: crate::prompt::PromptState::default(),
         };
         (agent, provider)
     }
@@ -2007,6 +3010,7 @@ mod tests {
         let (mut agent, _provider) = agent_with_mock(&root);
 
         let call = |id: &str| ToolCall {
+            item_id: None,
             id: id.to_string(),
             name: "grep".into(),
             input: serde_json::json!({"path": "src", "pattern": "flag{"}),
@@ -2021,6 +3025,7 @@ mod tests {
         // ...and one different call in between resets the streak: the
         // next three identical calls pass again, the fourth trips.
         let other = ToolCall {
+            item_id: None,
             id: "f".into(),
             name: "glob".into(),
             input: serde_json::json!({"pattern": "*.md"}),
@@ -2032,6 +3037,7 @@ mod tests {
         assert!(agent.register_call(&call("j")));
         // Input is canonical JSON: key order must not matter.
         let reordered = ToolCall {
+            item_id: None,
             id: "k".into(),
             name: "grep".into(),
             input: serde_json::json!({"pattern": "flag{", "path": "src"}),
@@ -2155,5 +3161,93 @@ mod tests {
             context.len()
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn interrupted_tool_history_is_closed_once_before_reuse() {
+        let dir = std::env::temp_dir().join(format!("wrose-interrupted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut agent, _) = agent_with_mock(&dir);
+        agent.messages.push(Message {
+            role: "assistant".into(),
+            content: vec![Content::Call(ToolCall {
+                item_id: None,
+                id: "interrupted-call".into(),
+                name: "shell".into(),
+                input: serde_json::json!({"command":"touch output.txt"}),
+            })],
+        });
+        agent.repair_tool_history();
+        let count = agent.messages.len();
+        assert!(matches!(&agent.messages.last().unwrap().content[0],
+            Content::Result { id, is_error: true, output }
+            if id == "interrupted-call" && output.contains("side effects")));
+        agent.repair_tool_history();
+        assert_eq!(agent.messages.len(), count);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    struct RecoveryProvider {
+        prompts: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Provider for RecoveryProvider {
+        async fn chat_stream_with_think(
+            &self,
+            system: &str,
+            _messages: &[Message],
+            _tools: &[serde_json::Value],
+            _require_tool: bool,
+            _progress: Option<&mpsc::UnboundedSender<Progress>>,
+            _think: ThinkLevel,
+        ) -> anyhow::Result<Response> {
+            let mut prompts = self.prompts.lock().unwrap();
+            prompts.push(system.into());
+            if prompts.len() < 3 {
+                anyhow::bail!("temporary connection failure");
+            }
+            Ok(Response {
+                content: vec![Content::Text("Recovered".into())],
+                usage: Usage::default(),
+            })
+        }
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_keep_project_instructions_on_third_attempt() {
+        let dir = std::env::temp_dir().join(format!("wrose-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut agent, _) = agent_with_mock(&dir);
+        let provider = Arc::new(RecoveryProvider {
+            prompts: Mutex::new(Vec::new()),
+        });
+        agent.provider = provider.clone();
+        agent.instructions = "PROJECT-INSTRUCTION-MUST-SURVIVE".into();
+        assert_eq!(
+            agent.turn("explain Rust ownership").await.unwrap(),
+            "Recovered"
+        );
+        let prompts = provider.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts
+            .iter()
+            .all(|p| p.contains("PROJECT-INSTRUCTION-MUST-SURVIVE")));
+        assert_eq!(prompts[0], prompts[2]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn leaving_ctf_restores_build_mode_state() {
+        let dir = std::env::temp_dir().join(format!("wrose-mode-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut agent, _) = agent_with_mock(&dir);
+        agent.set_mode("ctf").unwrap();
+        agent.ctf.lock_category();
+        agent.set_mode("build").unwrap();
+        assert!(!agent.ctf.category_locked());
+        assert!(!agent.tools.plan);
+        assert_eq!(agent.mode, "build");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -23,6 +23,9 @@ pub struct ProviderCli {
 #[derive(Args)]
 pub struct AddArgs {
     pub name: String,
+    /// Human-facing label shown in the model picker (defaults to the name).
+    #[arg(long)]
+    pub display_name: Option<String>,
     #[arg(long)]
     pub base_url: String,
     #[arg(long, conflicts_with = "stdin")]
@@ -60,6 +63,8 @@ pub struct KeyArgs {
 #[derive(Args)]
 pub struct EditArgs {
     pub name: String,
+    #[arg(long)]
+    pub display_name: Option<String>,
     #[arg(long)]
     pub base_url: Option<String>,
     #[arg(long)]
@@ -105,6 +110,7 @@ pub async fn run(action: ProviderAction) -> Result<()> {
             }
             let profile = ProviderProfile {
                 name: args.name.clone(),
+                display_name: args.display_name.clone().unwrap_or_default(),
                 kind: args.kind,
                 base_url: args.base_url,
                 model: args.model.unwrap_or_default(),
@@ -143,6 +149,9 @@ pub async fn run(action: ProviderAction) -> Result<()> {
                 .with_context(|| format!("unknown provider: {}", args.name))?;
             if let Some(url) = args.base_url {
                 profile.base_url = url;
+            }
+            if let Some(display) = args.display_name {
+                profile.display_name = display;
             }
             if let Some(model) = args.model {
                 profile.model = model;
@@ -257,6 +266,7 @@ async fn oauth_add(settings: &mut Settings, args: &AddArgs) -> Result<()> {
     }
     settings.upsert_provider(ProviderProfile {
         name: args.name.clone(),
+        display_name: args.display_name.clone().unwrap_or_default(),
         kind: args.kind.clone(),
         base_url: args.base_url.clone(),
         model: args.model.clone().unwrap_or_default(),

@@ -163,12 +163,22 @@ pub fn open_browser(url: &str) -> Result<()> {
     let program = "cmd";
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let program = "xdg-open";
+    // Browser helpers are external UI, not WROSE output. Detach their file
+    // descriptors so browser/GCM diagnostics can never corrupt the TUI.
     #[cfg(target_os = "windows")]
     let status = std::process::Command::new(program)
         .args(["/C", "start", "", url])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()?;
     #[cfg(not(target_os = "windows"))]
-    let status = std::process::Command::new(program).arg(url).status()?;
+    let status = std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
     if status.success() {
         Ok(())
     } else {

@@ -60,9 +60,9 @@ impl Pty {
             .env("HOME", home)
             .env("TERM", "xterm-256color")
             .env("WROSECODE_NO_MOUSE", "1");
-        if let Some(cwd) = cwd {
-            launcher.current_dir(cwd);
-        }
+        // A shell-only test must not inherit the repository's large CTF
+        // artifacts, skills, runtime config or background git activity.
+        launcher.current_dir(cwd.unwrap_or(home));
         for (key, value) in extra {
             launcher.env(key, value);
         }
@@ -113,7 +113,17 @@ impl Pty {
 
     fn finish(mut self) -> (bool, String) {
         drop(self.stdin);
-        let status = self.child.wait().expect("wait for the TUI to exit");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll TUI exit") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                break self.child.wait().expect("reap timed-out PTY launcher");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         self.reader
             .join()
             .expect("stdout capture thread joins at EOF");
@@ -223,6 +233,44 @@ fn first_paint_ms(transcript: &str) -> Option<u128> {
     digits.parse().ok()
 }
 
+/// Strip terminal control sequences from a raw PTY byte capture so assertions
+/// read what the terminal grid shows. The renderer emits cursor movement and
+/// visibility controls as well as SGR colour changes; removing only `...m`
+/// sequences can accidentally consume the following visible text.
+fn strip_sgr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.next() {
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC sequences terminate with BEL or ST.
+                    let mut previous = '\0';
+                    for next in chars.by_ref() {
+                        if next == '\x07' || (previous == '\x1b' && next == '\\') {
+                            break;
+                        }
+                        previous = next;
+                    }
+                }
+                Some(_) | None => {
+                    // Two-byte escape sequence; its payload is not visible.
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[test]
 fn tui_survives_scroll_editing_and_clearing_in_a_real_terminal() {
     if !pty_helper() {
@@ -252,8 +300,8 @@ fn tui_survives_scroll_editing_and_clearing_in_a_real_terminal() {
         "the welcome banner renders\n{transcript}"
     );
     assert!(
-        transcript.contains("TRANSCRIPT"),
-        "the transcript pane header renders\n{transcript}"
+        strip_sgr(&transcript).contains("Ask WROSECODE"),
+        "the composer placeholder renders\n{transcript}"
     );
     assert!(
         transcript.contains("DASHBOARD · "),
@@ -372,13 +420,16 @@ fn pty_scrolls_up_counts_new_lines_and_reengages_follow() {
         transcript.contains("Theme set to nord"),
         "the post-wheel push landed (wheel-down re-engaged follow)\n{transcript}"
     );
-    // The renderer rewrites a whole row when it changes, so the LAST header
-    // we ever see is the one after End: it must carry no marker.
-    let last_header = transcript
-        .rfind("TRANSCRIPT")
-        .expect("the header renders at least once");
-    let after = &transcript[last_header..];
-    let window = &after[..after.len().min(160)];
+    // The renderer rewrites a whole row when it changes, so the LAST composer
+    // paint we ever see is the one after End: it must carry no marker. The
+    // placeholder paints in every frame, which anchors the tail. Stripped:
+    // the focus indicator fragments the raw stream per character.
+    let stripped = strip_sgr(&transcript);
+    let last_composer = stripped
+        .rfind("Ask WROSECODE")
+        .expect("the composer renders at least once");
+    let after = &stripped[last_composer..];
+    let window: String = after.chars().take(400).collect();
     assert!(
         !window.contains("End to jump"),
         "End re-engages auto-follow and drops the indicator: {window}\n{transcript}"
@@ -405,6 +456,7 @@ fn no_color_session_emits_no_palette_codes() {
     std::thread::sleep(Duration::from_millis(900));
     pty.send_text("/theme", 300);
     pty.send(b"\r", 500);
+    pty.send(b"\x1b", 300); // close the theme picker before the next command
     pty.send_text("/help", 300);
     pty.send(b"\r", 600);
     pty.send_text("/quit", 300);

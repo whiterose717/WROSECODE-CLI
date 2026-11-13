@@ -15,6 +15,42 @@ pub struct PaletteEntry {
     pub description: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthCommand {
+    LoginChatGpt,
+    Status,
+    Accounts,
+    Switch(String),
+    Logout(String),
+}
+
+/// Parse the local `/auth` namespace. Keeping this separate from rendering
+/// prevents authentication commands from ever falling through to the model.
+pub fn parse_auth(args: &str) -> Result<AuthCommand, String> {
+    let mut parts = args.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (None, None, None) | (Some("status"), None, None) => Ok(AuthCommand::Status),
+        (Some("login"), None, None) | (Some("login"), Some("chatgpt"), None) => {
+            Ok(AuthCommand::LoginChatGpt)
+        }
+        (Some("accounts"), None, None) => Ok(AuthCommand::Accounts),
+        (Some("switch"), Some(label), None) if valid_auth_label(label) => {
+            Ok(AuthCommand::Switch(label.into()))
+        }
+        (Some("logout"), Some(label), None) if valid_auth_label(label) => {
+            Ok(AuthCommand::Logout(label.into()))
+        }
+        _ => Err("Usage: /auth login chatgpt | /auth status | /auth accounts | /auth switch <label> | /auth logout <label>".into()),
+    }
+}
+
+fn valid_auth_label(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'))
+}
+
 impl From<&CommandSpec> for PaletteEntry {
     fn from(spec: &CommandSpec) -> Self {
         PaletteEntry {
@@ -37,7 +73,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/agents",
         category: "Agents",
-        description: "Choose build, plan, or general",
+        description: "Choose build, plan, general, ctf, or bug-bounty",
+    },
+    CommandSpec {
+        name: "/mode",
+        category: "Agents",
+        description: "Switch mode: general, ctf, bounty, build, or plan",
     },
     CommandSpec {
         name: "/build",
@@ -63,6 +104,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "/connect",
         category: "Providers",
         description: "Connect a provider with a guided setup",
+    },
+    CommandSpec {
+        name: "/auth",
+        category: "Providers",
+        description: "Sign in with ChatGPT, list accounts, or log out",
+    },
+    CommandSpec {
+        name: "/chatgpt",
+        category: "Providers",
+        description: "ChatGPT browser sign-in, status, accounts and logout",
     },
     CommandSpec {
         name: "/providers",
@@ -93,6 +144,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "/clear",
         category: "Session",
         description: "Clear the transcript (add --context to also drop conversation context)",
+    },
+    CommandSpec {
+        name: "/copy",
+        category: "Session",
+        description: "Copy the current session transcript (use /copy all)",
     },
     CommandSpec {
         name: "/theme",
@@ -160,6 +216,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Show live usage and timing counters",
     },
     CommandSpec {
+        name: "/activity",
+        category: "Session",
+        description: "Toggle the live activity rail (/activity on|off)",
+    },
+    CommandSpec {
         name: "/dashboard",
         category: "Session",
         description: "Open the eight-panel live dashboard (Ctrl+D)",
@@ -167,7 +228,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/verbosity",
         category: "Session",
-        description: "Set compact, normal, or verbose tool output",
+        description: "On by default; /verbosity off|on|compact|normal|verbose",
     },
     CommandSpec {
         name: "/think",
@@ -267,7 +328,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/ctf",
         category: "Project",
-        description: "Run the scope-guarded CTF autopilot on a challenge",
+        description: "Enter CTF agent mode and run the scope-guarded autopilot",
+    },
+    CommandSpec {
+        name: "/bugbounty",
+        category: "Project",
+        description: "Evidence-gated bug-bounty run (/bugbounty <target> --scope host)",
     },
     CommandSpec {
         name: "/export",
@@ -288,6 +354,16 @@ pub fn help(user: &[crate::markdown::UserCommand]) -> String {
             .filter(|command| command.category == category)
         {
             output.push_str(&format!("  {:<12} {}\n", command.name, command.description));
+            if command.name == "/auth" {
+                output.push_str("  /auth login chatgpt  Sign in with ChatGPT\n");
+                output.push_str("  /auth status         Show auth status\n");
+                output.push_str("  /auth accounts       List saved accounts\n");
+                output.push_str("  /auth switch <label> Switch account\n");
+                output.push_str("  /auth logout <label> Log out account\n");
+            }
+            if command.name == "/chatgpt" {
+                output.push_str("  /chatgpt login        Sign in with ChatGPT (browser)\n");
+            }
         }
         output.push('\n');
     }
@@ -354,16 +430,44 @@ mod tests {
     use crate::markdown::UserCommand;
 
     #[test]
+    fn auth_namespace_parses_supported_commands() {
+        assert_eq!(parse_auth(""), Ok(AuthCommand::Status));
+        assert_eq!(parse_auth("login"), Ok(AuthCommand::LoginChatGpt));
+        assert_eq!(parse_auth("login chatgpt"), Ok(AuthCommand::LoginChatGpt));
+        assert_eq!(parse_auth("status"), Ok(AuthCommand::Status));
+        assert_eq!(parse_auth("accounts"), Ok(AuthCommand::Accounts));
+        assert_eq!(
+            parse_auth("switch personal"),
+            Ok(AuthCommand::Switch("personal".into()))
+        );
+        assert_eq!(
+            parse_auth("logout personal"),
+            Ok(AuthCommand::Logout("personal".into()))
+        );
+    }
+
+    #[test]
+    fn auth_namespace_rejects_invalid_commands_and_labels() {
+        assert!(parse_auth("login openai").is_err());
+        assert!(parse_auth("switch Personal").is_err());
+        assert!(parse_auth("logout").is_err());
+        assert!(parse_auth("status extra").is_err());
+    }
+
+    #[test]
     fn registry_contains_all_requested_commands() {
         for name in [
             "/add",
             "/agents",
             "/clear",
+            "/chatgpt",
             "/compact",
+            "/copy",
             "/commit",
             "/connect",
             "/coverage",
             "/ctf",
+            "/bugbounty",
             "/dashboard",
             "/debug",
             "/diff",
@@ -377,6 +481,7 @@ mod tests {
             "/init",
             "/issues",
             "/mcps",
+            "/mode",
             "/models",
             "/move",
             "/mcp",

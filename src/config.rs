@@ -3,6 +3,23 @@ use clap::ValueEnum;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Normalize user-friendly verbosity switches. Off only affects this launch
+/// or this interactive session; future launches default to verbose.
+pub fn normalize_verbosity(mode: &str) -> &str {
+    match mode {
+        "on" => "verbose",
+        "off" => "normal",
+        other => other,
+    }
+}
+
+/// Default wall-clock limit for one shell tool invocation.
+///
+/// Long-running archive, build, and CTF analysis commands should not be
+/// interrupted by the old 30-second default. Individual calls can still
+/// request a larger limit through the shell tool's `timeout` argument.
+pub const DEFAULT_SHELL_TIMEOUT_SECONDS: u64 = 60;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Permission {
@@ -90,7 +107,7 @@ impl Default for UiRuntimeConfig {
     fn default() -> Self {
         Self {
             theme: "dark".into(),
-            verbosity: "normal".into(),
+            verbosity: "verbose".into(),
             alternate_screen: true,
             mouse_capture: Some("auto".into()),
             alert_bell: true,
@@ -160,7 +177,7 @@ impl Default for AgentRuntimeConfig {
             think: None,
             thinking_level: 5,
             max_parallel_tasks: 20,
-            shell_timeout_seconds: 30,
+            shell_timeout_seconds: DEFAULT_SHELL_TIMEOUT_SECONDS,
             tool_retries: 3,
             fallback_provider: String::new(),
             fallback_model: String::new(),
@@ -312,11 +329,31 @@ impl Config {
             }
             return None;
         }
-        if self.root.join("pyproject.toml").exists() {
-            return Some("python -m pytest -q".into());
+        if self.root.join("pyproject.toml").exists() || has_python_tests(&self.root) {
+            return Some("python3 -m pytest -q".into());
         }
         None
     }
+}
+
+/// Many small real-world Python projects ship tests/test_*.py but no
+/// pyproject.toml. Detect those tests cheaply without walking a full repo.
+/// A user-provided --check-command always takes precedence.
+fn has_python_tests(root: &std::path::Path) -> bool {
+    for dir in [root.join("tests"), root.to_path_buf()] {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            if entries.take(1024).flatten().any(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                (name.starts_with("test_") || name.ends_with("_test.py"))
+                    && name.ends_with(".py")
+                    && entry.path().is_file()
+            }) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -328,9 +365,41 @@ mod tests {
     }
 
     #[test]
+    fn detects_real_python_tests_without_pyproject_or_global_config_changes() {
+        let directory =
+            std::env::temp_dir().join(format!("wrose-python-check-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("tests")).unwrap();
+        assert!(!has_python_tests(&directory));
+        std::fs::write(
+            directory.join("tests/test_audit.py"),
+            "def test_ok(): pass\n",
+        )
+        .unwrap();
+        assert!(has_python_tests(&directory));
+        std::fs::remove_file(directory.join("tests/test_audit.py")).unwrap();
+        std::fs::write(directory.join("my_module_test.py"), "def test_ok(): pass\n").unwrap();
+        assert!(has_python_tests(&directory));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn verbosity_aliases_are_explicit_and_reversible() {
+        assert_eq!(normalize_verbosity("on"), "verbose");
+        assert_eq!(normalize_verbosity("off"), "normal");
+        assert_eq!(normalize_verbosity("compact"), "compact");
+        assert_eq!(normalize_verbosity("verbose"), "verbose");
+        assert_eq!(normalize_verbosity("normal"), "normal");
+    }
+
+    #[test]
     fn missing_config_falls_back_to_defaults() {
         let runtime = RuntimeConfig::load(std::path::Path::new("/nonexistent"));
         assert_eq!(runtime.ui.theme, "dark");
+        assert_eq!(
+            runtime.ui.verbosity, "verbose",
+            "no project config defaults to visible tool calls"
+        );
         assert_eq!(runtime.agent.thinking_level, 5);
         assert_eq!(runtime.agent.permission, Permission::Ask);
         assert_eq!(runtime.cache.backend, "memory");
@@ -391,15 +460,18 @@ mod tests {
         .expect("config.toml ships with the crate");
         let runtime = parse(&source);
 
-        assert_eq!(runtime.ui.theme, "wrose-dark");
-        assert_eq!(runtime.ui.verbosity, "normal");
+        assert_eq!(runtime.ui.theme, "studio");
+        assert_eq!(runtime.ui.verbosity, "verbose");
         assert!(runtime.ui.alternate_screen);
         assert_eq!(runtime.ui.smooth_scroll_lines, 1);
 
-        assert_eq!(runtime.agent.think, Some(ThinkLevel::Medium));
+        assert_eq!(runtime.agent.think, Some(ThinkLevel::Auto));
         assert_eq!(runtime.agent.thinking_level, 5);
         assert_eq!(runtime.agent.max_parallel_tasks, 20);
-        assert_eq!(runtime.agent.shell_timeout_seconds, 30);
+        assert_eq!(
+            runtime.agent.shell_timeout_seconds,
+            DEFAULT_SHELL_TIMEOUT_SECONDS
+        );
         assert_eq!(runtime.agent.tool_retries, 3);
         assert_eq!(runtime.agent.permission, Permission::Ask);
         assert_eq!(runtime.agent.budget_usd, 0.0);

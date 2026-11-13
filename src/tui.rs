@@ -18,9 +18,10 @@ use crossterm::event::{
     KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::style::{Color, Print, SetBackgroundColor, SetForegroundColor};
-use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen};
 use crossterm::{execute, queue};
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -50,6 +51,7 @@ impl Row {
 struct Renderer {
     previous: Vec<Row>,
     size: (u16, u16),
+    previous_cursor: (u16, u16),
     /// Redraw every cell on every frame. Terminals whose cell buffer drifts
     /// (Zellij, some multiplexers) show stale glyphs with diff-only updates.
     full_redraw: bool,
@@ -60,6 +62,7 @@ impl Renderer {
         Self {
             previous: Vec::new(),
             size: (0, 0),
+            previous_cursor: (u16::MAX, u16::MAX),
             full_redraw: false,
         }
     }
@@ -78,6 +81,14 @@ impl Renderer {
         input_cursor: (u16, u16),
         size: (u16, u16),
     ) -> io::Result<()> {
+        if self.size == size
+            && !self.full_redraw
+            && self.previous.len() == rows.len()
+            && self.previous == rows
+            && self.previous_cursor == input_cursor
+        {
+            return Ok(());
+        }
         if self.size != size || self.full_redraw {
             queue!(out, Clear(ClearType::All))?;
             self.previous.clear();
@@ -132,6 +143,7 @@ impl Renderer {
         )?;
         out.flush()?;
         self.previous = rows.to_vec();
+        self.previous_cursor = input_cursor;
         Ok(())
     }
 }
@@ -371,6 +383,7 @@ const PLAIN_THEME: Theme = Theme {
     accent: Color::Reset,
     status: Color::Reset,
     background: Color::Reset,
+    panel: Color::Reset,
 };
 
 /// One-line provider health for the splash: `3 connected · 2 need setup`.
@@ -401,8 +414,24 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    pub fn enter(profile: TerminalProfile) -> io::Result<Self> {
+    /// Take the screen for the splash but leave the terminal in canonical
+    /// mode, so `SIGINT` is still generated while startup work (OAuth, MCP
+    /// handshakes, session restore) runs. The signal handler in
+    /// [`crate::crash`] restores the terminal and exits; [`Self::start_input`]
+    /// upgrades to raw mode once the TUI event loop is ready to read keys.
+    pub fn enter_painting(profile: TerminalProfile) -> io::Result<Self> {
+        Self::paint_owned(profile)
+    }
+
+    /// Enable raw input for the interactive TUI loop.
+    pub fn start_input(&self) -> io::Result<()> {
         terminal::enable_raw_mode()?;
+        crate::crash::arm_terminal(self.profile.alternate, self.profile.mouse);
+        Ok(())
+    }
+
+    fn paint_owned(profile: TerminalProfile) -> io::Result<Self> {
+        crate::crash::arm_terminal(profile.alternate, profile.mouse);
         let entered = match (profile.alternate, profile.mouse) {
             (true, true) => execute!(
                 io::stdout(),
@@ -426,14 +455,54 @@ impl TerminalGuard {
             (false, false) => execute!(io::stdout(), EnableBracketedPaste, cursor::Hide),
         };
         if let Err(error) = entered {
-            let _ = terminal::disable_raw_mode();
+            crate::crash::restore();
             return Err(error);
         }
+        crate::crash::arm_terminal(profile.alternate, profile.mouse);
         Ok(Self { profile })
     }
 
     pub fn profile(&self) -> TerminalProfile {
         self.profile
+    }
+
+    /// Temporarily return terminal ownership to a child process such as the
+    /// user's editor, then restore the exact terminal profile afterwards.
+    pub fn suspend(&self) {
+        crate::crash::restore();
+    }
+
+    pub fn resume(&self) -> io::Result<()> {
+        terminal::enable_raw_mode()?;
+        crate::crash::arm_terminal(self.profile.alternate, self.profile.mouse);
+        let entered = match (self.profile.alternate, self.profile.mouse) {
+            (true, true) => execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                EnableMouseCapture,
+                cursor::Hide
+            ),
+            (true, false) => execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                cursor::Hide
+            ),
+            (false, true) => execute!(
+                io::stdout(),
+                EnableBracketedPaste,
+                EnableMouseCapture,
+                cursor::Hide
+            ),
+            (false, false) => execute!(io::stdout(), EnableBracketedPaste, cursor::Hide),
+        };
+        if let Err(error) = entered {
+            crate::crash::restore();
+            return Err(error);
+        }
+        crate::crash::arm_terminal(self.profile.alternate, self.profile.mouse);
+        Ok(())
     }
 }
 
@@ -453,9 +522,193 @@ enum Speaker {
     System,
 }
 
+/// The single presentation state for the active task. Backend progress still
+/// arrives through the existing channel, but the renderer no longer has to
+/// guess a visual state from arbitrary status strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskState {
+    Ready,
+    Submitting,
+    Thinking,
+    Streaming,
+    RunningTool,
+    WaitingForModel,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskState {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Ready => "◆ READY",
+            Self::Submitting => "● SUBMIT",
+            Self::Thinking => "◇ THINK",
+            Self::Streaming => "◆ STREAM",
+            Self::RunningTool => "● TOOL",
+            Self::WaitingForModel => "● WAIT",
+            Self::Completed => "✓ DONE",
+            Self::Failed => "× ERROR",
+            Self::Cancelled => "× CANCELLED",
+        }
+    }
+}
+
 struct Entry {
     speaker: Speaker,
     text: String,
+}
+
+/// Wrap-cache bookkeeping for one transcript entry: where its rows live in
+/// the flattened transcript, how many rows it owns (including the blank
+/// separator), and the revision that produced them.
+#[derive(Clone, Copy, Debug)]
+struct EntryRowsMeta {
+    start: usize,
+    count: usize,
+    revision: u64,
+}
+
+/// Streaming state for the assistant body renderer. The full renderer and
+/// the incremental draft cache both drive this machine, so the live draft is
+/// byte-identical to rendering the finished text at every split point.
+///
+/// A fence opens on its marker line, emits code rows as they arrive, and
+/// closes on the next marker (or at the end of the visible text). Nothing is
+/// buffered, so a long code block streams instead of appearing only once its
+/// closing fence arrives.
+#[derive(Clone, Debug, Default)]
+struct BodyStream {
+    in_fence: bool,
+    fence_lang: String,
+}
+
+impl BodyStream {
+    /// Render one logical line into `out`.
+    fn feed(
+        &mut self,
+        line: &str,
+        width: usize,
+        panel: Color,
+        out: &mut Vec<(String, Option<Color>)>,
+    ) {
+        let width = width.max(12);
+        let available = width.saturating_sub(6).max(1);
+        let trimmed = line.trim_start();
+        // Studio: a slim gutter, rather than double-boxing every paragraph.
+        // Code fences keep the same streaming state as the final message.
+        if studio_panel(panel) {
+            if trimmed.as_bytes().starts_with(&[96, 96, 96]) {
+                if self.in_fence {
+                    self.in_fence = false;
+                    self.fence_lang.clear();
+                    out.push(("  ╰─".into(), Some(panel)));
+                } else {
+                    self.in_fence = true;
+                    self.fence_lang = trimmed
+                        .trim_start_matches(char::from(96))
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    out.push((
+                        format!(
+                            "  ╭─ {}",
+                            if self.fence_lang.is_empty() {
+                                "code"
+                            } else {
+                                &self.fence_lang
+                            }
+                        ),
+                        Some(panel),
+                    ));
+                }
+                return;
+            }
+            for part in wrap(line, available) {
+                let prefix = if self.in_fence { "  │ " } else { "    " };
+                out.push((
+                    clip(&format!("{prefix}{part}"), width),
+                    if self.in_fence { Some(panel) } else { None },
+                ));
+            }
+            return;
+        }
+        if !self.in_fence && trimmed.starts_with("```") {
+            self.in_fence = true;
+            self.fence_lang = trimmed
+                .strip_prefix("```")
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let label = if self.fence_lang.is_empty() {
+                "code"
+            } else {
+                &self.fence_lang
+            };
+            out.push((box_top_row(width, label), Some(panel)));
+            return;
+        }
+        if self.in_fence && trimmed.starts_with("```") {
+            self.in_fence = false;
+            self.fence_lang.clear();
+            out.push((box_bottom_row_text(width), Some(panel)));
+            return;
+        }
+        // Prose and code both wrap; indentation is preserved verbatim. An
+        // empty line still owns a row so paragraph breaks keep their shape.
+        for part in wrap(line, available) {
+            out.push((box_body_row(&part, width), Some(panel)));
+        }
+    }
+
+    /// Close an unclosed fence at the end of the currently visible text, so
+    /// a half-streamed block renders as a real container rather than leaking
+    /// raw backticks or an unterminated box.
+    fn finish(&mut self, width: usize, panel: Color, out: &mut Vec<(String, Option<Color>)>) {
+        if self.in_fence {
+            self.in_fence = false;
+            self.fence_lang.clear();
+            if studio_panel(panel) {
+                out.push(("  ╰─".into(), Some(panel)));
+            } else {
+                out.push((box_bottom_row_text(width.max(12)), Some(panel)));
+            }
+        }
+    }
+}
+
+/// Incremental renderer for the live assistant draft. Complete lines are
+/// wrapped once, when they arrive; only the trailing partial line is
+/// re-wrapped per frame. That keeps the per-frame cost independent of how
+/// long the streamed answer has grown.
+fn agent_header(width: usize, panel: Color) -> (String, Option<Color>) {
+    if studio_panel(panel) {
+        ("  ◈ WROSECODE".into(), None)
+    } else {
+        (box_top_row(width, "◈ WROSECODE"), Some(panel))
+    }
+}
+
+fn agent_footer(width: usize, panel: Color) -> Option<(String, Option<Color>)> {
+    if studio_panel(panel) {
+        None
+    } else {
+        Some((box_bottom_row_text(width), Some(panel)))
+    }
+}
+
+#[derive(Debug, Default)]
+struct DraftCache {
+    width: usize,
+    verbose: bool,
+    panel: Option<Color>,
+    /// Bytes of the draft already converted into `rows` (ends at a newline).
+    processed: usize,
+    rows: Vec<(String, Option<Color>)>,
+    body: BodyStream,
 }
 
 struct Ui {
@@ -469,7 +722,15 @@ struct Ui {
     history_index: Option<usize>,
     scroll: usize,
     status: String,
+    /// The last execution stage the provider announced (`Progress::ModelStage`).
+    /// Kept apart from `status`: the status line shows transient UI state
+    /// ("Streaming", "Tool active"), while this holds the stage the model is
+    /// actually in ("Preparing request context…", "Sending prompt to model").
+    stage: String,
+    task_state: TaskState,
     draft: String,
+    /// Incremental wrapping state for `draft` (see [`DraftCache`]).
+    draft_cache: DraftCache,
     busy: bool,
     spinner: usize,
     root: String,
@@ -478,6 +739,12 @@ struct Ui {
     user_commands: Vec<crate::markdown::UserCommand>,
     provider: String,
     model: String,
+    /// Cached provider/profile/model rows used by `/models`. The cache is
+    /// presentation-only; the active provider/model remains authoritative in
+    /// `Agent::config` and the selected provider profile.
+    model_catalog: Vec<(String, String)>,
+    model_catalog_errors: Vec<String>,
+    model_catalog_fetched: Option<std::time::Instant>,
     harness: String,
     mode: String,
     permission: String,
@@ -492,6 +759,8 @@ struct Ui {
     mask_input: bool,
     tool_rows: HashMap<String, usize>,
     verbosity: String,
+    activity_rail: bool,
+    plan_row: Option<usize>,
     tool_calls: usize,
     tool_failures: usize,
     session_started: std::time::Instant,
@@ -511,6 +780,26 @@ struct Ui {
     usage: Usage,
     flags_found: usize,
     navigation_mode: bool,
+    /// Live MCP servers: (name, tool count). Synced from the agent; empty
+    /// means no MCP is connected — never invented. Surfaced through the
+    /// Ctrl+B session snapshot now that the rail is gone.
+    mcp_live: Vec<(String, usize)>,
+    /// Live LSP servers: (server key, ready). Empty when LSP is disabled or
+    /// no server has been spawned yet.
+    lsp_live: Vec<(String, bool)>,
+    /// LSP server keys that failed to start and will not be retried (e.g. a
+    /// missing binary). Surfaced in Ctrl+B instead of raw stderr.
+    lsp_dead: Vec<String>,
+    /// Whether `[lsp]` is enabled in the active config.
+    lsp_enabled: bool,
+    /// Cached git state (refreshed at most every 5s, never per frame).
+    git_branch: String,
+    git_files: usize,
+    git_added: i64,
+    git_removed: i64,
+    git_at: Option<std::time::Instant>,
+    /// Last backend sync; rate-limits the git refresh.
+    chrome_at: Option<std::time::Instant>,
     theme: usize,
     /// Finished delegate subagents this session, collapsed to one summary
     /// line in the tree pane instead of growing it without bound.
@@ -523,7 +812,6 @@ struct Ui {
     /// `~/.wrosecode/trace.log` next to the API/tool timings.
     pub trace: crate::trace::TraceSink,
     metrics: crate::metrics::MetricsSnapshot,
-    timeout_seconds: u64,
     search_query: String,
     search_matches: Vec<usize>,
     search_position: usize,
@@ -539,8 +827,26 @@ struct Ui {
     /// width, or the verbosity changes. Scrolling just reslices this, which is
     /// what keeps a long session from re-wrapping every line on every key.
     transcript_lines: Vec<String>,
-    transcript_key: Option<(usize, usize, usize, bool)>,
+    /// Per-row background override parallel to `transcript_lines`: `Some`
+    /// paints charcoal containers (code fences, tool output, snapshot),
+    /// `None` keeps the entry's style background.
+    transcript_bg: Vec<Option<Color>>,
+    transcript_key: Option<(usize, bool, Color)>,
+    /// Earliest entry mutated since the last wrap pass. Avoid an O(history)
+    /// revision scan on every 30 FPS frame of an hours-long conversation.
+    transcript_dirty_from: Option<usize>,
+    /// Per-entry revision, parallel to `entries`. Mutating one entry bumps
+    /// only its revision, so the wrap cache re-wraps that entry instead of
+    /// the whole transcript. Entries are append-only between clears.
+    entry_revisions: Vec<u64>,
+    /// Next revision handed out to a new or rewritten entry.
+    next_entry_revision: u64,
+    /// Where each entry starts in `transcript_lines` plus the revision and
+    /// row count recorded when it was last wrapped. Aligned with `entries`.
+    entry_rows_meta: Vec<EntryRowsMeta>,
     transcript_rebuilds: u64,
+    /// Entries re-wrapped across all rebuild passes (cache misses only).
+    entries_rewrapped: u64,
     /// Rows the transcript viewport could show at the last render; PageUp and
     /// friends page by this instead of a hardcoded five lines.
     page_size: usize,
@@ -558,8 +864,6 @@ struct Ui {
     colors: ColorSupport,
     /// `NO_COLOR` / `--no-color`: paint every row with the plain theme.
     no_color: bool,
-    /// Sandbox engine name (`none`, `docker`, …).
-    sandbox: String,
     /// One-line provider health, e.g. `3 connected · 2 need setup`.
     provider_health: String,
     /// Index into [`TIPS`] for the rotating splash tip row.
@@ -604,6 +908,8 @@ struct Ui {
     /// Open detail view: (title, body) for a process tail or a file diff.
     dash_detail: Option<(String, String)>,
     dash_procs: Vec<crate::tools::shell::ProcSnapshot>,
+    /// Bounded operation history, plus monotonic start times for live clocks.
+    dash_activity: VecDeque<(ActivityStat, std::time::Instant)>,
     dash_files: Vec<(String, i64, i64)>,
     dash_data_at: Option<std::time::Instant>,
     dash_files_at: Option<std::time::Instant>,
@@ -613,6 +919,10 @@ struct Ui {
     plan: Vec<(String, bool)>,
     /// Recent flag hits: (flag, source), capped.
     flag_log: Vec<(String, String)>,
+    /// Detector used by the UI event reducer for flags split across streamed
+    /// model/tool chunks. Persistence and auto-submit remain agent-owned.
+    flag_detector: crate::ctf::CtfEngine,
+    flag_stream_buffers: HashMap<String, String>,
     /// Files edited or written this session (first seen order).
     changed_files: Vec<String>,
     /// A `Checker VERIFIED` line landed during the current task.
@@ -626,6 +936,9 @@ struct Ui {
     max_parallel: usize,
     inflight_tools: usize,
     turn_tool_ms: u128,
+    /// Real request milestones for the task receipt and live diagnostics.
+    first_token_ms: Option<u64>,
+    first_tool_ms: Option<u64>,
     task_started: Option<std::time::Instant>,
     task_base: Option<TaskBase>,
 }
@@ -691,7 +1004,7 @@ struct TaskBase {
 
 /// The eight dashboard panels, in grid order (spec 3.2).
 const DASH_PANELS: [&str; 8] = [
-    "PROCESSES",
+    "ACTIVITY / PROCESSES",
     "THINKING",
     "TIMELINE",
     "PLAN",
@@ -735,10 +1048,20 @@ impl From<&crate::tools::shell::ProcSnapshot> for ProcStat {
     }
 }
 
-/// Everything a dashboard render, `/stats`, `wrosecode dashboard`, and
-/// `exec --json` need, as one serializable snapshot (spec 3.2). Field-level
-/// defaults let the attach client parse both `live.json` and the smaller
-/// `/v1/status` payload.
+/// A model-requested operation, including non-shell tools such as reads,
+/// searches, edits, MCP calls and delegated agent jobs.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ActivityStat {
+    pub id: String,
+    pub title: String,
+    pub running: bool,
+    pub ok: Option<bool>,
+    pub elapsed_ms: u64,
+}
+
+/// Everything the dashboard and attach clients need. Field defaults let
+/// older snapshots be read without losing compatibility.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct DashStats {
@@ -780,6 +1103,10 @@ pub(crate) struct DashStats {
     pub shells: usize,
     pub changed_files: Vec<(String, i64, i64)>,
     pub procs: Vec<ProcStat>,
+    /// Newest-first model tool calls, not just shell subprocesses.
+    pub activities: Vec<ActivityStat>,
+    /// Current transport/execution state, distinct from internal reasoning.
+    pub stage: String,
     pub turn_tokens: Vec<u64>,
     pub verified: bool,
     pub last_error: String,
@@ -799,9 +1126,7 @@ struct UiMeta {
     thinking_level: u8,
     think: ThinkLevel,
     theme: usize,
-    timeout_seconds: u64,
     budget_usd: f64,
-    sandbox: String,
     provider_health: String,
 }
 
@@ -818,9 +1143,7 @@ impl From<&Agent> for UiMeta {
             thinking_level: agent.thinking_level,
             think: agent.think,
             theme: theme_index(&agent.config.ui_theme),
-            timeout_seconds: agent.config.shell_timeout_seconds,
             budget_usd: agent.config.budget_usd,
-            sandbox: agent.config.sandbox.engine.clone(),
             provider_health: provider_health_line(),
         }
     }
@@ -840,9 +1163,7 @@ impl UiMeta {
             thinking_level: 5,
             think: ThinkLevel::Medium,
             theme: 0,
-            timeout_seconds: 30,
             budget_usd: 0.0,
-            sandbox: "none".into(),
             provider_health: "0 connected · 0 need setup".into(),
         }
     }
@@ -852,6 +1173,7 @@ impl Ui {
     fn new(agent: &Agent, session_id: String) -> Self {
         let mut ui = Self::from_meta(UiMeta::from(agent), session_id);
         ui.trace = agent.trace.clone();
+        ui.flag_detector = agent.ctf.clone();
         ui
     }
 
@@ -877,13 +1199,19 @@ impl Ui {
             completion: None,
             scroll: 0,
             status: "Ready".into(),
+            stage: String::new(),
+            task_state: TaskState::Ready,
             draft: String::new(),
+            draft_cache: DraftCache::default(),
             busy: false,
             spinner: 0,
             root: meta.root,
             user_commands,
             provider: meta.provider,
             model: meta.model,
+            model_catalog: Vec::new(),
+            model_catalog_errors: Vec::new(),
+            model_catalog_fetched: None,
             harness: meta.harness,
             mode: "BUILD".into(),
             permission: meta.permission,
@@ -895,6 +1223,8 @@ impl Ui {
             mask_input: false,
             tool_rows: HashMap::new(),
             verbosity: meta.verbosity,
+            activity_rail: false,
+            plan_row: None,
             tool_calls: 0,
             tool_failures: 0,
             session_started: std::time::Instant::now(),
@@ -908,13 +1238,22 @@ impl Ui {
             usage: Usage::default(),
             flags_found: 0,
             navigation_mode: false,
+            mcp_live: Vec::new(),
+            lsp_live: Vec::new(),
+            lsp_dead: Vec::new(),
+            lsp_enabled: true,
+            git_branch: String::new(),
+            git_files: 0,
+            git_added: 0,
+            git_removed: 0,
+            git_at: None,
+            chrome_at: None,
             theme: meta.theme,
             finished_children: 0,
             finished_ms: 0,
             last_interrupt: None,
             metrics: crate::metrics::MetricsSnapshot::default(),
             trace: crate::trace::TraceSink::default(),
-            timeout_seconds: meta.timeout_seconds,
             search_query: String::new(),
             search_matches: Vec::new(),
             search_position: 0,
@@ -926,8 +1265,14 @@ impl Ui {
             error_count: 0,
             last_error_kind: "",
             transcript_lines: Vec::new(),
+            transcript_bg: Vec::new(),
             transcript_key: None,
+            transcript_dirty_from: Some(0),
+            entry_revisions: vec![0],
+            next_entry_revision: 1,
+            entry_rows_meta: Vec::new(),
             transcript_rebuilds: 0,
+            entries_rewrapped: 0,
             page_size: 10,
             max_scroll: 0,
             pending: Vec::new(),
@@ -935,7 +1280,6 @@ impl Ui {
             paste_chip: None,
             colors: ColorSupport::None,
             no_color: false,
-            sandbox: meta.sandbox,
             provider_health: meta.provider_health,
             tip_index: 0,
             turn_steps: 0,
@@ -958,12 +1302,15 @@ impl Ui {
             dash_sel: 0,
             dash_detail: None,
             dash_procs: Vec::new(),
+            dash_activity: VecDeque::new(),
             dash_files: Vec::new(),
             dash_data_at: None,
             dash_files_at: None,
             live_written_at: None,
             plan: Vec::new(),
             flag_log: Vec::new(),
+            flag_detector: crate::ctf::CtfEngine::new(std::path::Path::new(".")),
+            flag_stream_buffers: HashMap::new(),
             changed_files: Vec::new(),
             verified: false,
             ctf_offered: false,
@@ -973,25 +1320,33 @@ impl Ui {
             max_parallel: 0,
             inflight_tools: 0,
             turn_tool_ms: 0,
+            first_token_ms: None,
+            first_tool_ms: None,
             task_started: None,
             task_base: None,
         }
     }
 
     fn begin_turn(&mut self) {
+        self.set_task_state(TaskState::WaitingForModel);
         self.turn_usage = Usage::default();
         self.turn_started = Some(std::time::Instant::now());
         self.turn_steps = 0;
         self.turn_tool_ms = 0;
-        // A dimmed reasoning cell opens each turn; the first model activity
-        // freezes it into `Thought  n.ns` (spec 3.1).
+        self.first_token_ms = None;
+        self.flag_stream_buffers.clear();
+        self.first_tool_ms = None;
+        // A quiet reasoning cell opens each turn and freezes into its
+        // elapsed time on first model activity.
         self.think_finished = false;
         self.active_group = None;
+        self.plan_row = None;
+        self.stage.clear();
         let row = self.entries.len();
         self.push_scrolled(
             Entry {
                 speaker: Speaker::System,
-                text: format!("{} Thinking…", SPINNER[0]),
+                text: "◌ Thinking…".into(),
             },
             1,
         );
@@ -1010,23 +1365,47 @@ impl Ui {
             .turn_started
             .map(|started| started.elapsed().as_secs_f64())
             .unwrap_or(0.0);
-        self.set_entry_text(row, format!("  Thought  {secs:.1}s"));
+        self.set_entry_text(row, format!("Thought {secs:.1}s"));
     }
 
     /// Tick the live `Thinking… 2.1s` cell from the render ticker.
     fn tick_thinking(&mut self) {
+        if self.inflight_tools > 0
+            && self.shell_calls > 0
+            && self
+                .dash_data_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(250))
+        {
+            self.dash_procs = crate::tools::shell::proc_snapshots();
+            self.dash_data_at = Some(std::time::Instant::now());
+        }
+        // Every running agent tool has a visible, live elapsed timer.
+        let running: Vec<String> = self
+            .tool_cells
+            .iter()
+            .filter(|(_, cell)| cell.running && cell.row != usize::MAX)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in running {
+            self.refresh_cell(&id);
+        }
         if self.think_finished {
             return;
         }
         let Some(started) = self.turn_started else {
             return;
         };
+        if self.first_token_ms.is_none() && self.inflight_tools == 0 {
+            self.set_task_state(TaskState::Thinking);
+        }
         let secs = started.elapsed().as_secs_f64();
         let Some(row) = self.think_row else { return };
-        let next = format!(
-            "{} Thinking… {secs:.1}s",
-            SPINNER[self.spinner % SPINNER.len()]
-        );
+        if row >= self.entries.len() {
+            self.think_row = None;
+            self.think_finished = true;
+            return;
+        }
+        let next = format!("◌ Thinking… {secs:.1}s");
         if self.entries[row].text != next {
             self.set_entry_text(row, next);
         }
@@ -1035,8 +1414,24 @@ impl Ui {
     /// Rewrite one entry's text, keeping a scrolled-up viewport anchored to
     /// the same content as the line count changes.
     fn set_entry_text(&mut self, row: usize, text: String) {
+        // A session switch, /new or Ctrl+L can replace all rows. Tool
+        // completions arriving from the old turn must never index new rows.
+        let Some(entry) = self.entries.get(row) else {
+            return;
+        };
+        if entry.text == text {
+            return;
+        }
+        self.transcript_dirty_from = Some(
+            self.transcript_dirty_from
+                .map_or(row, |start| start.min(row)),
+        );
         let old_lines = self.entries[row].text.lines().count().max(1);
         self.entries[row].text = text;
+        if let Some(revision) = self.entry_revisions.get_mut(row) {
+            *revision = self.next_entry_revision;
+            self.next_entry_revision = self.next_entry_revision.wrapping_add(1);
+        }
         let new_lines = self.entries[row].text.lines().count().max(1);
         if self.scroll > 0 {
             self.scroll = self
@@ -1102,6 +1497,180 @@ impl Ui {
         label
     }
 
+    /// True while anything on screen can change on its own: a running turn
+    /// or the dashboard's live panels. When false the frame is a pure
+    /// function of input state, so the loop sleeps instead of repainting —
+    /// zero periodic draws while idle.
+    fn wants_animation(&self) -> bool {
+        self.busy || self.dashboard
+    }
+
+    /// Wrose Pulse: a small semantic state marker, driven only by real UI
+    /// state transitions. It is intentionally calmer than a decorative
+    /// spinner and lets users identify the current phase at a glance.
+    /// Surfaced in the Ctrl+B session snapshot.
+    fn pulse_marker(&self) -> &'static str {
+        self.task_state.marker()
+    }
+
+    /// Cheap identity of everything the 1 Hz chrome sync can change. The
+    /// idle loop repaints only when this moves (or a turn is running), so a
+    /// quiet session costs no frames.
+    fn chrome_fingerprint(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
+            self.provider,
+            self.model,
+            self.mode,
+            self.category,
+            self.usage.input,
+            self.usage.output,
+            self.usage.reasoning,
+            self.usage.cache_read,
+            self.tool_calls,
+            self.tool_failures,
+            self.inflight_tools,
+            self.mcp_live.len(),
+            self.lsp_live.len(),
+            self.git_branch,
+            self.flags_found,
+            self.metrics.cost_usd,
+        )
+    }
+
+    /// The slim think status bar owns one row directly above the composer
+    /// box whenever a thinking level is active (`/think`, Ctrl+T, `[`/`]`).
+    /// Turn it off and the bar — and its row — disappear with it.
+    fn think_bar_visible(&self) -> bool {
+        self.think != ThinkLevel::Off
+    }
+
+    fn set_task_state(&mut self, state: TaskState) {
+        self.task_state = state;
+    }
+
+    /// Mirror live backend facts into the chrome (header, composer info line,
+    /// Ctrl+B snapshot). Cheap fields sync every call; git is refreshed at
+    /// most every 5s so rendering never pays for `git` per frame. Never
+    /// invents state: missing integrations stay empty and the snapshot omits
+    /// those sections.
+    fn sync_chrome(&mut self, agent: &Agent) {
+        self.provider = agent.config.provider.clone();
+        self.model = agent.config.model.clone();
+        self.mode = agent.mode.to_ascii_uppercase();
+        self.category = agent.ctf.category.clone();
+        self.usage = agent.usage;
+        self.metrics = agent.metrics.snapshot();
+        self.mcp_live = agent
+            .tools
+            .mcps
+            .iter()
+            .map(|(name, mcp)| (name.clone(), mcp.schemas.len()))
+            .collect();
+        self.mcp_live.sort_by(|a, b| a.0.cmp(&b.0));
+        self.lsp_enabled = agent.config.lsp.enabled;
+        // Live LSP servers need the async lock; the render path must never
+        // block, so best-effort only — a locked registry keeps its last view.
+        if let Ok(lsp) = agent.tools.lsp.try_lock() {
+            self.lsp_live = lsp.live_servers();
+            self.lsp_dead = lsp.dead_servers();
+        }
+        let now = std::time::Instant::now();
+        // Three git child processes cost ~50ms; refresh them every 5s while
+        // working but only every 30s while idle.
+        let stale = git_stale(self.git_at, now, self.busy);
+        if stale {
+            let (branch, files, added, removed) = git_sidebar_state(&self.root);
+            self.git_branch = branch;
+            self.git_files = files;
+            self.git_added = added;
+            self.git_removed = removed;
+            self.git_at = Some(now);
+        }
+        self.chrome_at = Some(now);
+    }
+
+    /// One-shot session snapshot for Ctrl+B: every live backend fact in one
+    /// muted block, now that the rail is gone. Sections with no real data are
+    /// omitted, never invented. Mirrors `/stats` and `/debug`, which remain
+    /// the canonical deep views.
+    fn session_snapshot(&self) -> String {
+        let mut out = String::from("SESSION\n");
+        out.push_str(&format!(
+            " project  {}\n session  {} · {} · {}\n backend  {} / {}\n",
+            short_path(&self.root, 48),
+            clip(&self.session_id, 18),
+            self.mode,
+            self.pulse_marker(),
+            self.provider,
+            clip(&self.model, 40),
+        ));
+        out.push_str(&format!(
+            " context  {} in · {} out · {}% cache",
+            compact_number(self.usage.input),
+            compact_number(self.usage.output),
+            cache_percent(self.usage),
+        ));
+        match self.metrics.cost_usd {
+            Some(cost) => out.push_str(&format!(" · ${cost:.4}\n")),
+            None => out.push_str(" · cost n/a\n"),
+        }
+        if self.mcp_live.is_empty() {
+            out.push_str(" mcp      no servers connected\n");
+        } else {
+            out.push_str(&format!(" mcp      {} connected\n", self.mcp_live.len()));
+            for (name, tools) in self.mcp_live.iter().take(6) {
+                out.push_str(&format!("   ● {} · {} tools\n", clip(name, 28), tools));
+            }
+        }
+        if self.lsp_enabled {
+            if self.lsp_live.is_empty() {
+                out.push_str(" lsp      enabled · no live servers\n");
+            } else {
+                out.push_str(" lsp\n");
+                for (name, ready) in self.lsp_live.iter().take(6) {
+                    out.push_str(&format!(
+                        "   {} {}\n",
+                        if *ready { "●" } else { "◌" },
+                        clip(name, 40)
+                    ));
+                }
+            }
+            for name in self.lsp_dead.iter().take(6) {
+                out.push_str(&format!("   ✗ {} · unavailable\n", clip(name, 36)));
+            }
+        }
+        if self.inflight_tools > 0 || self.tool_calls > 0 {
+            out.push_str(&format!(
+                " tasks    {} done · {} running · {} failed\n",
+                self.tool_calls, self.inflight_tools, self.tool_failures,
+            ));
+        }
+        if !self.git_branch.is_empty() {
+            out.push_str(&format!(
+                " git      {} · ~{} +{} -{}\n",
+                clip(&self.git_branch, 28),
+                self.git_files,
+                self.git_added,
+                self.git_removed,
+            ));
+        }
+        if self.mode.eq_ignore_ascii_case("CTF") {
+            out.push_str(&format!(
+                " ctf      {} flags · {} · {}\n",
+                self.flags_found,
+                self.category,
+                if self.verified {
+                    "verified"
+                } else {
+                    "unverified"
+                },
+            ));
+        }
+        out.push_str(" details  /stats · /debug · /models");
+        out
+    }
+
     /// Apply a thinking level (Ctrl+T cycle, `[`/`]`, `/think`) to both the
     /// agent and the mirrored UI state.
     fn apply_think(&mut self, agent: &mut Agent, level: ThinkLevel) {
@@ -1139,6 +1708,33 @@ impl Ui {
         } else {
             None
         };
+        let step_count = self.tool_calls.saturating_sub(base.tool_calls);
+        if self.verbosity != "verbose" {
+            let marker = match self.task_state {
+                TaskState::Failed => "× Failed",
+                TaskState::Cancelled => "× Cancelled",
+                _ if self.verified => "✓ Verified",
+                _ => "✓ Done",
+            };
+            let tools_label = format!(
+                "{} tool{}",
+                step_count,
+                if step_count == 1 { "" } else { "s" }
+            );
+            let context = if self.usage.input > 0 {
+                format!(" · {} ctx", compact_number(self.usage.input))
+            } else {
+                String::new()
+            };
+            self.push(
+                Speaker::System,
+                format!(
+                    "{marker} in {} · {tools_label}{context}",
+                    format_duration_ms(wall as u64)
+                ),
+            );
+            return;
+        }
         let answer = self
             .entries
             .iter()
@@ -1161,7 +1757,6 @@ impl Ui {
             cache_read,
             ..Usage::default()
         });
-        let step_count = self.tool_calls.saturating_sub(base.tool_calls);
         let mut step_lines = String::new();
         // The closing receipt names what the turn did, one line per step;
         // the list is capped so a long run cannot flood the transcript.
@@ -1179,8 +1774,16 @@ impl Ui {
         let status_line = status
             .map(|status| format!(" {status}\n"))
             .unwrap_or_default();
+        let first_token = self
+            .first_token_ms
+            .map(format_duration_ms)
+            .unwrap_or_else(|| "n/a".into());
+        let first_tool = self
+            .first_tool_ms
+            .map(format_duration_ms)
+            .unwrap_or_else(|| "n/a".into());
         let mut text = format!(
-            "{status_line} answer: {answer}\n proof: {proof}\n time {} (model {} · tools {} · wait {})\n steps {step_count}{step_lines} · tokens {} ({hit}% cache) · cost {} · saved ~{} tok",
+            "{status_line} answer: {answer}\n proof: {proof}\n time {} (model {} · tools {} · wait {})\n first token {first_token} · first tool {first_tool}\n steps {step_count}{step_lines} · tokens {} ({hit}% cache) · cost {} · saved ~{} tok",
             secs_text(wall),
             secs_text(model),
             secs_text(tools),
@@ -1208,37 +1811,157 @@ impl Ui {
         self.push(Speaker::System, format!("{header}\n{text}"));
     }
 
-    fn transcript_key(&self, left_width: usize, verbose: bool) -> (usize, usize, usize, bool) {
-        (
-            self.entries.len(),
-            self.entries.iter().map(|entry| entry.text.len()).sum(),
-            left_width,
-            verbose,
-        )
+    fn transcript_key(
+        &self,
+        left_width: usize,
+        verbose: bool,
+        panel: Color,
+    ) -> (usize, bool, Color) {
+        (left_width, verbose, panel)
     }
 
-    /// Rebuild the wrapped transcript only when something it depends on
-    /// changed. Returns true when a rebuild happened (asserted by tests).
-    fn ensure_transcript(&mut self, left_width: usize, verbose: bool) -> bool {
-        let key = self.transcript_key(left_width, verbose);
-        if self.transcript_key == Some(key) {
-            return false;
+    /// Rebuild the wrapped transcript only where it actually changed.
+    /// Returns true when at least one entry was re-wrapped (asserted by
+    /// tests). Entries are append-only, so a streaming turn re-wraps only
+    /// the entry that is growing; a width/verbosity/theme change re-wraps
+    /// everything.
+    fn ensure_transcript(&mut self, left_width: usize, verbose: bool, panel: Color) -> bool {
+        let key = self.transcript_key(left_width, verbose, panel);
+        let geometry_changed = self.transcript_key != Some(key);
+        if geometry_changed {
+            self.transcript_key = Some(key);
+            self.entry_rows_meta.clear();
+            self.transcript_lines.clear();
+            self.transcript_bg.clear();
+            self.line_origin.clear();
         }
-        let mut lines = Vec::new();
-        let mut origin = Vec::new();
-        for (index, entry) in self.entries.iter().enumerate() {
-            let wrapped = entry_lines(entry, left_width, verbose);
+        // All normal mutations mark the first changed entry. A render that
+        // only animates a spinner or updates draft text never walks the full
+        // history to compare thousands of unchanged revision numbers.
+        let mut first_stale = if geometry_changed {
+            0
+        } else {
+            self.transcript_dirty_from
+                .unwrap_or(self.entries.len())
+                .min(self.entry_rows_meta.len())
+        };
+        self.transcript_dirty_from = None;
+        // A direct session replacement must also invalidate the cache even
+        // when its new transcript happens to have the same number of rows.
+        if !geometry_changed
+            && first_stale == self.entries.len()
+            && self.entry_rows_meta.len() != self.entries.len()
+        {
+            first_stale = self.entry_rows_meta.len().min(self.entries.len());
+        }
+        if self.entry_rows_meta.len() > self.entries.len() {
+            // A clear happened without the meta being cleared alongside it.
+            let keep = self.entries.len();
+            let start = self
+                .entry_rows_meta
+                .get(keep)
+                .map(|meta| meta.start)
+                .unwrap_or(self.transcript_lines.len());
+            self.transcript_lines.truncate(start);
+            self.transcript_bg.truncate(start);
+            self.line_origin.truncate(start);
+            self.entry_rows_meta.truncate(keep);
+        }
+        if first_stale >= self.entries.len() {
+            return geometry_changed;
+        }
+        let start = self
+            .entry_rows_meta
+            .get(first_stale)
+            .map(|meta| meta.start)
+            .unwrap_or(self.transcript_lines.len());
+        self.transcript_lines.truncate(start);
+        self.transcript_bg.truncate(start);
+        self.line_origin.truncate(start);
+        self.entry_rows_meta.truncate(first_stale);
+        for (index, entry) in self.entries.iter().enumerate().skip(first_stale) {
+            let revision = self.entry_revisions.get(index).copied().unwrap_or_default();
+            let begin = self.transcript_lines.len();
+            let wrapped = entry_rows(entry, left_width, verbose, panel);
             let count = wrapped.len();
-            lines.extend(wrapped);
-            origin.extend(std::iter::repeat_n(index, count));
-            lines.push(String::new());
-            origin.push(index);
+            self.transcript_lines
+                .extend(wrapped.iter().map(|(text, _)| text.clone()));
+            self.transcript_bg.extend(wrapped.iter().map(|(_, bg)| *bg));
+            self.line_origin.extend(std::iter::repeat_n(index, count));
+            self.transcript_lines.push(String::new());
+            self.transcript_bg.push(None);
+            self.line_origin.push(index);
+            self.entry_rows_meta.push(EntryRowsMeta {
+                start: begin,
+                count: count + 1,
+                revision,
+            });
         }
-        self.transcript_lines = lines;
-        self.line_origin = origin;
-        self.transcript_key = Some(key);
         self.transcript_rebuilds += 1;
+        self.entries_rewrapped += self.entries.len().saturating_sub(first_stale) as u64;
         true
+    }
+
+    /// Feed every newly completed line of the draft through the incremental
+    /// wrap cache. Only text appended since the previous frame is processed,
+    /// so per-frame work is proportional to the new bytes, not the whole
+    /// response.
+    fn refresh_draft_rows(&mut self, width: usize, verbose: bool, panel: Color) {
+        let width = width.max(12);
+        let reset = self.draft_cache.width != width
+            || self.draft_cache.verbose != verbose
+            || self.draft_cache.panel != Some(panel)
+            || self.draft_cache.processed > self.draft.len();
+        if reset {
+            self.draft_cache = DraftCache {
+                width,
+                verbose,
+                panel: Some(panel),
+                ..DraftCache::default()
+            };
+            self.draft_cache.rows.push(agent_header(width, panel));
+        }
+        let start = self.draft_cache.processed;
+        let Some(offset) = self.draft[start..].rfind('\n') else {
+            return;
+        };
+        let end = start + offset;
+        // Disjoint field borrows: the cache is mutated while the draft is
+        // only read, which the borrow checker accepts for direct fields.
+        let cache = &mut self.draft_cache;
+        for line in self.draft[start..end].split('\n') {
+            cache.body.feed(line, width, panel, &mut cache.rows);
+        }
+        cache.processed = end + 1;
+    }
+
+    /// Rows for the not-yet-newline-terminated tail plus the closing border.
+    /// Returns the number of already-cached draft rows alongside the tail,
+    /// so the caller can index the combined sequence without copying the
+    /// cached rows on every frame.
+    #[allow(clippy::type_complexity)]
+    fn prepare_draft(
+        &mut self,
+        width: usize,
+        verbose: bool,
+        panel: Color,
+    ) -> (usize, Vec<(String, Option<Color>)>) {
+        self.refresh_draft_rows(width, verbose, panel);
+        let width = width.max(12);
+        let mut tail = Vec::new();
+        // Replay the partial line on a copy of the streaming state: the
+        // preview must match a full render of the same bytes without
+        // committing anything the cache will see again next frame.
+        let mut preview = self.draft_cache.body.clone();
+        let processed = self.draft_cache.processed;
+        for line in self.draft[processed..].split('\n') {
+            preview.feed(line, width, panel, &mut tail);
+        }
+        preview.finish(width, panel, &mut tail);
+        if let Some(footer) = agent_footer(width, panel) {
+            tail.push(footer);
+        }
+        (self.draft_cache.rows.len(), tail)
     }
 
     /// Scroll by `lines` toward the top, clamped to what the last render
@@ -1373,6 +2096,10 @@ impl Ui {
     /// conversation context (spec 1.3).
     fn clear_transcript(&mut self) {
         self.entries.clear();
+        self.entry_revisions.clear();
+        self.entry_rows_meta.clear();
+        self.draft.clear();
+        self.draft_cache = DraftCache::default();
         self.tool_rows.clear();
         self.tool_cells.clear();
         self.child_cells.clear();
@@ -1381,8 +2108,13 @@ impl Ui {
         self.ro_ids.clear();
         self.active_group = None;
         self.think_row = None;
+        self.plan_row = None;
+        self.dash_detail = None;
+        self.dash_sel = 0;
         self.top_entry = None;
         self.line_origin.clear();
+        self.transcript_lines.clear();
+        self.transcript_bg.clear();
         self.finished_children = 0;
         self.finished_ms = 0;
         self.last_flag.clear();
@@ -1390,9 +2122,28 @@ impl Ui {
         self.search_matches.clear();
         self.search_position = 0;
         self.transcript_key = None;
+        self.transcript_dirty_from = Some(0);
         self.renderer.previous.clear();
         self.renderer.full_redraw = true;
         self.scroll_end();
+    }
+
+    /// Restore only the flags belonging to the active saved session. The
+    /// detector's project-wide `.ctf/flags.log` remains available to the CTF
+    /// verifier, but it must not leak into the interactive session panel.
+    fn restore_flags(&mut self, flags: Vec<(String, String)>) {
+        self.flag_log.clear();
+        self.flags_found = 0;
+        for (flag, source) in flags {
+            self.record_flag(flag, source);
+        }
+    }
+
+    fn clear_session_flags(&mut self) {
+        self.flag_log.clear();
+        self.flags_found = 0;
+        self.last_flag.clear();
+        self.flag_stream_buffers.clear();
     }
 
     /// Bracketed paste (spec 1.2): a short paste types through, a long one
@@ -1452,7 +2203,14 @@ impl Ui {
             self.scroll = self.scroll.saturating_add(added_lines);
             self.new_since_detach += added_lines;
         }
+        let row = self.entries.len();
+        self.transcript_dirty_from = Some(
+            self.transcript_dirty_from
+                .map_or(row, |start| start.min(row)),
+        );
         self.entries.push(entry);
+        self.entry_revisions.push(self.next_entry_revision);
+        self.next_entry_revision = self.next_entry_revision.wrapping_add(1);
     }
 
     fn push(&mut self, speaker: Speaker, text: impl Into<String>) {
@@ -1468,12 +2226,86 @@ impl Ui {
             self.scroll = self.scroll.saturating_add(added);
             self.new_since_detach += added;
         }
+        let row = self.entries.len();
+        self.transcript_dirty_from = Some(
+            self.transcript_dirty_from
+                .map_or(row, |start| start.min(row)),
+        );
         self.entries.push(Entry { speaker, text });
+        self.entry_revisions.push(self.next_entry_revision);
+        self.next_entry_revision = self.next_entry_revision.wrapping_add(1);
+    }
+
+    fn record_flag(&mut self, flag: String, source: String) {
+        if flag.trim().is_empty() || self.flag_log.iter().any(|(known, _)| known == &flag) {
+            return;
+        }
+        self.flags_found += 1;
+        self.last_flag = flag.clone();
+        self.flag_log.push((flag, source));
+        // Keep state bounded while the durable .ctf log remains the complete
+        // history. The pinned panel displays only the newest few entries.
+        if self.flag_log.len() > 256 {
+            self.flag_log.remove(0);
+        }
+    }
+
+    fn detect_stream_flags(&mut self, source: &str, chunk: &str) {
+        if self.mode != "CTF" {
+            return;
+        }
+        let buffer = self
+            .flag_stream_buffers
+            .entry(source.to_string())
+            .or_default();
+        buffer.push_str(chunk);
+        // Wide enough that a flag split across a large streamed artifact
+        // (base64 blobs, dumps) still matches; bounded so providers that
+        // stream indefinitely cannot grow it without limit.
+        if buffer.chars().count() > 16384 {
+            *buffer = buffer
+                .chars()
+                .skip(buffer.chars().count() - 16384)
+                .collect();
+        }
+        let buffer = buffer.clone();
+        for hit in self.flag_detector.detect(source, &buffer) {
+            self.record_flag(hit.flag, hit.source);
+        }
     }
 
     fn apply_progress(&mut self, progress: Progress) {
         match progress {
             Progress::ToolBegin { id, title } => {
+                self.dash_activity.push_back((
+                    ActivityStat {
+                        id: id.clone(),
+                        title: crate::crash::redact(&title),
+                        running: true,
+                        ok: None,
+                        elapsed_ms: 0,
+                    },
+                    std::time::Instant::now(),
+                ));
+                // Keep current tasks visible even after many completed calls.
+                while self.dash_activity.len() > 96 {
+                    if let Some(index) = self
+                        .dash_activity
+                        .iter()
+                        .position(|(activity, _)| !activity.running)
+                    {
+                        self.dash_activity.remove(index);
+                    } else {
+                        self.dash_activity.pop_front();
+                    }
+                }
+                self.set_task_state(TaskState::RunningTool);
+                if self.first_tool_ms.is_none() {
+                    self.first_tool_ms = self
+                        .turn_started
+                        .map(|started| started.elapsed().as_millis() as u64);
+                }
+                self.status = "Tool active".into();
                 self.tool_calls += 1;
                 self.turn_steps += 1;
                 self.inflight_tools += 1;
@@ -1501,16 +2333,16 @@ impl Ui {
                 }
                 // Read-only calls collect into one `▸ Explored …` group cell
                 // instead of one row per file or search (spec 3.1).
-                if title.starts_with("Read ") || title.starts_with("Searched ") {
+                if self.verbosity == "compact"
+                    && (title.starts_with("Read ") || title.starts_with("Searched "))
+                {
                     let is_read = title.starts_with("Read ");
                     let row = match self.active_group {
                         Some(row) => row,
                         None => {
                             let row = self.entries.len();
-                            let group = GroupCell {
-                                inflight: 1,
-                                ..GroupCell::default()
-                            };
+                            // The increment below counts the first call as well.
+                            let group = GroupCell::default();
                             let text = group_text(&group);
                             self.push_scrolled(
                                 Entry {
@@ -1524,8 +2356,12 @@ impl Ui {
                             row
                         }
                     };
-                    if let Some(group) = self.groups.get_mut(&row) {
+                    let updated = self.groups.get_mut(&row).map(|group| {
                         group.inflight += 1;
+                        group_text(group)
+                    });
+                    if let Some(text) = updated {
+                        self.set_entry_text(row, text);
                     }
                     self.ro_ids.insert(id.clone(), (row, is_read));
                     // The cell tracks the title for a failure; it has no row
@@ -1549,7 +2385,7 @@ impl Ui {
                 self.push_scrolled(
                     Entry {
                         speaker: Speaker::Tool,
-                        text: format!(" ⠋ {title}  …"),
+                        text: format!("◌ {title}"),
                     },
                     1,
                 );
@@ -1573,6 +2409,30 @@ impl Ui {
                 output,
                 elapsed_ms,
             } => {
+                if let Some((activity, _)) = self
+                    .dash_activity
+                    .iter_mut()
+                    .rev()
+                    .find(|(activity, _)| activity.id == id && activity.running)
+                {
+                    activity.running = false;
+                    activity.ok = Some(ok);
+                    activity.elapsed_ms = elapsed_ms.min(u64::MAX as u128) as u64;
+                }
+                self.detect_stream_flags(&format!("tool:{id}"), &output);
+                if self.inflight_tools <= 1 {
+                    self.set_task_state(if ok {
+                        TaskState::WaitingForModel
+                    } else {
+                        TaskState::Failed
+                    });
+                    self.status = if ok {
+                        "Processing result"
+                    } else {
+                        "Tool failed"
+                    }
+                    .into();
+                }
                 if !ok {
                     self.tool_failures += 1;
                 }
@@ -1688,20 +2548,65 @@ impl Ui {
                     self.set_entry_text(row, text);
                 }
             }
-            Progress::Plan(items) => self.plan = items,
+            Progress::Plan(items) => {
+                self.plan = items;
+                let complete = self.plan.iter().filter(|(_, done)| *done).count();
+                let mut body = format!("☷ PLAN  {complete}/{} complete", self.plan.len());
+                for (step, done) in self.plan.iter().take(8) {
+                    let safe = crate::crash::redact(&step.replace(['\n', '\r'], " "));
+                    let mark = if *done { "✓" } else { "○" };
+                    body.push_str(&format!("\n   {mark} {safe}"));
+                }
+                if self.plan.len() > 8 {
+                    body.push_str(&format!("\n   +{} more steps", self.plan.len() - 8));
+                }
+                if let Some(row) = self.plan_row {
+                    self.set_entry_text(row, body);
+                } else {
+                    let row = self.entries.len();
+                    self.push(Speaker::System, body);
+                    self.plan_row = Some(row);
+                }
+            }
             Progress::Tool(message) => {
                 self.finalize_think();
                 self.push(Speaker::Tool, message);
             }
-            Progress::ResetText => {
-                self.finalize_think();
-                if !self.draft.is_empty() {
-                    let completed = std::mem::take(&mut self.draft);
-                    self.push(Speaker::Agent, completed);
+            Progress::Heartbeat => {
+                if self.inflight_tools == 0 && self.draft.is_empty() {
+                    self.status = "Model active".into();
                 }
+            }
+            Progress::ModelStage(stage) => {
+                // The stage is recorded even while tools are live: a stage
+                // announces what the model is doing next, and dropping it
+                // whenever a tool is in flight loses the only progress
+                // signal a long turn gives.
+                self.stage = stage.clone();
+                if self.inflight_tools == 0 {
+                    self.set_task_state(TaskState::WaitingForModel);
+                    self.status = stage;
+                }
+            }
+            Progress::ResetText => {
+                // Reset means replacement, not completion. Provider retries and
+                // forced-tool recovery must discard a partial failed stream.
+                self.finalize_think();
+                self.draft.clear();
             }
             Progress::TextDelta(piece) => {
                 self.finalize_think();
+                self.detect_stream_flags("model stream", &piece);
+                self.set_task_state(TaskState::Streaming);
+                if self.first_token_ms.is_none() {
+                    self.first_token_ms = self
+                        .turn_started
+                        .map(|started| started.elapsed().as_millis() as u64);
+                }
+                self.status = "Streaming".into();
+                // The model is producing output now, so the last announced
+                // stage ("Sending prompt to model") is spent.
+                self.stage = "Streaming".into();
                 self.draft.push_str(&crate::crash::redact(&piece));
             }
             Progress::Usage(usage) => {
@@ -1710,17 +2615,15 @@ impl Ui {
             }
             Progress::Metrics(metrics) => self.metrics = metrics,
             Progress::FlagFound { flag, source } => {
-                self.finalize_think();
-                self.flags_found += 1;
-                self.last_flag = flag.clone();
-                self.flag_log.push((flag.clone(), source.clone()));
-                if self.flag_log.len() > 32 {
-                    self.flag_log.remove(0);
+                if self.mode != "CTF" {
+                    return;
                 }
+                self.finalize_think();
+                self.record_flag(flag.clone(), source.clone());
                 self.push(
                     Speaker::System,
                     format!(
-                        "🚩 FLAG FOUND  {flag}\n   Clipboard copy attempted · source: {source} · logged in .ctf/flags.log"
+                        "🚩 FLAG DETECTED  {flag}\n   source: {source} · logged in .ctf/flags.log"
                     ),
                 );
             }
@@ -1758,27 +2661,100 @@ impl Ui {
     /// Full text for a tool cell: header, nested child tools, and either the
     /// collapsed preview or the expanded output.
     fn cell_text(&self, id: &str, cell: &ToolCell) -> String {
+        // Always redact displayed tool titles: command arguments can contain
+        // environment credentials and verbose mode must not echo them.
+        let title = crate::crash::redact(&display_tool_title(&cell.title));
         let mut out = if cell.running {
-            format!(" ⠋ {}  …", cell.title)
-        } else {
-            let icon = if cell.ok { "✓" } else { "✗" };
+            let ms = self
+                .dash_activity
+                .iter()
+                .rev()
+                .find(|(activity, _)| activity.id == id && activity.running)
+                .map(|(_, started)| started.elapsed().as_millis())
+                .unwrap_or(0);
             format!(
-                " {icon} {}  {:.1}s",
-                cell.title,
-                cell.elapsed_ms as f64 / 1000.0
+                "◌  {title}   {}",
+                format_duration_ms(ms.min(u64::MAX as u128) as u64)
+            )
+        } else {
+            let icon = if cell.ok { "✓" } else { "×" };
+            format!(
+                " {icon}  {title}   {}",
+                format_duration_ms(cell.elapsed_ms.min(u64::MAX as u128) as u64)
             )
         };
         if !id.contains('/') {
             out.push_str(&self.child_lines(id, 1));
         }
         if cell.running {
+            // Show only a shell's own latest line, not unrelated process
+            // output, and always redact credentials before displaying it.
+            if let Some(cmd) = cell
+                .title
+                .strip_prefix("Ran shell: ")
+                .or_else(|| cell.title.strip_prefix("Ran shell "))
+            {
+                if let Some(proc) = self
+                    .dash_procs
+                    .iter()
+                    .rev()
+                    .find(|proc| proc.running && proc.command.trim() == cmd.trim())
+                {
+                    if self.verbosity == "verbose" {
+                        // Procfs values approximate the tracked command's
+                        // active shell+subprocess tree, not system-wide usage.
+                        let cpu = proc
+                            .cpu_pct
+                            .map(|value| format!("{value:.1}%"))
+                            .unwrap_or_else(|| "n/a".into());
+                        let ram = proc
+                            .rss_kb
+                            .map(|kb| format!("{:.1} MiB", kb as f64 / 1024.0))
+                            .unwrap_or_else(|| "n/a".into());
+                        out.push_str(&format!(
+                            "\n     ↳ PID {} · CPU {} · RAM {} (process tree)",
+                            proc.pid, cpu, ram,
+                        ));
+                    }
+                    let limit = if self.verbosity == "verbose" { 2 } else { 1 };
+                    let last: Vec<_> = proc
+                        .tail
+                        .lines()
+                        .rev()
+                        .filter(|line| !line.trim().is_empty())
+                        .take(limit)
+                        .collect();
+                    for line in last.into_iter().rev() {
+                        let safe = crate::crash::redact(line);
+                        let safe: String = safe.chars().filter(|ch| !ch.is_control()).collect();
+                        out.push_str(&format!("\n     ↳ {}", clip(&safe, 105)));
+                    }
+                }
+            }
             return out;
         }
         let expanded = self.expanded.contains(&cell.row);
-        if !cell.ok || expanded {
+        if !cell.ok || expanded || self.verbosity == "verbose" {
             out.push_str(&expanded_block(&cell.output, cell.exit_code));
         } else {
-            out.push_str(&preview_block(&cell.output, 3, 2));
+            let lines = clean_output_lines(&cell.output);
+            let content: Vec<&str> = lines
+                .iter()
+                .map(String::as_str)
+                .filter(|line| !line.starts_with("exit="))
+                .collect();
+            if let Some(last) = content.last() {
+                let safe = crate::crash::redact(last);
+                let safe: String = safe.chars().filter(|ch| !ch.is_control()).collect();
+                out.push_str(&format!(
+                    "\n     ↳ {} line{} · {}",
+                    content.len(),
+                    if content.len() == 1 { "" } else { "s" },
+                    clip(&safe, 90)
+                ));
+            } else if cell.exit_code.is_some() {
+                out.push_str("\n     ↳ Completed · expand for details");
+            }
         }
         out
     }
@@ -1809,11 +2785,11 @@ impl Ui {
                 continue;
             };
             let icon = if child.running {
-                "⠋"
+                "◌"
             } else if child.ok {
                 "✓"
             } else {
-                "✗"
+                "×"
             };
             let tail = if child.running {
                 "  …".to_string()
@@ -1954,6 +2930,20 @@ impl Ui {
             changed_files: self.dash_files.clone(),
             // Newest first: the panel and the selection both index this order.
             procs: self.dash_procs.iter().rev().map(ProcStat::from).collect(),
+            activities: self
+                .dash_activity
+                .iter()
+                .rev()
+                .map(|(activity, started)| {
+                    let mut visible = activity.clone();
+                    if visible.running {
+                        visible.elapsed_ms =
+                            started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    }
+                    visible
+                })
+                .collect(),
+            stage: self.stage.clone(),
             turn_tokens: self.turn_tokens.clone(),
             verified: self.verified,
             last_error: self.last_error_kind.to_string(),
@@ -1973,7 +2963,7 @@ impl Ui {
             return;
         }
         let count = match self.dash_focus {
-            0 => self.dash_procs.len(),
+            0 => self.dash_activity.len() + self.dash_procs.len(),
             5 => self.dash_files.len(),
             _ => return,
         };
@@ -1992,7 +2982,31 @@ impl Ui {
         }
         match self.dash_focus {
             0 => {
-                let selected = self.dash_procs.iter().rev().nth(self.dash_sel).cloned();
+                // Operation details precede shell PIDs in the mixed panel.
+                if let Some((activity, started)) =
+                    self.dash_activity.iter().rev().nth(self.dash_sel)
+                {
+                    let elapsed_ms = if activity.running {
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64
+                    } else {
+                        activity.elapsed_ms
+                    };
+                    let state = if activity.running {
+                        "running"
+                    } else if activity.ok == Some(true) {
+                        "completed"
+                    } else {
+                        "failed"
+                    };
+                    let body = format!(
+                        "tool {}\nid {}\nstate {}\nelapsed {:.2}s\n\nTool output: see its transcript cell (Enter/Ctrl+O).\nThis agent operation does not have its own shell PID.",
+                        activity.title, activity.id, state, elapsed_ms as f64 / 1000.0
+                    );
+                    self.dash_detail = Some(("AGENT ACTIVITY".into(), body));
+                    return;
+                }
+                let proc_index = self.dash_sel.saturating_sub(self.dash_activity.len());
+                let selected = self.dash_procs.iter().rev().nth(proc_index).cloned();
                 if let Some(proc) = selected {
                     let mut body = format!(
                         "pid {}\ncommand {}\ncwd {}\nage {}s\nstatus {}\ncpu {} · rss {}\n\nOUTPUT (live tail)\n",
@@ -2062,11 +3076,15 @@ impl Ui {
         if self.dash_focus != 0 {
             return;
         }
+        if self.dash_sel < self.dash_activity.len() {
+            self.status = "Agent activity is not an OS process".into();
+            return;
+        }
         let selected = self
             .dash_procs
             .iter()
             .rev()
-            .nth(self.dash_sel)
+            .nth(self.dash_sel - self.dash_activity.len())
             .map(|proc| proc.pid);
         let Some(pid) = selected else {
             self.status = "No process selected".into();
@@ -2146,7 +3164,6 @@ impl Ui {
             && !self.busy
             && self.tool_cells.is_empty()
             && self.finished_children == 0;
-        let show_alert = !self.last_flag.is_empty();
         let mut body_start = 0usize;
         if show_logo {
             let spin = SPINNER[self.spinner % SPINNER.len()];
@@ -2159,19 +3176,27 @@ impl Ui {
             } else {
                 (LOGO.iter().map(|line| (*line).to_string()).collect(), true)
             };
-            for (index, line) in lines.iter().enumerate() {
+            for line in &lines {
                 if body_start >= height_usize {
                     break;
                 }
-                let tail = match (wide, index) {
-                    (false, 0) => String::new(),
-                    (true, 2) => format!("  WROSECODE v{}", env!("CARGO_PKG_VERSION")),
-                    _ => String::new(),
-                };
-                let text = clip(&format!("{line}{tail}"), width_usize);
+                // Keep the block wordmark on its own rows. Appending the
+                // version to a logo row made the row exceed narrow usable
+                // widths and could visually clip the final `D`.
+                let text = clip(line, width_usize);
                 let mut row = Row::new(text, colors.accent);
                 row.colors = gradient_colors(&row.text, self.colors);
                 frame[body_start] = row;
+                body_start += 1;
+            }
+            if wide && body_start < height_usize {
+                frame[body_start] = Row::new(
+                    clip(
+                        &format!("  WROSECODE v{}", env!("CARGO_PKG_VERSION")),
+                        width_usize,
+                    ),
+                    colors.muted,
+                );
                 body_start += 1;
             }
             if body_start < height_usize && height_usize >= 16 {
@@ -2198,7 +3223,15 @@ impl Ui {
             if body_start < height_usize {
                 frame[body_start] = Row::new(
                     clip(
-                        &format!("  status   {}", startup_connection(&self.provider_health)),
+                        &format!(
+                            "  status   {}{}",
+                            startup_connection(&self.provider_health),
+                            if self.permission == "yolo" {
+                                " · YOLO"
+                            } else {
+                                ""
+                            },
+                        ),
                         width_usize,
                     ),
                     colors.status,
@@ -2216,59 +3249,107 @@ impl Ui {
                 body_start += 1;
             }
         } else if body_start < height_usize {
-            // The splash collapses into this slim header once the first
-            // message is sent: identity plus the facts that still matter.
-            frame[body_start] = Row::new(
-                clip(
-                    &format!(
-                        " WROSECODE v{} • {} • {} / {} • {} • {} • [{}] • think {} · {}",
-                        env!("CARGO_PKG_VERSION"),
-                        self.mode,
-                        self.provider,
-                        self.model,
-                        self.harness,
-                        self.permission,
-                        self.category,
-                        self.think_label(),
-                        level_resources(self.thinking_level)
-                    ),
-                    width_usize,
-                ),
-                colors.muted,
+            // Minimal chrome: brand · mode/state · provider/model ·
+            // connection. Session and project live in Ctrl+B; the bar never
+            // wraps and never carries debug numbers.
+            let online = if self.provider_health.contains("unavailable")
+                || self.provider_health.starts_with('0')
+            {
+                "○ Offline"
+            } else {
+                "● Online"
+            };
+            let state_word = if self.busy { "WORKING" } else { "READY" };
+            let studio = studio_panel(colors.panel);
+            let mut header = if studio {
+                format!(
+                    "  ◈ WROSECODE    ▸ {}   ·  {}",
+                    self.mode,
+                    if self.busy { "Working" } else { "Ready" }
+                )
+            } else {
+                format!(" WROSECODE  ◈ {} · {}", self.mode, state_word)
+            };
+            if self.permission == "yolo" {
+                header.push_str("  [YOLO]");
+            }
+            if width_usize >= 80 {
+                let model_short = clip(&self.model, 28);
+                header.push_str(&format!("   {}/{}  {}", self.provider, model_short, online));
+            }
+            if width_usize >= 112 && self.verbosity == "verbose" {
+                header.push_str("  · VERBOSE");
+            }
+            let mut heading = Row::new(
+                clip(&header, width_usize),
+                if studio {
+                    colors.muted
+                } else if self.busy {
+                    colors.status
+                } else {
+                    colors.accent
+                },
             );
+            if studio && !self.no_color {
+                heading.colors = Some(
+                    heading
+                        .text
+                        .chars()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            if index < 14 {
+                                colors.accent
+                            } else {
+                                colors.muted
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            frame[body_start] = heading;
             body_start += 1;
+            // Thin rule under the bar; violet-tinted via muted so it stays
+            // subtle on every palette.
+            if body_start < height_usize && height_usize >= 24 {
+                let rule = "─".repeat(width_usize.min(240));
+                frame[body_start] = Row::new(clip(&rule, width_usize), colors.muted);
+                body_start += 1;
+            }
         }
         if body_start < height_usize {
-            frame[body_start] = Row::new("─".repeat(width_usize), colors.muted);
+            // Quiet breathing room below the app bar; avoid the old
+            // full-width separator that made every message feel boxed.
+            frame[body_start] = Row::new("", colors.muted);
             body_start += 1;
         }
-        if show_alert && body_start < height_usize {
-            frame[body_start] = Row::new(
-                clip(
-                    &format!(
-                        " 🚩 FLAG ALERT  {}   ·   {} captured   ·   auto-copied, logged to .ctf/flags.log",
-                        self.last_flag, self.flags_found
-                    ),
-                    width_usize,
-                ),
-                Color::Green,
-            );
-            body_start += 1;
-        }
-        // The prompt panel keeps a visible minimum footprint even when the
-        // draft is empty; multiline input then grows inside that bottom panel.
-        let input_width = width_usize.saturating_sub(5).max(1);
+        // Bottom-up composer geometry FIRST (pure arithmetic, no painting):
+        // footer(1) + box bottom(1) + info(1) + input + chip(0/1) + box top.
+        // Everything above — flags panel, transcript — must yield to the
+        // rows this reserves; the composer is never overwritten.
+        let compact_h = height_usize < 24;
+        let footer_rows = 1usize;
+        let info_rows = 1usize;
+        let rule_rows = 1usize;
+        let think_rows = usize::from(self.think_bar_visible());
+        // Input text budget inside the box walls: `│ > ` … ` │`.
+        let input_width = width_usize.saturating_sub(6).max(1);
         let input_visual_lines = wrap_input(&self.input, input_width);
         let input_rows = input_visual_lines.len().max(1);
         let chip_rows = usize::from(self.paste_chip.is_some());
-        let min_input_rows = if height_usize >= 10 { 3 } else { 1 };
-        // Leave the transcript/status area at least one row, and cap the
-        // editor at eight rows on tall terminals. Short terminals shrink it
-        // to the space actually available instead of painting over output.
+        let min_input_rows = if height_usize >= 10 && !compact_h {
+            3
+        } else {
+            1
+        };
+        // Cap the editor at eight rows on tall terminals (four when
+        // compact). Short terminals shrink it to the space actually
+        // available instead of painting over output.
+        let input_cap = if compact_h { 4 } else { 8 };
         let input_capacity = height_usize
-            .saturating_sub(body_start + 4 + chip_rows)
-            .min(8)
-            .max(1);
+            .saturating_sub(
+                body_start + rule_rows + chip_rows + info_rows + 1 + footer_rows + think_rows,
+            )
+            .clamp(1, input_cap);
         let visible_input_rows = input_rows.max(min_input_rows).min(input_capacity);
         let (cursor_row, _) = input_cursor_position(&input_visual_lines, self.cursor);
         let max_input_scroll = input_rows.saturating_sub(visible_input_rows);
@@ -2278,7 +3359,113 @@ impl Ui {
         } else if cursor_row >= self.input_scroll + visible_input_rows {
             self.input_scroll = cursor_row + 1 - visible_input_rows;
         }
-        let body_end = height_usize.saturating_sub(2 + visible_input_rows + chip_rows);
+        let box_bottom_row = height_usize.saturating_sub(footer_rows + 1);
+        let info_row = box_bottom_row.saturating_sub(1);
+        let input_top = info_row
+            .saturating_sub(visible_input_rows)
+            .max(usize::from(height_usize > 1));
+        let chip_row = input_top.saturating_sub(1);
+        let rule_row = chip_row.saturating_sub(chip_rows);
+        if self.mode == "CTF" && !self.flag_log.is_empty() && body_start < height_usize {
+            // Pinned accuracy panel: always the newest session flags (5 on
+            // roomy screens, 2 when short), full text wrapped across rows —
+            // never silently clipped — plus an exact overflow count. Every
+            // row stays strictly above `panel_end`, which the bottom-up
+            // layout reserved for the composer: the panel yields, the
+            // composer never gets overwritten.
+            let inner = width_usize.saturating_sub(4).max(1);
+            let slots = if height_usize.saturating_sub(body_start + 4) >= 7 {
+                5
+            } else {
+                2
+            };
+            let total = self.flag_log.len();
+            let start = total.saturating_sub(slots);
+            // Last row the panel may own; the composer owns `panel_end`
+            // upward from here via rule/chip/input rows... see the bottom-up
+            // geometry above (`rule_row - think_rows`).
+            let panel_end = rule_row.saturating_sub(think_rows);
+            if body_start >= panel_end {
+                // No room even for the title: skip the panel entirely rather
+                // than paint half of it into the composer.
+            } else {
+                frame[body_start] = Row::new(
+                    clip(
+                        "╭─ 🚩 FLAGS FOUND ─────────────────────────────",
+                        width_usize,
+                    ),
+                    colors.accent,
+                );
+                body_start += 1;
+            }
+            let mut shown = 0usize;
+            for (flag, source) in &self.flag_log[start..] {
+                // One spare row stays free for the count/close line.
+                if body_start + 1 >= panel_end {
+                    break;
+                }
+                // One flag owns up to 3 wrapped text rows plus an explicit
+                // overflow marker, so a giant body cannot flood the panel
+                // while nothing is ever silently cut.
+                let parts = wrap(flag, inner);
+                let overflow = parts.len() > 3;
+                for (index, part) in parts.into_iter().take(3).enumerate() {
+                    if body_start + 1 >= panel_end {
+                        break;
+                    }
+                    let prefix = if index == 0 { "│ " } else { "│   " };
+                    frame[body_start] =
+                        Row::new(clip(&format!("{prefix}{part}"), width_usize), colors.status);
+                    body_start += 1;
+                }
+                if overflow && body_start + 1 < panel_end {
+                    frame[body_start] = Row::new(
+                        clip(
+                            &format!("│   ⋯ +{} chars", flag.chars().count()),
+                            width_usize,
+                        ),
+                        colors.muted,
+                    );
+                    body_start += 1;
+                }
+                if body_start + 1 < panel_end {
+                    frame[body_start] = Row::new(
+                        clip(&format!("│   ↳ {}", source), width_usize),
+                        colors.muted,
+                    );
+                    body_start += 1;
+                }
+                shown += 1;
+            }
+            let hidden = total.saturating_sub(shown);
+            if hidden > 0 && body_start < panel_end {
+                frame[body_start] = Row::new(
+                    clip(
+                        &format!("│ +{hidden} more · /flags for history"),
+                        width_usize,
+                    ),
+                    colors.muted,
+                );
+                body_start += 1;
+            } else if body_start < panel_end {
+                frame[body_start] = Row::new(
+                    clip("╰────────────────────────────────────────────", width_usize),
+                    colors.accent,
+                );
+                body_start += 1;
+            }
+        }
+        // Transcript bounds from the precomputed bottom-up geometry: the
+        // think bar sits directly above the composer box top, so the
+        // transcript ends one row earlier while it is visible.
+        let mut body_end = rule_row
+            .saturating_sub(think_rows)
+            .clamp(body_start, height_usize);
+        // Tiny terminals: the transcript collapses to zero rows; header,
+        // composer, and footer keep their own rows without overlap.
+        if body_end < body_start {
+            body_end = body_start.min(height_usize.saturating_sub(1));
+        }
         let body_height = body_end.saturating_sub(body_start);
         if show_logo {
             self.view = TranscriptView {
@@ -2291,91 +3478,41 @@ impl Ui {
             self.scroll = 0;
             self.page_size = body_height.max(1);
         }
-        // The transcript owns the full terminal width. Token, latency and
-        // cost counters stay internal (status line, `/stats`, `live.json`)
-        // instead of occupying permanent screen real estate.
-        let left_width = width_usize;
-        // The tree pane takes only its natural height (capped), so the
-        // transcript flexes to fill every remaining body row instead of
-        // splitting the body into fixed fractions.
-        let mut running: Vec<&ToolCell> = if show_logo {
-            Vec::new()
+        // On wide terminals display live operations beside the conversation.
+        // Narrow terminals keep the full-width transcript.
+        let show_activity = self.activity_rail
+            && width_usize >= 110
+            && body_height >= 10
+            && !show_logo
+            && self.tool_calls > 0
+            && self.picker.is_none()
+            && !self.palette;
+        let rail_width = if show_activity {
+            (width_usize / 3).clamp(34, 46)
         } else {
-            self.tool_cells
-                .values()
-                .filter(|cell| cell.running)
-                .collect()
-        };
-        running.sort_by_key(|cell| cell.row);
-        // Header + root line + one footer line are reserved; the rest is the
-        // capped running window.
-        let slots = max_tree_height(body_height).saturating_sub(3);
-        let hidden = running.len().saturating_sub(slots);
-        let filled = self.spinner % 6 + 1;
-        let footer = if hidden > 0 {
-            format!(" +{hidden} more running")
-        } else if self.finished_children > 0 {
-            format!(
-                " ✓ {} subagents done · {}",
-                self.finished_children,
-                format_duration_ms(self.finished_ms.min(u64::MAX as u128) as u64)
-            )
-        } else {
-            String::new()
-        };
-        let mut tree_lines: Vec<String> = Vec::new();
-        if !running.is_empty() || !footer.is_empty() {
-            let running_count = running.len();
-            tree_lines.push(format!(" SUBAGENT TREE  {running_count} running"));
-            tree_lines.push(format!(
-                " root [{}] think {} · {}",
-                self.category,
-                self.think_label(),
-                level_resources(self.thinking_level)
-            ));
-            for cell in running.into_iter().skip(hidden) {
-                tree_lines.push(format!(
-                    " ├─ [{}{}] {}",
-                    "█".repeat(filled),
-                    "░".repeat(7 - filled),
-                    clip(&cell.title, left_width.saturating_sub(16).max(8))
-                ));
-            }
-            if !footer.is_empty() {
-                tree_lines.push(footer);
-            }
-        }
-        let tree_height = tree_lines.len().min(body_height);
-        tree_lines.truncate(tree_height);
-        // One row is the transcript header; every other remaining body row
-        // shows transcript content.
-        let transcript_height = if show_logo {
             0
-        } else {
-            body_height.saturating_sub(tree_height).saturating_sub(1)
         };
+        let transcript_width = width_usize.saturating_sub(rail_width + usize::from(show_activity));
+        let transcript_height = if show_logo { 0 } else { body_height };
         // Wrapped rows come from the cache; scrolling reslices instead of
-        // re-wrapping, and only the visible window is ever read below.
+        // re-wrapping, and only the visible window is ever read below. The
+        // transcript owns the full terminal width: no rail, no reservation.
         let verbose = self.verbosity == "verbose";
+        let panel = input_panel_bg(colors);
         if !show_logo {
-            self.ensure_transcript(left_width, verbose);
+            self.ensure_transcript(transcript_width, verbose, panel);
         }
         let base = self.transcript_lines.len();
         // The live draft only joins the view when the viewport is pinned to
         // the bottom; otherwise its growth would shift a scrolled-up view.
-        let draft_lines: Vec<String> = if self.scroll == 0 && !self.draft.is_empty() {
-            entry_lines(
-                &Entry {
-                    speaker: Speaker::Agent,
-                    text: self.draft.clone(),
-                },
-                left_width,
-                verbose,
-            )
+        // Completed lines come from the incremental cache; only the trailing
+        // partial line is wrapped per frame.
+        let (draft_cached, draft_tail) = if self.scroll == 0 && !self.draft.is_empty() {
+            self.prepare_draft(transcript_width, verbose, panel)
         } else {
-            Vec::new()
+            (0, Vec::new())
         };
-        let total_lines = base + draft_lines.len();
+        let total_lines = base + draft_cached + draft_tail.len();
         if !show_logo {
             self.max_scroll = total_lines.saturating_sub(transcript_height);
             self.scroll = self.scroll.min(self.max_scroll);
@@ -2385,15 +3522,25 @@ impl Ui {
         let transcript_start = transcript_end.saturating_sub(transcript_height);
         let mut visible: Vec<&str> = Vec::with_capacity(transcript_height);
         for index in transcript_start..transcript_end {
-            if let Some(line) = self.transcript_lines.get(index) {
-                visible.push(line.as_str());
-            } else if let Some(line) = draft_lines.get(index - base) {
-                visible.push(line.as_str());
+            if index < base {
+                if let Some(line) = self.transcript_lines.get(index) {
+                    visible.push(line.as_str());
+                }
+            } else {
+                let offset = index - base;
+                if let Some(row) = self.draft_cache.rows.get(offset) {
+                    visible.push(row.0.as_str());
+                } else if let Some(row) = offset
+                    .checked_sub(draft_cached)
+                    .and_then(|tail_index| draft_tail.get(tail_index))
+                {
+                    visible.push(row.0.as_str());
+                }
             }
         }
         // Remember where the transcript sits so a click (or Ctrl+O) can map a
         // terminal row back to its entry: line `transcript_start` paints on
-        // frame row `body_start + 1`.
+        // frame row `body_start`.
         if !show_logo {
             self.view = TranscriptView {
                 body_start,
@@ -2403,49 +3550,109 @@ impl Ui {
             self.top_entry = self.line_origin.get(transcript_start).copied();
         }
 
-        // Header row plus every transcript content row that fits; the tree
-        // lines painted below start exactly where these end.
-        for row in 0..transcript_height.saturating_add(1) {
-            let line = if row == 0 {
-                format!(
-                    " TRANSCRIPT  {} {}{}",
-                    self.entries.len(),
-                    if self.entries.len() == 1 {
-                        "entry"
-                    } else {
-                        "entries"
-                    },
-                    self.follow_marker()
-                )
+        // Every transcript content row that fits, full width, no header row:
+        // the conversation starts immediately under the app bar.
+        for row in 0..transcript_height {
+            let line = visible
+                .get(row)
+                .map(|line| (*line).to_string())
+                .unwrap_or_default();
+            let mut painted = Row::new(clip(&line, transcript_width), colors.text);
+            let idx = transcript_start + row;
+            if idx < base {
+                if let Some(entry_index) = self.line_origin.get(idx) {
+                    let entry = &self.entries[*entry_index];
+                    let (mut fg, style_bg) = transcript_style(entry, colors);
+                    // Charcoal containers (code fences, tool output, snapshot)
+                    // override the entry background per row.
+                    let bg = self
+                        .transcript_bg
+                        .get(idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(style_bg);
+                    let is_first = idx == 0 || self.line_origin.get(idx - 1) != Some(entry_index);
+                    // Tool details echo their title's state in a dimmer shade:
+                    // green on green, amber on amber, red on red.
+                    if !self.no_color && matches!(entry.speaker, Speaker::Tool) && !is_first {
+                        fg = if studio_panel(colors.panel) {
+                            colors.muted
+                        } else if entry.text.starts_with('✗') {
+                            WROSE_ERROR
+                        } else if entry.text.starts_with('◌') {
+                            WROSE_AMBER
+                        } else {
+                            WROSE_DIM_GREEN
+                        };
+                    }
+                    if !self.no_color
+                        && studio_panel(colors.panel)
+                        && matches!(entry.speaker, Speaker::Agent)
+                        && is_first
+                    {
+                        fg = colors.accent;
+                    }
+                    // The user marker keeps the cyan accent while the prompt
+                    // itself reads soft white.
+                    if !self.no_color && matches!(entry.speaker, Speaker::User) && is_first {
+                        painted.colors = Some(vec![colors.accent, colors.accent]);
+                    }
+                    painted.fg = fg;
+                    painted.bg = bg;
+                } else {
+                    painted.bg = transcript_panel_bg(colors);
+                }
             } else {
-                visible
-                    .get(row - 1)
-                    .map(|line| (*line).to_string())
-                    .unwrap_or_default()
-            };
-            let mut painted = Row::new(clip(&line, left_width), colors.text);
-            if row == 0 {
-                painted.fg = colors.accent;
-                painted.bg = transcript_panel_bg(colors);
-            } else if let Some(entry_index) = self.line_origin.get(transcript_start + row - 1) {
-                let entry = &self.entries[*entry_index];
-                let (fg, bg) = transcript_style(entry, colors);
-                painted.fg = fg;
-                painted.bg = bg;
-            } else {
-                painted.bg = transcript_panel_bg(colors);
+                let offset = idx - base;
+                let bg = self
+                    .draft_cache
+                    .rows
+                    .get(offset)
+                    .and_then(|row| row.1)
+                    .or_else(|| {
+                        offset
+                            .checked_sub(draft_cached)
+                            .and_then(|tail_index| draft_tail.get(tail_index))
+                            .and_then(|row| row.1)
+                    });
+                painted.bg = bg.unwrap_or_else(|| transcript_panel_bg(colors));
             }
             if !show_logo {
                 frame[body_start + row] = painted;
             }
         }
-        // Tree lines were sized above to fit exactly; paint them directly
-        // after the transcript rows.
-        let tree_start = body_start + transcript_height.saturating_add(1);
-        for (offset, line) in tree_lines.iter().enumerate() {
-            let target = tree_start + offset;
-            if target < body_end {
-                frame[target] = Row::new(clip(line, left_width), colors.muted);
+        // Append the activity rail only to transcript rows. The composer
+        // stays full width and all colors remain attached to their own cells.
+        if show_activity {
+            // Process snapshots carry a bounded live stdout/stderr tail.
+            // Sample on a 150ms clock, without the more expensive git scan.
+            if self
+                .dash_data_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(150))
+            {
+                self.dash_procs = crate::tools::shell::proc_snapshots();
+                self.dash_data_at = Some(std::time::Instant::now());
+            }
+            let rail = activity_lines(self, rail_width, colors);
+            for index in 0..transcript_height {
+                let row = &mut frame[body_start + index];
+                let left = pad_row(&row.text, transcript_width);
+                let (activity, activity_fg, _) = rail
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| (String::new(), colors.muted, colors.background));
+                let right = clip(&activity, rail_width);
+                if !self.no_color {
+                    let mut palette = row
+                        .colors
+                        .take()
+                        .unwrap_or_else(|| vec![row.fg; row.text.chars().count()]);
+                    palette.resize(transcript_width, row.fg);
+                    palette.push(colors.muted);
+                    palette.extend(std::iter::repeat_n(activity_fg, right.chars().count()));
+                    row.colors = Some(palette);
+                }
+                row.text = format!("{left}│{right}");
             }
         }
         let choices: Vec<String> = if self.picker.is_some() {
@@ -2501,103 +3708,83 @@ impl Ui {
                 };
             }
         }
-        let status_row = body_end;
-        let spinner = SPINNER;
-        let queue_note = if self.pending.is_empty() {
-            String::new()
-        } else {
-            format!(" · queued {}", self.pending.len())
-        };
-        let status_text = if show_logo && !self.busy {
-            format!(
-                " {} Ready · {} / {} · {}",
-                spinner[self.spinner % spinner.len()],
-                self.provider,
-                self.model,
-                startup_connection(&self.provider_health)
-            )
-        } else if self.busy {
-            format!(
-                " {} {}{} · session {} · {} · think:{} · tok {}/{} · cache {}% · {}s · step {} · {}/{} · {} · {}w · cost {} · timeout {}s · tools {}:{}",
-                spinner[self.spinner % spinner.len()],
-                self.status,
-                queue_note,
-                self.session_id,
-                self.model,
+        // Boxed composer geometry, resolved bottom-up so nothing overlaps:
+        // footer(1) + box bottom(1) + info(1) + input + chip(0/1) + box top.
+        // The transcript gets whatever rows remain above the box top.
+        // (`input_top`, `chip_row`, `rule_row`, and `body_end` were resolved
+        // with the layout above so the transcript and palette agree.)
+        // Slim think status bar: one quiet row above the composer box while
+        // a thinking level is active. No telemetry, just the live mode.
+        if think_rows == 1 && body_end >= body_start && body_end < rule_row {
+            let bar = format!(
+                " ◈ THINK · {} · {}/20",
                 self.think_label(),
-                self.usage.input,
-                self.usage.output,
-                cache_percent(self.usage),
-                self.session_started.elapsed().as_secs(),
-                self.turn_steps,
-                self.sandbox,
-                self.permission,
-                speed_tier(self.thinking_level),
-                level_workers(self.thinking_level),
-                self.metrics
-                    .cost_usd
-                    .map(|cost| format!("${cost:.4}"))
-                    .unwrap_or_else(|| "n/a".into()),
-                self.timeout_seconds,
-                self.tool_calls,
-                self.tool_rows.len(),
-            )
-        } else {
-            format!(
-                " {}{} · session {} · {} · think:{} · tok {}/{} · cache {}% · {}s · step {} · {}/{} · {} · {}w · cost {} · tools {}:{} · errors {} · flags {}",
-                self.status,
-                queue_note,
-                self.session_id,
-                self.model,
-                self.think_label(),
-                self.usage.input,
-                self.usage.output,
-                cache_percent(self.usage),
-                self.session_started.elapsed().as_secs(),
-                self.turn_steps,
-                self.sandbox,
-                self.permission,
-                speed_tier(self.thinking_level),
-                level_workers(self.thinking_level),
-                self.metrics.cost_usd.map(|cost| format!("${cost:.4}")).unwrap_or_else(|| "n/a".into()),
-                self.tool_calls,
-                self.tool_rows.len(),
-                self.tool_failures,
-                self.flags_found,
-            )
-        };
-        if status_row < height_usize {
-            let mut status = Row::new(clip(&status_text, width_usize), colors.status);
-            status.bg = if self.busy {
-                activity_bg(colors)
-            } else {
-                transcript_panel_bg(colors)
-            };
-            frame[status_row] = status;
+                self.thinking_level.min(20),
+            );
+            let mut row = Row::new(clip(&bar, width_usize), colors.accent);
+            row.bg = transcript_panel_bg(colors);
+            if body_end < height_usize {
+                frame[body_end] = row;
+            }
         }
-        let separator_row = status_row.saturating_add(1);
-        if separator_row < height_usize {
-            // Top edge of the input box; the draft rows below hang a `│ `
-            // gutter off it.
-            let edge = if show_logo && width_usize >= 24 {
-                let label = " prompt ";
+        // The composer's box top doubles as the live activity line: working
+        // state, queued follow-ups, or the detached-view jump hint. There is
+        // no separate telemetry bar.
+        let rule_label = if self.busy {
+            if let Some((activity, started)) = self
+                .dash_activity
+                .iter()
+                .rev()
+                .find(|(activity, _)| activity.running)
+            {
+                let name = display_tool_title(&activity.title);
                 format!(
-                    "┌{}{}",
-                    label,
-                    "─".repeat(width_usize.saturating_sub(1 + label.chars().count()))
+                    "◌ {}  ·  {:.1}s  ·  {} live  ·  Esc cancel",
+                    clip(&name, 46),
+                    started.elapsed().as_secs_f64(),
+                    self.inflight_tools
+                )
+            } else if self.pending.is_empty() {
+                format!(
+                    "◌ {}  ·  Esc cancel",
+                    clip(
+                        if self.stage.is_empty() {
+                            "Thinking"
+                        } else {
+                            &self.stage
+                        },
+                        55
+                    )
                 )
             } else {
-                let mut edge = String::from("┌");
-                edge.push_str(&"─".repeat(width_usize.saturating_sub(1)));
-                edge
-            };
-            let mut separator = Row::new(clip(&edge, width_usize), colors.accent);
-            separator.bg = input_panel_bg(colors);
-            frame[separator_row] = separator;
+                format!("◌ Working  ·  {} queued  ·  Esc cancel", self.pending.len())
+            }
+        } else if !self.is_following() && self.max_scroll > 0 {
+            self.follow_marker().trim().to_string()
+        } else {
+            String::new()
+        };
+        // Focus chrome: the box walls glow cyan while editing, quiet gray
+        // while navigating. Computed once per frame.
+        let border = if composer_focused(self) && !self.no_color {
+            colors.accent
+        } else {
+            colors.muted
+        };
+        if rule_row >= body_start && rule_row < input_top && rule_row < height_usize {
+            let mut rule = Row::new(
+                box_top_row(width_usize, &rule_label),
+                if rule_label.is_empty() {
+                    border
+                } else {
+                    colors.accent
+                },
+            );
+            rule.bg = input_panel_bg(colors);
+            frame[rule_row] = rule;
         }
         if let Some((_, pasted_lines)) = &self.paste_chip {
-            let chip_row = separator_row.saturating_add(1);
-            if chip_row < height_usize {
+            if chip_row >= body_start && chip_row < input_top && chip_row < height_usize {
                 let mut chip = Row::new(
                     clip(
                         &format!(
@@ -2611,20 +3798,30 @@ impl Ui {
                 frame[chip_row] = chip;
             }
         }
-        // The input box: a top border row with the draft rows bottom-aligned
-        // behind a `│ ` gutter. Empty space stays styled as part of the panel
-        // so the prompt never collapses into a single lonely line.
-        let input_top = height_usize.saturating_sub(visible_input_rows);
-        for row_index in input_top..height_usize {
-            let mut row = Row::new("│", colors.muted);
+        // The input rows live inside the box: `│ > … │` over the charcoal
+        // panel, one distinct editing surface.
+        for frame_row in frame
+            .iter_mut()
+            .take(info_row.min(height_usize))
+            .skip(input_top)
+        {
+            let mut row = Row::new("", colors.muted);
             row.bg = input_panel_bg(colors);
-            frame[row_index] = row;
+            *frame_row = row;
         }
         let rendered_input_rows = input_rows.min(visible_input_rows);
         let input_content_top = input_top + visible_input_rows.saturating_sub(rendered_input_rows);
         let input_color = input_syntax_color(&self.input, colors);
         let (cursor_row, cursor_column) = input_cursor_position(&input_visual_lines, self.cursor);
         let mut caret_x = 4usize + cursor_column;
+        // Empty-draft placeholder; the persistent info line below always
+        // carries mode and model.
+        let placeholder = self.input.is_empty() && self.paste_chip.is_none();
+        let placeholder_text = "Ask WROSECODE anything...".to_string();
+        // Inner width between the box walls.
+        let inner = width_usize.saturating_sub(4).max(1);
+        // Text budget inside `│ > ` … ` │`.
+        let text_width = inner.saturating_sub(2).max(1);
         for (index, line) in input_visual_lines
             .iter()
             .enumerate()
@@ -2633,21 +3830,27 @@ impl Ui {
         {
             let slot = input_content_top - input_top + index - self.input_scroll;
             let row_index = input_top + slot;
-            let prefix = if line.start == 0 {
-                "│ > "
+            let prefix = if line.start == 0 { "│ > " } else { "│   " };
+            let (visible, fg) = if self.mask_input {
+                (
+                    line.text.chars().map(|_| '•').collect::<String>(),
+                    input_color,
+                )
+            } else if placeholder && index == self.input_scroll {
+                (clip(&placeholder_text, text_width), colors.muted)
             } else {
-                "│ ↳ "
+                (clip(&line.text, text_width), input_color)
             };
-            let visible: String = if self.mask_input {
-                line.text.chars().map(|_| '•').collect()
-            } else {
-                line.text.clone()
-            };
-            let mut input_row = Row::new(
-                clip(&format!("{prefix}{visible}"), width_usize),
-                input_color,
+            let padded = format!(
+                "{visible}{}",
+                " ".repeat(text_width.saturating_sub(visible.chars().count()))
             );
+            let mut input_row = Row::new(clip(&format!("{prefix}{padded} │"), width_usize), fg);
             input_row.bg = input_panel_bg(colors);
+            paint_box_walls(&mut input_row, border, self.no_color);
+            // `row_index` always lands inside the cleared input window: the
+            // topmost row is `input_top` and the window holds exactly
+            // `visible_input_rows` rows below the info line.
             if let Some(row) = frame.get_mut(row_index) {
                 *row = input_row;
             }
@@ -2655,6 +3858,59 @@ impl Ui {
                 caret_x = 4 + cursor_column;
             }
         }
+        // Persistent composer info line inside the box: actual mode,
+        // provider/model, and the command hint. The model is clipped first
+        // so the line never wraps.
+        if info_row > input_top && info_row < height_usize {
+            let left = format!(
+                "◈ {} · {}/{}",
+                self.mode,
+                self.provider,
+                clip(&self.model, 32)
+            );
+            let hint = "/ for commands";
+            let gap = inner
+                .saturating_sub(left.chars().count())
+                .saturating_sub(hint.len() + 2)
+                .max(1);
+            let content = clip(&format!("{left}{}  {hint}", " ".repeat(gap)), inner);
+            let padded = format!(
+                "{content}{}",
+                " ".repeat(inner.saturating_sub(content.chars().count()))
+            );
+            let mut info = Row::new(clip(&format!("│ {padded} │"), width_usize), colors.muted);
+            info.bg = input_panel_bg(colors);
+            paint_box_walls(&mut info, border, self.no_color);
+            frame[info_row] = info;
+        }
+        // Box bottom; skipped only when the viewport is too short to hold it.
+        if box_bottom_row > input_top && box_bottom_row < height_usize {
+            let mut bottom = Row::new(box_bottom_row_text(width_usize), border);
+            bottom.bg = input_panel_bg(colors);
+            frame[box_bottom_row] = bottom;
+        }
+        // Minimal footer: only shortcuts that actually exist (Tab toggles
+        // the mode on an empty prompt, Ctrl+P opens the palette). Never
+        // overlaps: it owns the last row and is clipped, never wrapped.
+        if height_usize > 0 {
+            let footer = if width_usize < 60 {
+                "/ commands    Esc cancel".to_string()
+            } else {
+                if studio_panel(colors.panel) {
+                    "  Tab mode   ·   Ctrl+P commands   ·   Ctrl+O details   ·   /activity panel   ·   Esc cancel".to_string()
+                } else {
+                    "Tab mode    Ctrl+P palette    / commands    Esc cancel".to_string()
+                }
+            };
+            let mut row = Row::new(clip(&footer, width_usize), colors.muted);
+            row.bg = transcript_panel_bg(colors);
+            frame[height_usize - 1] = row;
+        }
+        // Opaque viewport: every cell carries an explicit background so no
+        // terminal transparency or stale glyphs show through. Terminals with
+        // forced transparency still composite, but WROSECODE never leaves a
+        // Reset cell behind (set opaque in GNOME Terminal / Konsole /
+        // Windows Terminal profile settings for a fully solid result).
         for row in &mut frame {
             if row.bg == Color::Reset {
                 row.bg = colors.background;
@@ -2762,6 +4018,226 @@ impl Ui {
     }
 }
 
+fn display_tool_title(title: &str) -> String {
+    let title = title.trim();
+    if let Some(command) = title
+        .strip_prefix("Ran shell: ")
+        .or_else(|| title.strip_prefix("Ran shell "))
+    {
+        format!("Run  {command}")
+    } else if let Some(query) = title
+        .strip_prefix("Searched grep ")
+        .or_else(|| title.strip_prefix("Searched glob "))
+        .or_else(|| title.strip_prefix("Searched "))
+    {
+        format!("Search  {query}")
+    } else if let Some(path) = title
+        .strip_prefix("Read read_file ")
+        .or_else(|| title.strip_prefix("Read "))
+    {
+        format!("Read  {path}")
+    } else if let Some(path) = title
+        .strip_prefix("Edited search_replace ")
+        .or_else(|| title.strip_prefix("Edited edit_file "))
+        .or_else(|| title.strip_prefix("Edited write_file "))
+        .or_else(|| title.strip_prefix("Edited "))
+    {
+        format!("Edit  {path}")
+    } else if let Some(items) = title.strip_prefix("Plan update_plan ") {
+        format!("Plan  {items}")
+    } else if let Some(task) = title.strip_prefix("Delegated delegate_task ") {
+        format!("Agent  {task}")
+    } else {
+        title.to_string()
+    }
+}
+
+/// Build the persistent activity rail used by the wide layout. The rail is
+/// deliberately derived from UI state, so progress events replace cells in
+/// place instead of appending another log line. Each tuple is one terminal
+/// row: text, foreground, background.
+fn activity_lines(ui: &Ui, width: usize, colors: &Theme) -> Vec<(String, Color, Color)> {
+    let width = width.max(8);
+    let muted_bg = activity_bg(colors);
+    let mut rows = Vec::new();
+    let mut add = |text: String, fg: Color, bg: Color| {
+        rows.push((clip(&text, width), fg, bg));
+    };
+    add(" ACTIVITY".into(), colors.accent, muted_bg);
+    add(
+        format!(
+            " {}  {}",
+            if ui.busy { "● RUNNING" } else { "○ READY" },
+            ui.status
+        ),
+        if ui.busy { colors.status } else { colors.muted },
+        muted_bg,
+    );
+    add("────────────────────────".into(), colors.muted, muted_bg);
+    add(
+        format!(
+            " stage  {}",
+            if ui.stage.is_empty() {
+                &ui.status
+            } else {
+                &ui.stage
+            }
+        ),
+        colors.muted,
+        muted_bg,
+    );
+    add(format!(" task  {}", ui.category), colors.text, muted_bg);
+    add(
+        format!(" step  {}  ·  {} live", ui.turn_steps, ui.inflight_tools),
+        colors.text,
+        muted_bg,
+    );
+    add(
+        format!(
+            " usage {} in / {} out",
+            compact_number(ui.usage.input),
+            compact_number(ui.usage.output)
+        ),
+        colors.muted,
+        muted_bg,
+    );
+    add("────────────────────────".into(), colors.muted, muted_bg);
+    add(" LIVE TOOLS".into(), colors.accent, tool_panel_bg(colors));
+
+    let running: Vec<_> = ui
+        .dash_activity
+        .iter()
+        .rev()
+        .filter(|(activity, _)| activity.running)
+        .take(5)
+        .collect();
+    if running.is_empty() {
+        add(
+            " no active tools".into(),
+            colors.muted,
+            tool_panel_bg(colors),
+        );
+    } else {
+        for (activity, started) in running.into_iter().rev() {
+            add(
+                format!(
+                    " ◌ {}  {:.1}s",
+                    display_tool_title(&activity.title),
+                    started.elapsed().as_secs_f64()
+                ),
+                colors.status,
+                tool_panel_bg(colors),
+            );
+        }
+    }
+    add(
+        "────────────────────────".into(),
+        colors.muted,
+        tool_panel_bg(colors),
+    );
+    if let Some(proc) = ui
+        .dash_procs
+        .iter()
+        .rev()
+        .find(|proc| proc.running && !proc.tail.trim().is_empty())
+    {
+        add(
+            " LIVE SHELL OUTPUT".into(),
+            colors.accent,
+            tool_panel_bg(colors),
+        );
+        // Shell registry streams stdout/stderr during execution. Its output
+        // is not a model thought; keep only two redacted visible tail lines.
+        let tail: Vec<&str> = proc
+            .tail
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .rev()
+            .take(2)
+            .collect();
+        for line in tail.into_iter().rev() {
+            let safe = crate::crash::redact(line);
+            let safe: String = safe.chars().filter(|ch| !ch.is_control()).collect();
+            add(format!("  {}", safe), colors.muted, tool_panel_bg(colors));
+        }
+        add("────────────────────────".into(), colors.muted, muted_bg);
+    }
+    add(
+        " RECENT RESULTS".into(),
+        colors.accent,
+        result_panel_bg(colors),
+    );
+    // Use the authoritative activity timeline: read/search success cells
+    // may be grouped away in the transcript, but their result must still
+    // appear in the rail like every other tool.
+    let finished: Vec<_> = ui
+        .dash_activity
+        .iter()
+        .rev()
+        .filter(|(activity, _)| !activity.running)
+        .take(4)
+        .collect();
+    if finished.is_empty() {
+        add(
+            " waiting for first result".into(),
+            colors.muted,
+            result_panel_bg(colors),
+        );
+    } else {
+        for (activity, _) in finished.into_iter().rev() {
+            let (icon, fg) = if activity.ok == Some(true) {
+                ("✓", Color::Green)
+            } else {
+                ("×", Color::Red)
+            };
+            add(
+                format!(
+                    " {icon} {}  {}",
+                    display_tool_title(&activity.title),
+                    format_duration_ms(activity.elapsed_ms)
+                ),
+                fg,
+                result_panel_bg(colors),
+            );
+        }
+    }
+    add(
+        "────────────────────────".into(),
+        colors.muted,
+        result_panel_bg(colors),
+    );
+    if !ui.plan.is_empty() {
+        let done = ui.plan.iter().filter(|(_, complete)| *complete).count();
+        add(
+            format!(" PLAN  {done}/{}", ui.plan.len()),
+            colors.accent,
+            muted_bg,
+        );
+        for (step, complete) in ui.plan.iter().take(3) {
+            add(
+                format!(" {} {}", if *complete { "✓" } else { "○" }, step),
+                if *complete { Color::Green } else { colors.text },
+                muted_bg,
+            );
+        }
+    }
+    add(
+        format!(" tools {}  ·  errors {}", ui.tool_calls, ui.tool_failures),
+        colors.muted,
+        result_panel_bg(colors),
+    );
+    add(
+        format!(
+            " tokens {}  ·  cache {}%",
+            compact_number(ui.usage.input + ui.usage.output),
+            cache_percent(ui.usage)
+        ),
+        colors.muted,
+        result_panel_bg(colors),
+    );
+    rows
+}
+
 #[derive(Clone, Debug)]
 struct InputVisualLine {
     text: String,
@@ -2814,7 +4290,7 @@ fn input_cursor_position(rows: &[InputVisualLine], cursor: usize) -> (usize, usi
         .enumerate()
         .filter(|(_, row)| cursor >= row.start && cursor <= row.end)
         .map(|(index, _)| index)
-        .last()
+        .next_back()
         .unwrap_or(0);
     let line = &rows[row];
     let byte = cursor.clamp(line.start, line.end);
@@ -2825,11 +4301,91 @@ fn clip(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
 }
 
-/// Total rows the tree pane may occupy (header + root + running window +
-/// footer). One body row is always reserved for the transcript header
-/// itself, so the tree can never starve the transcript.
-fn max_tree_height(body_height: usize) -> usize {
-    body_height.saturating_sub(1).min(8)
+/// Box top for the OpenCode-style chrome: `┌─ label ───┐`, exactly `width`
+/// cells wide. An empty label yields a plain rule with corners.
+fn box_top_row(width: usize, label: &str) -> String {
+    if width < 4 {
+        return clip(&"─".repeat(width.max(1)), width);
+    }
+    if label.is_empty() {
+        return format!("┌{}┐", "─".repeat(width - 2));
+    }
+    let tag = format!("─ {label} ");
+    let fill = "─".repeat(width.saturating_sub(3 + tag.chars().count()));
+    clip(&format!("┌{tag}{fill}┐"), width)
+}
+
+/// Box bottom: `└──────┘`, exactly `width` cells wide.
+fn box_bottom_row_text(width: usize) -> String {
+    if width < 4 {
+        return clip(&"─".repeat(width.max(1)), width);
+    }
+    format!("└{}┘", "─".repeat(width - 2))
+}
+
+/// One boxed body row: `│ {content} │`, padded to exactly `width` cells.
+/// `content` must already fit `width - 4`.
+fn box_body_row(content: &str, width: usize) -> String {
+    let pad = width
+        .saturating_sub(4)
+        .saturating_sub(content.chars().count());
+    clip(&format!("│ {content}{} │", " ".repeat(pad)), width)
+}
+
+/// The Ctrl+B session snapshot as a bordered transcript section: titled top
+/// border, one boxed row per line, closing border. Never wider than `width`.
+fn snapshot_box_lines(text: &str, width: usize) -> Vec<String> {
+    let available = width.saturating_sub(4).max(1);
+    let mut lines = vec![box_top_row(width, "SESSION")];
+    for line in text.lines().skip(1) {
+        for part in wrap(line, available) {
+            lines.push(box_body_row(&part, width));
+        }
+    }
+    lines.push(box_bottom_row_text(width));
+    lines
+}
+
+/// The composer owns focus except while navigating the transcript, a
+/// picker, or the dashboard. Focused chrome glows cyan; blurred chrome
+/// falls back to quiet gray.
+fn composer_focused(ui: &Ui) -> bool {
+    !ui.navigation_mode && ui.picker.is_none() && !ui.dashboard
+}
+
+/// Recolor a boxed row's walls (`│ … │`) with the border colour, leaving
+/// the interior in the row's own foreground. No-op on narrow rows and in
+/// `NO_COLOR` sessions.
+fn paint_box_walls(row: &mut Row, border: Color, no_color: bool) {
+    if no_color {
+        return;
+    }
+    let cells = row.text.chars().count();
+    if cells < 6 {
+        return;
+    }
+    let mut palette = vec![border, border];
+    palette.extend(std::iter::repeat_n(row.fg, cells - 4));
+    palette.push(border);
+    palette.push(border);
+    row.colors = Some(palette);
+}
+
+/// Last-two-components path for the session snapshot (`…/proj/wrose` keeps
+/// the readout narrow without losing orientation).
+fn short_path(path: &str, width: usize) -> String {
+    let clipped = clip(path, width);
+    if clipped.chars().count() < width {
+        return clipped;
+    }
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() >= 2 {
+        let tail = format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+        if tail.chars().count() <= width {
+            return format!("…/{tail}");
+        }
+    }
+    format!("…{}", clip(path, width.saturating_sub(1)))
 }
 
 fn startup_connection(provider_health: &str) -> String {
@@ -2848,33 +4404,142 @@ fn startup_connection(provider_health: &str) -> String {
     "ready".into()
 }
 
-/// One transcript entry as rendered rows: label on the first line, indented
-/// continuation lines after it, clipped to the transcript pane. A tool call's
-/// command line is never truncated: it wraps onto as many rows as it needs.
-/// Tool *output* stays capped with its own explicit markers instead.
-fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
-    let label = match entry.speaker {
-        Speaker::User => "YOU",
-        Speaker::Agent => "WROSE",
-        Speaker::Tool => "TOOL",
-        Speaker::System => "INFO",
-    };
-    let available = left_width.saturating_sub(9).max(1);
+/// One transcript entry as rendered rows, OpenCode-style: user prompts open
+/// with `›`, assistant prose follows an `◈ WROSECODE` marker, and tool or
+/// system rows render label-free (their first character already carries the
+/// ✓/◌/✗ state). A tool call's command line is never truncated: it wraps
+/// onto as many rows as it needs. Tool *output* stays capped with its own
+/// explicit markers instead.
+///
+/// Returns `(row, background-override)` pairs: `Some(panel)` paints fenced
+/// code blocks, tool output boxes, and the snapshot box on the charcoal
+/// container background, `None` keeps the entry's style background.
+fn entry_rows(
+    entry: &Entry,
+    left_width: usize,
+    verbose: bool,
+    panel: Color,
+) -> Vec<(String, Option<Color>)> {
+    if entry.speaker == Speaker::Agent {
+        return render_agent_body(&entry.text, left_width, verbose, panel);
+    }
+    if entry.speaker == Speaker::User {
+        return boxed_message_lines(entry.speaker, &entry.text, left_width, verbose)
+            .into_iter()
+            .map(|line| (line, None))
+            .collect();
+    }
+    // The Ctrl+B session snapshot reads inside its own bordered section.
+    if entry.speaker == Speaker::System && entry.text.starts_with("SESSION\n") {
+        return snapshot_box_lines(&entry.text, left_width)
+            .into_iter()
+            .map(|line| (line, Some(panel)))
+            .collect();
+    }
+    // Expanded tool output between the `▓WROSE-OUT▓` / `▓WROSE-END▓`
+    // sentinels renders as a bordered box at the live pane width; the
+    // sentinels themselves never reach the screen.
+    if entry.speaker == Speaker::Tool {
+        return render_tool_rows(&entry.text, left_width, verbose, panel);
+    }
+    let (first_prefix, cont_prefix, available) = ("", "  ", left_width.saturating_sub(2).max(1));
     let mut lines = Vec::new();
-    let logical_lines: Vec<&str> = if entry.speaker == Speaker::User {
-        // `lines()` drops a trailing empty line; user text is shown exactly,
-        // including its explicit and final newlines.
-        entry.text.split('\n').collect()
-    } else {
-        entry.text.lines().collect()
-    };
+    let logical_lines: Vec<&str> = entry.text.lines().collect();
     for (part_index, line) in logical_lines.into_iter().enumerate() {
+        // System rows always wrap: silent clipping once cut a 60-char flag
+        // in half inside `/flags` output and `🚩 FLAG DETECTED` lines.
+        for (wrap_index, part) in wrap(line, available).into_iter().enumerate() {
+            let prefix = if part_index == 0 && wrap_index == 0 {
+                first_prefix
+            } else {
+                cont_prefix
+            };
+            lines.push((clip(&format!("{prefix}{part}"), left_width), None));
+        }
+    }
+    lines
+}
+
+/// Plain-text view of [`entry_rows`]: what the wrap-cache tests assert on.
+/// Test-only: production rendering goes through `ensure_transcript`, which
+/// also tracks per-row backgrounds.
+#[cfg(test)]
+fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
+    entry_rows(entry, left_width, verbose, Color::Black)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// Assistant result message as one bordered container, OpenCode-style:
+/// a top border titled `◈ WROSECODE`, prose rows inside the walls, fenced
+/// code blocks kept as their own labeled containers nested inside, closing
+/// border. Indentation is preserved verbatim; long lines wrap inside the
+/// walls. An unclosed fence renders to the end of the message instead of
+/// leaking raw backticks.
+fn render_agent_body(
+    text: &str,
+    width: usize,
+    _verbose: bool,
+    panel: Color,
+) -> Vec<(String, Option<Color>)> {
+    let width = width.max(12);
+    let mut out: Vec<(String, Option<Color>)> = vec![agent_header(width, panel)];
+    let mut body = BodyStream::default();
+    for line in text.split('\n') {
+        body.feed(line, width, panel, &mut out);
+    }
+    body.finish(width, panel, &mut out);
+    if let Some(footer) = agent_footer(width, panel) {
+        out.push(footer);
+    }
+    out
+}
+
+/// Tool entry rows with the expanded-output section (between the
+/// `▓WROSE-OUT▓` / `▓WROSE-END▓` sentinels `cell_text` emits) rendered as a
+/// bordered output box: titled top border with name, status, duration, and
+/// exit code, one boxed row per output line, closing border. Long lines wrap
+/// inside the walls; collapsed previews stay a single quiet line.
+fn render_tool_rows(
+    text: &str,
+    left_width: usize,
+    verbose: bool,
+    panel: Color,
+) -> Vec<(String, Option<Color>)> {
+    let available = left_width.saturating_sub(2).max(1);
+    let code_available = left_width.saturating_sub(6).max(1);
+    let mut out = Vec::new();
+    let mut in_box = false;
+    for (part_index, line) in text.lines().enumerate() {
+        if line.starts_with("▓WROSE-OUT▓") {
+            let label = format!(
+                "output{}",
+                line.strip_prefix("▓WROSE-OUT▓")
+                    .map(str::trim)
+                    .filter(|rest| !rest.is_empty())
+                    .map(|rest| format!(" · {rest}"))
+                    .unwrap_or_default()
+            );
+            out.push((box_top_row(left_width, &label), Some(panel)));
+            in_box = true;
+            continue;
+        }
+        if line.starts_with("▓WROSE-END▓") {
+            out.push((box_bottom_row_text(left_width), Some(panel)));
+            in_box = false;
+            continue;
+        }
+        if in_box {
+            for part in wrap(line, code_available) {
+                out.push((box_body_row(&part, left_width), Some(panel)));
+            }
+            continue;
+        }
         // The first line of a tool cell is the command or task being run:
         // always show all of it, wrapped, so a long command is never cut
         // off mid-text the way silent clipping would.
-        let wrap_line = verbose
-            || entry.speaker == Speaker::User
-            || (part_index == 0 && entry.speaker == Speaker::Tool);
+        let wrap_line = verbose || part_index == 0;
         for (wrap_index, part) in if wrap_line {
             wrap(line, available)
         } else {
@@ -2884,59 +4549,121 @@ fn entry_lines(entry: &Entry, left_width: usize, verbose: bool) -> Vec<String> {
         .enumerate()
         {
             let prefix = if part_index == 0 && wrap_index == 0 {
-                format!(" {label:<5} ")
+                ""
             } else {
-                "       ".into()
+                "  "
             };
-            lines.push(clip(&format!("{prefix}{part}"), left_width));
+            out.push((clip(&format!("{prefix}{part}"), left_width), None));
         }
+    }
+    out
+}
+
+/// Bounded message treatment for the two primary conversational surfaces.
+/// A user prompt opens with `›`; an assistant result renders through the
+/// same bordered container the transcript uses (backgrounds stripped here —
+/// the streaming draft paints plain until it commits).
+/// Tool/system rows intentionally stay unboxed so the timeline remains dense.
+fn boxed_message_lines(speaker: Speaker, text: &str, width: usize, verbose: bool) -> Vec<String> {
+    let width = width.max(12);
+    let mut lines = Vec::new();
+    match speaker {
+        Speaker::User => {
+            // Grok-clean prompt: no box, just the `›` marker and the text.
+            // The marker is repainted cyan at render time; wrapped lines
+            // hang beneath it.
+            let available = width.saturating_sub(4).max(1);
+            let mut first = true;
+            for line in text.split('\n') {
+                for part in wrap(line, available) {
+                    if first {
+                        lines.push(clip(&format!("› {part}"), width));
+                        first = false;
+                    } else {
+                        lines.push(clip(&format!("  {part}"), width));
+                    }
+                }
+            }
+            if first {
+                lines.push("›".into());
+            }
+        }
+        Speaker::Agent => {
+            return render_agent_body(text, width, verbose, Color::Black)
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect();
+        }
+        _ => unreachable!("boxed_message_lines only accepts user or agent entries"),
     }
     lines
 }
 
-/// Keep transcript activity scannable at a glance.  Foreground colours carry
-/// the meaning, while the subtle backgrounds make the input, live work, and
-/// completed output read as separate panels without consuming extra rows.
+/// Keep transcript activity scannable at a glance. Foreground colours carry
+/// the meaning on the dark viewport: user prompts read soft white with a
+/// cyan marker, tool output speaks green (bright highlighted titles, dim
+/// matching details), live activity glows muted amber, failures stay muted
+/// red. Assistant results read as one calm bordered container on charcoal.
 fn transcript_style(entry: &Entry, colors: &Theme) -> (Color, Color) {
     let lower = entry.text.to_ascii_lowercase();
     match entry.speaker {
-        Speaker::User => (colors.accent, transcript_panel_bg(colors)),
+        Speaker::User => (colors.text, transcript_panel_bg(colors)),
         Speaker::Agent => (colors.text, transcript_panel_bg(colors)),
-        Speaker::Tool => {
-            let editing = lower.contains("wrote ")
-                || lower.contains("write_file")
-                || lower.contains("edit_file")
-                || lower.contains("apply_patch")
-                || lower.contains("modified ")
-                || lower.contains("created ");
-            if editing {
-                (Color::Green, tool_panel_bg(colors))
+        // Tool rows carry their state in the first character: running glows
+        // amber, failures read red, everything finished settles green.
+        Speaker::Tool if entry.text.starts_with('◌') => (
+            if studio_panel(colors.panel) {
+                Color::Rgb {
+                    r: 224,
+                    g: 185,
+                    b: 132,
+                }
             } else {
-                (Color::Yellow, tool_panel_bg(colors))
-            }
+                WROSE_AMBER
+            },
+            tool_panel_bg(colors),
+        ),
+        Speaker::Tool if entry.text.starts_with('✗') || entry.text.starts_with('×') => {
+            (WROSE_ERROR, tool_panel_bg(colors))
         }
-        Speaker::System if lower.contains("result") || lower.contains("verified") => {
-            (Color::Green, result_panel_bg(colors))
+        Speaker::Tool => (
+            if studio_panel(colors.panel) {
+                Color::Rgb {
+                    r: 139,
+                    g: 207,
+                    b: 166,
+                }
+            } else {
+                WROSE_SUCCESS
+            },
+            tool_panel_bg(colors),
+        ),
+        // The Ctrl+B snapshot box stays quiet muted even when its counters
+        // mention failures or verification; the box is a readout, not an
+        // error or a receipt.
+        Speaker::System if entry.text.starts_with("SESSION\n") => {
+            (colors.muted, transcript_panel_bg(colors))
         }
-        Speaker::System if lower.contains("thinking") || lower.contains("running") => {
-            (colors.status, activity_bg(colors))
+        Speaker::System if lower.contains("failed") || lower.contains("cancelled") => {
+            (WROSE_ERROR, result_panel_bg(colors))
         }
+        Speaker::System
+            if lower.contains("result") || lower.contains("verified") || lower.contains("done") =>
+        {
+            (WROSE_DIM_GREEN, result_panel_bg(colors))
+        }
+        Speaker::System if lower.starts_with("◌") || lower.contains("running") => {
+            (WROSE_AMBER, activity_bg(colors))
+        }
+        // Frozen reasoning cells settle into quiet gray notes.
+        Speaker::System if lower.contains("thought") => (colors.muted, activity_bg(colors)),
         Speaker::System => (colors.muted, transcript_panel_bg(colors)),
     }
 }
 
 fn input_panel_bg(colors: &Theme) -> Color {
-    if colors.background == Color::Reset {
-        Color::Reset
-    } else if colors.name == "light" {
-        Color::Grey
-    } else {
-        Color::Rgb {
-            r: 18,
-            g: 30,
-            b: 48,
-        }
-    }
+    // The charcoal composer panel, distinct from the viewport background.
+    colors.panel
 }
 
 fn transcript_panel_bg(colors: &Theme) -> Color {
@@ -2948,39 +4675,15 @@ fn transcript_panel_bg(colors: &Theme) -> Color {
 }
 
 fn tool_panel_bg(colors: &Theme) -> Color {
-    if colors.background == Color::Reset {
-        Color::Reset
-    } else {
-        Color::Rgb {
-            r: 35,
-            g: 30,
-            b: 18,
-        }
-    }
+    transcript_panel_bg(colors)
 }
 
 fn activity_bg(colors: &Theme) -> Color {
-    if colors.background == Color::Reset {
-        Color::Reset
-    } else {
-        Color::Rgb {
-            r: 30,
-            g: 25,
-            b: 42,
-        }
-    }
+    transcript_panel_bg(colors)
 }
 
 fn result_panel_bg(colors: &Theme) -> Color {
-    if colors.background == Color::Reset {
-        Color::Reset
-    } else {
-        Color::Rgb {
-            r: 18,
-            g: 38,
-            b: 26,
-        }
-    }
+    transcript_panel_bg(colors)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2991,6 +4694,62 @@ pub(crate) struct Theme {
     accent: Color,
     status: Color,
     background: Color,
+    /// Composer panel: the charcoal editing surface.
+    panel: Color,
+}
+
+/// WROSECODE premium accents. The base [`Theme`] stays five fields so every
+/// existing palette keeps working; these are semantic overlays for the
+/// single-column design.
+const WROSE_CYAN: Color = Color::Rgb {
+    r: 34,
+    g: 211,
+    b: 238,
+};
+const WROSE_SUCCESS: Color = Color::Green;
+/// Dim companion for tool output continuations: the title line reads bright
+/// highlighted green, the detail lines below it match in the same family.
+const WROSE_DIM_GREEN: Color = Color::DarkGreen;
+/// Muted gold for live activity: running tools, thinking ticks.
+const WROSE_AMBER: Color = Color::DarkYellow;
+const WROSE_WARN: Color = Color::Yellow;
+/// Muted red for failures.
+const WROSE_ERROR: Color = Color::DarkRed;
+/// Near-black viewport background for the premium dark palette.
+const WROSE_BG: Color = Color::Rgb { r: 4, g: 5, b: 10 };
+const STUDIO_BG: Color = Color::Rgb {
+    r: 13,
+    g: 17,
+    b: 24,
+};
+const STUDIO_PANEL: Color = Color::Rgb {
+    r: 23,
+    g: 29,
+    b: 42,
+};
+const STUDIO_TEXT: Color = Color::Rgb {
+    r: 222,
+    g: 228,
+    b: 240,
+};
+const STUDIO_MUTED: Color = Color::Rgb {
+    r: 125,
+    g: 139,
+    b: 159,
+};
+const STUDIO_ACCENT: Color = Color::Rgb {
+    r: 169,
+    g: 178,
+    b: 247,
+};
+const STUDIO_STATUS: Color = Color::Rgb {
+    r: 126,
+    g: 205,
+    b: 213,
+};
+
+fn studio_panel(panel: Color) -> bool {
+    panel == STUDIO_PANEL
 }
 
 /// Every selectable palette. `/theme` (picker or `<name>`) and `[ui] theme` in
@@ -3000,10 +4759,15 @@ const THEMES: &[Theme] = &[
     Theme {
         name: "dark",
         text: Color::White,
-        muted: Color::DarkGrey,
-        accent: Color::Cyan,
+        muted: Color::Grey,
+        accent: WROSE_CYAN,
         status: Color::Yellow,
-        background: Color::Black,
+        background: WROSE_BG,
+        panel: Color::Rgb {
+            r: 12,
+            g: 16,
+            b: 25,
+        },
     },
     Theme {
         name: "light",
@@ -3012,6 +4776,11 @@ const THEMES: &[Theme] = &[
         accent: Color::Blue,
         status: Color::DarkYellow,
         background: Color::White,
+        panel: Color::Rgb {
+            r: 232,
+            g: 232,
+            b: 232,
+        },
     },
     Theme {
         name: "solarized",
@@ -3020,6 +4789,7 @@ const THEMES: &[Theme] = &[
         accent: Color::Cyan,
         status: Color::DarkYellow,
         background: Color::Rgb { r: 0, g: 43, b: 54 },
+        panel: Color::Rgb { r: 7, g: 54, b: 66 },
     },
     Theme {
         name: "dracula",
@@ -3031,6 +4801,11 @@ const THEMES: &[Theme] = &[
             r: 40,
             g: 42,
             b: 54,
+        },
+        panel: Color::Rgb {
+            r: 52,
+            g: 55,
+            b: 70,
         },
     },
     Theme {
@@ -3044,6 +4819,11 @@ const THEMES: &[Theme] = &[
             g: 52,
             b: 64,
         },
+        panel: Color::Rgb {
+            r: 59,
+            g: 66,
+            b: 82,
+        },
     },
     // The NO_COLOR-friendly palette: named colours only, no RGB, so the whole
     // frame stays inside the 16-colour baseline.
@@ -3054,6 +4834,16 @@ const THEMES: &[Theme] = &[
         accent: Color::Grey,
         status: Color::White,
         background: Color::Black,
+        panel: Color::Black,
+    },
+    Theme {
+        name: "studio",
+        text: STUDIO_TEXT,
+        muted: STUDIO_MUTED,
+        accent: STUDIO_ACCENT,
+        status: STUDIO_STATUS,
+        background: STUDIO_BG,
+        panel: STUDIO_PANEL,
     },
 ];
 
@@ -3143,6 +4933,8 @@ struct ThemeFile {
     status: String,
     #[serde(default)]
     background: Option<String>,
+    #[serde(default)]
+    panel: Option<String>,
 }
 
 /// `#rrggbb` (or `rrggbb`) to a truecolor entry.
@@ -3174,6 +4966,10 @@ fn parse_theme(fallback_name: &str, source: &str) -> Option<Theme> {
         Some(value) => hex_colour(value)?,
         None => Color::Black,
     };
+    let panel = match &file.panel {
+        Some(value) => hex_colour(value)?,
+        None => background,
+    };
     let name = file
         .name
         .map(|name| name.trim().to_ascii_lowercase())
@@ -3189,6 +4985,7 @@ fn parse_theme(fallback_name: &str, source: &str) -> Option<Theme> {
         accent,
         status,
         background,
+        panel,
     })
 }
 
@@ -3261,7 +5058,7 @@ fn input_syntax_color(input: &str, colors: &Theme) -> Color {
     } else if lower.contains(" asm") || lower.contains("objdump") || lower.contains("gdb") {
         Color::Magenta
     } else if lower.starts_with('!') || lower.starts_with("$ ") || lower.contains("cargo ") {
-        Color::Yellow
+        WROSE_WARN
     } else {
         colors.text
     }
@@ -3269,15 +5066,7 @@ fn input_syntax_color(input: &str, colors: &Theme) -> Color {
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-fn level_resources(level: u8) -> &'static str {
-    match level {
-        0..=3 => "1 agent / fast",
-        4..=7 => "up to 3 agents",
-        8..=12 => "up to 5 + checker",
-        _ => "up to 20 / race",
-    }
-}
-
+#[cfg(test)]
 fn level_workers(level: u8) -> u8 {
     match level {
         0..=3 => 1,
@@ -3454,7 +5243,16 @@ fn complete_input(ui: &mut Ui, agent: &Agent) {
     let (matches, index) = match cycled {
         Some((matches, index)) => (matches, index),
         None => {
-            let matches = completion_matches(agent, &token);
+            let auth_prefix = ui.input[..start].trim_end() == "/auth";
+            let matches = if auth_prefix {
+                ["login", "status", "accounts", "switch", "logout"]
+                    .into_iter()
+                    .filter(|candidate| token.is_empty() || candidate.starts_with(&token))
+                    .map(str::to_owned)
+                    .collect()
+            } else {
+                completion_matches(agent, &token)
+            };
             if matches.is_empty() {
                 ui.completion = None;
                 ui.status = "No completion for that token".into();
@@ -3527,63 +5325,63 @@ fn cap_output(output: &str) -> String {
     )
 }
 
-/// Collapsed cell body: first `head` lines, a middle marker, last `tail`.
-fn preview_block(output: &str, head: usize, tail: usize) -> String {
-    let lines = clean_output_lines(output);
-    let mut block = String::new();
-    if lines.is_empty() {
-        return block;
-    }
-    if lines.len() <= head + tail {
-        let last = lines.len() - 1;
-        for (index, line) in lines.iter().enumerate() {
-            let connector = if index == last { '└' } else { '├' };
-            block.push_str(&format!("\n   {connector} {line}"));
-        }
-        return block;
-    }
-    for line in lines.iter().take(head) {
-        block.push_str(&format!("\n   ├ {line}"));
-    }
-    block.push_str(&format!("\n   ⋮ {} more lines", lines.len() - head - tail));
-    let start = lines.len() - tail;
-    for (index, line) in lines[start..].iter().enumerate() {
-        let connector = if index + 1 == tail { '└' } else { '├' };
-        block.push_str(&format!("\n   {connector} {line}"));
-    }
-    block
-}
-
-/// Expanded cell body: exit code up front, then a bounded head/tail slice so
-/// one huge result cannot flood the transcript.
+/// Expanded cell body: a bounded head/tail slice of raw output lines so one
+/// huge result cannot flood the transcript. Wrapped in `▓WROSE-OUT▓`/`▓WROSE-END▓`
+/// sentinels carrying the exit-code label; `entry_rows` renders the section
+/// as a bordered output box at the live pane width (a width the cell itself
+/// never knows). The sentinels never reach the screen.
 fn expanded_block(output: &str, exit_code: Option<i32>) -> String {
     const MAX: usize = 120;
     const HEAD: usize = 80;
-    let mut block = String::new();
-    if let Some(code) = exit_code.filter(|code| *code != 0) {
-        block.push_str(&format!("\n   └ exit {code}"));
+    // A bounded 256 KB single line still expands to thousands of terminal
+    // rows. Bound pathological rows while preserving normal output and the
+    // original tool result retained in the cell.
+    const MAX_CHARS_PER_LINE: usize = 1024;
+    const MAX_VISIBLE_CHARS: usize = 32 * 1024;
+    let mut block = String::from("\n▓WROSE-OUT▓");
+    match exit_code {
+        Some(code) => block.push_str(&format!(" exit={code}")),
+        None => block.push_str(" no-exit"),
     }
     let lines = clean_output_lines(output);
     if lines.is_empty() {
+        block.push_str("\n▓WROSE-END▓");
         return block;
     }
-    if lines.len() <= MAX {
-        let last = lines.len() - 1;
-        for (index, line) in lines.iter().enumerate() {
-            let connector = if index == last { '└' } else { '├' };
-            block.push_str(&format!("\n   {connector} {line}"));
+    if lines.len() > MAX {
+        block.push_str(&format!("\n⋮ {} more lines", lines.len() - MAX));
+    }
+    let mut remaining = MAX_VISIBLE_CHARS;
+    let mut clipped = false;
+    let head = lines
+        .iter()
+        .take(if lines.len() <= MAX { MAX } else { HEAD });
+    let tail = lines.iter().skip(if lines.len() <= MAX {
+        lines.len()
+    } else {
+        lines.len() - (MAX - HEAD)
+    });
+    for line in head.chain(tail) {
+        if remaining == 0 {
+            clipped = true;
+            break;
         }
-        return block;
+        let max_chars = MAX_CHARS_PER_LINE.min(remaining);
+        let mut chars = line.chars();
+        let visible: String = chars.by_ref().take(max_chars).collect();
+        let shortened = chars.next().is_some();
+        remaining = remaining.saturating_sub(visible.chars().count());
+        block.push('\n');
+        block.push_str(&visible);
+        if shortened {
+            block.push_str(" … [line shortened for responsiveness]");
+            clipped = true;
+        }
     }
-    let tail = MAX - HEAD;
-    for line in lines[..HEAD].iter() {
-        block.push_str(&format!("\n   ├ {line}"));
+    if clipped {
+        block.push_str("\n… [display capped; full tool result retained in session]");
     }
-    block.push_str(&format!("\n   ⋮ {} more lines", lines.len() - MAX));
-    for (index, line) in lines[lines.len() - tail..].iter().enumerate() {
-        let connector = if index + 1 == tail { '└' } else { '├' };
-        block.push_str(&format!("\n   {connector} {line}"));
-    }
+    block.push_str("\n▓WROSE-END▓");
     block
 }
 
@@ -3598,7 +5396,7 @@ fn group_text(cell: &GroupCell) -> String {
         if cell.searches == 1 { "" } else { "es" }
     );
     if cell.inflight > 0 {
-        format!("⠋ ▸ Explored  {counts}  …")
+        format!("◌ ▸ Exploring  {counts}")
     } else {
         format!("▸ Explored  {counts}")
     }
@@ -3686,15 +5484,78 @@ pub(crate) fn git_changed_files(root: &str) -> Vec<(String, i64, i64)> {
     out
 }
 
+/// Git refresh schedule: ~50ms of child processes every 5s while working,
+/// every 30s while idle. Pure predicate so the cadence is unit-testable
+/// without spawning git.
+fn git_stale(at: Option<std::time::Instant>, now: std::time::Instant, busy: bool) -> bool {
+    let ttl = if busy { 5 } else { 30 };
+    at.is_none_or(|at| now.duration_since(at).as_secs() >= ttl)
+}
+/// Cheap git snapshot for the Ctrl+B session readout: current branch plus
+/// added/removed totals. Empty branch means "not a git repo" and the
+/// snapshot omits the GIT section.
+/// All commands are read-only and bounded; failures degrade to empty.
+fn git_sidebar_state(root: &str) -> (String, usize, i64, i64) {
+    let branch = std::process::Command::new("git")
+        .args(["-C", root, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    if branch.is_empty() || branch == "HEAD" {
+        // Detached HEAD or not a repo: try short hash, else omit section.
+        let hash = std::process::Command::new("git")
+            .args(["-C", root, "rev-parse", "--short", "HEAD"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default();
+        if hash.is_empty() {
+            return (String::new(), 0, 0, 0);
+        }
+        let files = git_changed_files(root);
+        let (added, removed, count) = git_totals(&files);
+        return (format!("@{hash}"), count, added, removed);
+    }
+    let files = git_changed_files(root);
+    let (added, removed, count) = git_totals(&files);
+    (branch, count, added, removed)
+}
+
+fn git_totals(files: &[(String, i64, i64)]) -> (i64, i64, usize) {
+    let mut added = 0i64;
+    let mut removed = 0i64;
+    for (_, a, r) in files {
+        added += (*a).max(0);
+        removed += *r;
+    }
+    (added, removed, files.len())
+}
+
 /// The eight panels as plain text rows, shared by the grid dashboard,
 /// `/stats`, and the `wrosecode dashboard` / `exec` CLI (spec 3.2).
 pub(crate) fn dashboard_panels(
     stats: &DashStats,
     width: usize,
 ) -> Vec<(&'static str, Vec<String>)> {
-    // 0 PROCESSES — newest first, bounded by the registry cap.
+    // 0 PROCESSES — agent actions first, OS shell PIDs afterward.
     let mut procs = Vec::new();
-    if stats.procs.is_empty() {
+    for activity in &stats.activities {
+        let status = if activity.running {
+            "◌"
+        } else if activity.ok == Some(true) {
+            "✓"
+        } else {
+            "×"
+        };
+        procs.push(format!(
+            " {status} {:>5.1}s  {}",
+            activity.elapsed_ms as f64 / 1000.0,
+            clip(
+                &display_tool_title(&activity.title),
+                width.saturating_sub(12).max(8)
+            )
+        ));
+    }
+    if stats.procs.is_empty() && stats.activities.is_empty() {
         procs.push(" no tracked processes".to_string());
     }
     for proc in stats.procs.iter() {
@@ -3729,8 +5590,7 @@ pub(crate) fn dashboard_panels(
         ));
     }
 
-    // 1 THINKING — level and mode, speed tier, the model/tool/wait split,
-    // and the previous turn's model time and reasoning tokens (phase 4).
+    // 1 THINKING — model stage is a public status, not hidden thought text.
     let thinking = vec![
         format!(
             " level {}/20 {} · {} · {} · {}",
@@ -3742,6 +5602,14 @@ pub(crate) fn dashboard_panels(
                 format!("{} tools live", stats.inflight)
             } else {
                 "idle".to_string()
+            }
+        ),
+        format!(
+            " stage: {}",
+            if stats.stage.is_empty() {
+                &stats.status
+            } else {
+                &stats.stage
             }
         ),
         format!(
@@ -4074,7 +5942,17 @@ fn dash_screen(
             header.push('─');
         }
         out.push((clip(&header, width), focus == index));
-        for (row_index, text) in rows.iter().enumerate() {
+        // The focused panel scrolls its rows to keep a selected activity or
+        // process visible. Without this, the 8-line panel hid older calls.
+        let available = height.saturating_sub(1);
+        let offset = if focus == index && available > 0 {
+            selected
+                .saturating_sub(available - 1)
+                .min(rows.len().saturating_sub(available))
+        } else {
+            0
+        };
+        for (row_index, text) in rows.iter().enumerate().skip(offset) {
             if out.len() - start >= height {
                 break;
             }
@@ -4166,6 +6044,9 @@ pub(crate) fn stats_from_agent(agent: &Agent, session_id: &str, status: &str) ->
         flags_total,
         changed_files: git_changed_files(&agent.config.root.display().to_string()),
         procs: proc_stats(),
+        // No model stage is surfaced on this path: `status` already carries
+        // the verification state, and the panel falls back to it when the
+        // stage is empty.
         turn_reasoning_tok: agent.last_turn_reasoning,
         turn_model_ms: agent
             .last_api_latency
@@ -4235,6 +6116,16 @@ pub async fn run(
     let session_dir = Session::dir()?;
     let mut session = initial_session.unwrap_or_else(Session::fresh);
     let mut ui = Ui::new(&agent, session.name.clone());
+    let (cached_models, cached_at) = load_model_catalog_cache(&settings);
+    ui.model_catalog = ready_model_rows(
+        &settings,
+        configured_model_rows(&settings)
+            .into_iter()
+            .chain(cached_models)
+            .collect(),
+    );
+    ui.model_catalog_fetched = cached_at;
+    ui.restore_flags(session.flags.clone());
     ui.history = load_history();
     ui.renderer.full_redraw = profile.full_redraw;
     ui.colors = profile.colors;
@@ -4252,6 +6143,8 @@ pub async fn run(
     }
     if !session.transcript.is_empty() {
         ui.entries.clear();
+        ui.entry_revisions.clear();
+        ui.entry_rows_meta.clear();
         for (speaker, text) in &session.transcript {
             ui.entries.push(Entry {
                 speaker: match speaker.to_ascii_lowercase().as_str() {
@@ -4262,32 +6155,137 @@ pub async fn run(
                 },
                 text: text.clone(),
             });
+            ui.entry_revisions.push(ui.next_entry_revision);
+            ui.next_entry_revision = ui.next_entry_revision.wrapping_add(1);
         }
     }
     let mut last_checkpoint = std::time::Instant::now();
+    // In-flight background checkpoint save (10s cadence below). While one
+    // is running the tick is skipped instead of queueing: saves stay
+    // strictly serial and a slow disk never stacks work behind the UI.
+    let mut checkpoint: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
+    // Compare lightweight state versions before cloning a long transcript
+    // for an idle checkpoint. Failed saves are never marked persisted.
+    let mut saved_checkpoint_version: Option<(
+        u64,
+        usize,
+        usize,
+        usize,
+        String,
+        String,
+        Vec<String>,
+        String,
+    )> = None;
+    let mut pending_checkpoint_version: Option<(
+        u64,
+        usize,
+        usize,
+        usize,
+        String,
+        String,
+        Vec<String>,
+        String,
+    )> = None;
     let mut last_spin = std::time::Instant::now();
     let mut last_tip = std::time::Instant::now();
+    let mut last_chrome = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(10))
+        .unwrap_or_else(std::time::Instant::now);
+    let mut render_needed = true;
+    // Initial chrome sync so the first frame already shows real MCP/LSP/git.
+    ui.sync_chrome(&agent);
+    // Repo maps are optional, deadline-bounded context loaded by the agent
+    // only when needed. Never eagerly crawl a Desktop/home tree at startup.
     loop {
-        ui.render()?;
+        if render_needed {
+            ui.render()?;
+            render_needed = false;
+        }
+        // Checkpoint on a background thread: serializing a large session
+        // measured 1.1s at 5MB, which used to freeze every keystroke on the
+        // event loop. Failures are traced and retried on the next tick, so
+        // a transient disk error degrades instead of aborting the session.
         if last_checkpoint.elapsed() >= Duration::from_secs(10) {
-            sync_session(&mut session, &agent, &ui);
-            store.save_session(&session)?;
+            // Reap the previous save if it finished; a still-running save
+            // means this tick is skipped, so saves stay strictly serial.
+            if checkpoint
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+            {
+                if let Some(handle) = checkpoint.take() {
+                    match handle.await {
+                        Ok(Ok(())) => {
+                            saved_checkpoint_version = pending_checkpoint_version.take();
+                        }
+                        Ok(Err(error)) => {
+                            pending_checkpoint_version = None;
+                            ui.trace.log("checkpoint", 0, &error.to_string());
+                        }
+                        Err(error) => {
+                            pending_checkpoint_version = None;
+                            ui.trace.log(
+                                "checkpoint",
+                                0,
+                                &format!("background save worker failed: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
+            let current_version = (
+                ui.next_entry_revision,
+                ui.entries.len(),
+                agent.messages.len(),
+                ui.flags_found,
+                ui.provider.clone(),
+                ui.model.clone(),
+                agent.pinned.clone(),
+                session.name.clone(),
+            );
+            if checkpoint.is_none() && saved_checkpoint_version.as_ref() != Some(&current_version) {
+                sync_session(&mut session, &agent, &ui);
+                let snapshot = session.clone();
+                let writer = store.clone();
+                pending_checkpoint_version = Some(current_version);
+                checkpoint = Some(tokio::task::spawn_blocking(move || {
+                    writer.save_session(&snapshot)
+                }));
+            }
             last_checkpoint = std::time::Instant::now();
         }
         if !event::poll(Duration::from_millis(16))? {
-            if last_spin.elapsed() >= Duration::from_millis(90) {
+            // Idle discipline: animation and chrome ticks only repaint while
+            // something can actually change (running turn / dashboard) or
+            // the synced state moved. A quiet session costs no frames —
+            // the identical-frame guard would skip the write anyway, but
+            // skipping compose entirely saves the CPU too.
+            let animated = ui.wants_animation();
+            if animated && last_spin.elapsed() >= Duration::from_millis(90) {
                 ui.spinner = ui.spinner.wrapping_add(1);
                 last_spin = std::time::Instant::now();
+                render_needed = true;
             }
-            if last_tip.elapsed() >= Duration::from_secs(4) {
+            if animated && last_tip.elapsed() >= Duration::from_secs(4) {
                 ui.advance_tip();
                 last_tip = std::time::Instant::now();
+                render_needed = true;
+            }
+            // Chrome refresh ~1Hz keeps MCP/LSP/git/model state live without
+            // running git per frame.
+            if last_chrome.elapsed() >= Duration::from_secs(1) {
+                let before = ui.chrome_fingerprint();
+                ui.sync_chrome(&agent);
+                last_chrome = std::time::Instant::now();
+                if animated || ui.chrome_fingerprint() != before {
+                    render_needed = true;
+                }
             }
             // Keep `live.json` current for `wrosecode dashboard` attaches.
             ui.maybe_write_live();
             continue;
         }
         let next = event::read()?;
+        render_needed = true;
         if let Event::Paste(text) = &next {
             ui.accept_paste(text);
             continue;
@@ -4309,7 +6307,7 @@ pub async fn run(
                 // (spec 3.1): map the terminal row back through line_origin.
                 MouseEventKind::Down(MouseButton::Left) => {
                     let row = mouse.row as usize;
-                    let first = ui.view.body_start + 1;
+                    let first = ui.view.body_start;
                     if row >= first && row < first + ui.view.height {
                         let index = ui.view.transcript_start + (row - first);
                         if let Some(entry) = ui.line_origin.get(index).copied() {
@@ -4433,6 +6431,13 @@ pub async fn run(
                 ui.palette = true;
                 ui.selected = 0;
                 ui.status = "Command palette".into();
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // The rail is gone; Ctrl+B now prints a one-shot session
+                // snapshot (provider, usage, MCP/LSP, tasks, git, CTF) into
+                // the transcript. `/stats` and `/debug` remain the deep views.
+                ui.sync_chrome(&agent);
+                ui.push(Speaker::System, ui.session_snapshot());
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Cycle the thinking level: off → low → … → max → auto → off.
@@ -4755,6 +6760,7 @@ pub async fn run(
                         &mut session,
                         &mut events,
                         &mut permissions,
+                        &_guard,
                     )
                     .await
                     {
@@ -4786,6 +6792,9 @@ pub async fn run(
             _ => {}
         }
     }
+    // Restore the shell before final persistence. A slow filesystem must not
+    // make quitting look like a frozen terminal. The guard's Drop is idempotent.
+    crate::crash::restore();
     save_session(&mut session, &agent, &ui, &session_dir)?;
     store.save_session(&session)?;
     Ok(())
@@ -4807,44 +6816,112 @@ async fn run_prompt(
 ) -> Result<bool> {
     ui.category = crate::ctf::categorize(&agent.config.root, prompt);
     ui.busy = true;
-    ui.status = "Thinking".into();
+    ui.set_task_state(TaskState::Submitting);
+    ui.status = "Waiting for first token".into();
     ui.begin_turn();
     ui.render()?;
+    let mut dirty = false;
+    let mut last_animation = std::time::Instant::now();
     let project_root = agent.config.root.clone();
     let session_store = agent.store.clone();
     let metrics = agent.metrics.clone();
     let messages_before = agent.messages.len();
+    // Normal turns should recover from a genuinely silent provider quickly.
+    // High/max reasoning and CTF analysis keep the generous long-run limit.
+    let idle_limit =
+        if agent.mode == "ctf" || matches!(agent.think, ThinkLevel::High | ThinkLevel::Max) {
+            provider::STREAM_IDLE_TIMEOUT
+        } else {
+            Duration::from_secs(65)
+        };
     // The turn future borrows `agent`, so it is confined to this block. Once
     // the block ends the borrow is released and a cancelled turn can be
     // rolled back instead of leaving half a conversation behind.
     let outcome = {
         let turn = agent.turn(prompt);
         tokio::pin!(turn);
-        let mut ticker = tokio::time::interval(Duration::from_millis(16));
+        // Progress events are applied immediately, but terminal writes are
+        // coalesced to a human-scale frame budget. This keeps stream/tool
+        // processing independent from renderer throughput.
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_progress = std::time::Instant::now();
+        // Immediate first paint, then at most one frame per 50 ms while
+        // progress events flood in. The old design only painted on the 50 ms
+        // ticker, so every first token waited for the next tick.
+        let mut next_frame = std::time::Instant::now();
+        let mut watchdog = tokio::time::interval(Duration::from_secs(1));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 result = &mut turn => break TurnOutcome::Done(result),
                 Some(message) = events.recv() => {
+                    last_progress = std::time::Instant::now();
                     ui.apply_progress(message);
-                    ui.status = "Working".into();
-                    ui.render()?;
+                    // Bound burst draining so a flood from parallel subagents
+                    // cannot monopolize the executor and starve keyboard/render
+                    // ticks. The queue retains the remainder for the next pass.
+                    for _ in 0..64 {
+                        let Ok(message) = events.try_recv() else { break; };
+                        last_progress = std::time::Instant::now();
+                        ui.apply_progress(message);
+                    }
+                    dirty = true;
+                    if std::time::Instant::now() >= next_frame {
+                        ui.render()?;
+                        dirty = false;
+                        next_frame = std::time::Instant::now() + Duration::from_millis(50);
+                    }
                 }
                 Some(request) = permissions.recv() => {
+                    last_progress = std::time::Instant::now();
                     if !ask_permission(ui, request).await? { return Ok(false); }
                     ui.status = "Working".into();
+                    dirty = true;
+                }
+                _ = watchdog.tick() => {
+                    // Tools have their own explicit timeouts. This watchdog is
+                    // only for a model/transport that produces no bytes/events
+                    // at all, keeping the TUI cancellable instead of hanging.
+                    if ui.inflight_tools == 0 {
+                        let idle = last_progress.elapsed();
+                        if idle >= idle_limit {
+                            break TurnOutcome::Done(Err(anyhow::anyhow!(
+                                "model stalled: no provider activity for {} seconds",
+                                idle_limit.as_secs()
+                            )));
+                        }
+                        if idle >= Duration::from_secs(20) && ui.draft.is_empty() {
+                            ui.status = format!(
+                                "No model activity for {}s · automatic recovery active · Esc cancel",
+                                idle.as_secs()
+                            );
+                            dirty = true;
+                        }
+                    }
                 }
                 _ = ticker.tick() => {
-                    ui.spinner = ui.spinner.wrapping_add(1);
-                    // Advance the live `Thinking… n.ns` cell (spec 3.1).
-                    ui.tick_thinking();
+                    if last_animation.elapsed() >= Duration::from_millis(140) {
+                        ui.spinner = ui.spinner.wrapping_add(1);
+                        // Advance the live `Thinking… n.ns` cell (spec 3.1).
+                        ui.tick_thinking();
+                        last_animation = std::time::Instant::now();
+                        dirty = true;
+                    }
                     // Keep `live.json` fresh while a turn runs (spec 3.2).
                     ui.maybe_write_live();
                     // Keep the terminal usable while the model thinks: keys
                     // land in the input box instead of being thrown away.
-                    if drain_turn_keys(ui, scroll_step)? {
+                    let (cancelled, input_changed) = drain_turn_keys(ui, scroll_step)?;
+                    dirty |= input_changed;
+                    if cancelled {
                         break TurnOutcome::Cancelled;
                     }
-                    ui.render()?;
+                    if dirty {
+                        ui.render()?;
+                        dirty = false;
+                        next_frame = std::time::Instant::now() + Duration::from_millis(50);
+                    }
                 }
             }
         }
@@ -4855,9 +6932,10 @@ async fn run_prompt(
     ui.draft.clear();
     ui.end_turn();
     ui.busy = false;
-    ui.status = "Ready".into();
     match outcome {
         TurnOutcome::Cancelled => {
+            ui.set_task_state(TaskState::Cancelled);
+            ui.status = "Cancelled".into();
             agent.messages.truncate(messages_before);
             // Arm the exit window: a second Ctrl+C within ~2s quits.
             ui.last_interrupt = Some(std::time::Instant::now());
@@ -4866,15 +6944,21 @@ async fn run_prompt(
                 "Turn cancelled. Your input and any queued messages are kept.",
             );
         }
-        TurnOutcome::Done(Ok(reply)) => ui.push(
-            Speaker::Agent,
-            if reply.is_empty() {
-                "(no response)".into()
-            } else {
-                reply
-            },
-        ),
+        TurnOutcome::Done(Ok(reply)) => {
+            ui.set_task_state(TaskState::Completed);
+            ui.status = "Done".into();
+            ui.push(
+                Speaker::Agent,
+                if reply.is_empty() {
+                    "(no response)".into()
+                } else {
+                    reply
+                },
+            );
+        }
         TurnOutcome::Done(Err(error)) => {
+            ui.set_task_state(TaskState::Failed);
+            ui.status = "Failed".into();
             crate::ctf::log_error(&project_root, "agent turn", &format!("{error:#}"));
             let kind = classify_error(&error.to_string());
             if kind == "rate_limit" {
@@ -4899,8 +6983,10 @@ async fn run_prompt(
 /// Consume terminal input while a turn is running. Typing goes to the input
 /// box, Enter queues the message for after the turn, scroll keys move the
 /// viewport, and Ctrl+C cancels the turn (the TUI stays up).
-fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
+fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<(bool, bool)> {
+    let mut changed = false;
     while event::poll(Duration::ZERO)? {
+        changed = true;
         match event::read()? {
             Event::Paste(text) => {
                 ui.accept_paste(&text);
@@ -4927,12 +7013,13 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
                     continue;
                 }
                 if control && key.code == KeyCode::Char('c') {
-                    return Ok(true);
+                    return Ok((true, changed));
                 }
                 match key.code {
                     KeyCode::Esc if ui.paste_chip.is_some() => {
                         ui.paste_chip = None;
                     }
+                    KeyCode::Esc => return Ok((true, changed)),
                     KeyCode::Char(ch) if !control && !alt => {
                         ui.navigation_mode = false;
                         ui.insert(ch);
@@ -5009,7 +7096,7 @@ fn drain_turn_keys(ui: &mut Ui, scroll_step: usize) -> Result<bool> {
             _ => {}
         }
     }
-    Ok(false)
+    Ok((false, changed))
 }
 
 /// Run one prompt, then everything that was queued while it was running.
@@ -5098,6 +7185,7 @@ fn sync_session(session: &mut Session, agent: &Agent, ui: &Ui) {
     session.pinned = agent.pinned.clone();
     session.provider_name = agent.config.provider.clone();
     session.model = agent.config.model.clone();
+    session.flags = ui.flag_log.clone();
     session.transcript = ui
         .entries
         .iter()
@@ -5135,6 +7223,11 @@ async fn restore_session(
 fn apply_session_state(session: &Session, agent: &mut Agent, ui: &mut Ui) {
     agent.messages = session.messages.clone();
     agent.pinned = session.pinned.clone();
+    // Old entry revisions and row-to-tool mappings refer to a different
+    // session. Never reuse them for a restored transcript.
+    ui.clear_transcript();
+    ui.plan.clear();
+    ui.dash_activity.clear();
     ui.entries = session
         .transcript
         .iter()
@@ -5148,7 +7241,15 @@ fn apply_session_state(session: &Session, agent: &mut Agent, ui: &mut Ui) {
             text: text.clone(),
         })
         .collect();
+    ui.entry_revisions = (0..ui.entries.len())
+        .map(|_| {
+            let revision = ui.next_entry_revision;
+            ui.next_entry_revision = ui.next_entry_revision.wrapping_add(1);
+            revision
+        })
+        .collect();
     ui.scroll = 0;
+    ui.restore_flags(session.flags.clone());
 }
 
 fn ask_line(ui: &mut Ui, label: &str, default: &str) -> Result<Option<String>> {
@@ -5309,6 +7410,32 @@ fn ask_input(ui: &mut Ui, label: &str, default: &str, masked: bool) -> Result<Op
     }
 }
 
+/// Switch the agent mode and reconcile tool scopes in one place: CTF needs a
+/// workspace allowlist, bug-bounty keeps only a scope armed by `/bugbounty`,
+/// and the editing modes must not inherit a stale one.
+fn switch_mode(agent: &mut Agent, ui: &mut Ui, mode: &str) -> Result<()> {
+    let previous = agent.mode.clone();
+    agent.set_mode(mode)?;
+    if mode == "ctf" {
+        let root = agent.config.root.clone();
+        let scope = crate::autopilot::Scope::for_target("", &root, None);
+        agent.tools.set_scope(Some(scope));
+    } else if mode == "bugbounty" {
+        if previous == "ctf" {
+            agent.tools.set_scope(None);
+        }
+    } else {
+        agent.tools.set_scope(None);
+        agent.ctf.unlock_category();
+    }
+    ui.mode = if mode == "bugbounty" {
+        "BUG_BOUNTY".into()
+    } else {
+        mode.to_ascii_uppercase()
+    };
+    Ok(())
+}
+
 fn picker(ui: &mut Ui, title: &str, items: Vec<String>) -> Result<Option<usize>> {
     if items.is_empty() {
         ui.push(Speaker::System, format!("No {title} available"));
@@ -5390,6 +7517,111 @@ fn picker(ui: &mut Ui, title: &str, items: Vec<String>) -> Result<Option<usize>>
     }
 }
 
+/// Interactive model changes are transactional: prove that the candidate can
+/// answer a bounded provider health check before replacing the working model.
+/// Session restore and freshly-authenticated provider paths use the local-only
+/// switch below so startup never pays this probe.
+async fn switch_provider_checked(
+    agent: &mut Agent,
+    ui: &mut Ui,
+    settings: &mut Settings,
+    name: &str,
+    model: &str,
+) -> Result<()> {
+    if name == agent.config.provider && model == agent.config.model {
+        ui.status = format!("Already using {name} / {model}");
+        return Ok(());
+    }
+    let profile = settings
+        .profile(name)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider: {name}"))?;
+    if !settings.can_use(profile) {
+        ui.push(
+            Speaker::System,
+            format!("{name} isn't connected. Open /providers for an API key or /chatgpt login for ChatGPT."),
+        );
+        return Ok(());
+    }
+    let is_chatgpt = profile.kind == "openai_chatgpt_plan";
+    let candidate = provider::create_profile(
+        profile,
+        settings.key(profile),
+        model,
+        agent.tools.client.clone(),
+    )?;
+    ui.status = format!("Checking {name} / {model}…");
+    ui.render()?;
+    // A provider probe can take seconds even when healthy. Keep the modal
+    // responsive and cancellable; do not block the only terminal event reader
+    // for the entire network deadline.
+    let started = std::time::Instant::now();
+    let mut probe = Box::pin(tokio::time::timeout(Duration::from_secs(15), async {
+        if is_chatgpt {
+            let available = candidate.list_models().await?;
+            anyhow::ensure!(
+                available
+                    .iter()
+                    .any(|available_model| available_model == model),
+                "model is not in this ChatGPT account's catalog; run /models refresh"
+            );
+            Ok(())
+        } else {
+            candidate.test().await.map(|_| ())
+        }
+    }));
+    let mut ticker = tokio::time::interval(Duration::from_millis(125));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let health = loop {
+        tokio::select! {
+            outcome = &mut probe => break Some(outcome),
+            _ = ticker.tick() => {
+                if event::poll(Duration::ZERO)? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.kind == KeyEventKind::Press
+                            && (key.code == KeyCode::Esc
+                                || (key.code == KeyCode::Char('c')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+                        {
+                            break None;
+                        }
+                    }
+                }
+                ui.status = format!(
+                    "Checking {name} / {model} · {}s · Esc cancel",
+                    started.elapsed().as_secs()
+                );
+                ui.render()?;
+            }
+        }
+    };
+    match health {
+        Some(Ok(Ok(_))) => {
+            switch_provider(agent, ui, settings, name, model).await?;
+            ui.status = format!("Ready · {name} / {model}");
+            Ok(())
+        }
+        Some(Ok(Err(error))) => {
+            ui.status = "Ready · model switch cancelled".into();
+            anyhow::bail!(
+                "model switch kept the previous model because {name}/{model} failed its connection check: {}",
+                discovery_error(&error.to_string())
+            )
+        }
+        Some(Err(_)) => {
+            ui.status = "Ready · model switch cancelled".into();
+            anyhow::bail!(
+                "model switch kept the previous model because {name}/{model} did not respond within 15s"
+            )
+        }
+        None => {
+            // Dropping the probe future cancels the request. The old model
+            // remains selected and can continue serving the next turn.
+            ui.status = "Ready · model switch cancelled".into();
+            Ok(())
+        }
+    }
+}
+
 async fn switch_provider(
     agent: &mut Agent,
     ui: &mut Ui,
@@ -5400,19 +7632,22 @@ async fn switch_provider(
     let profile = settings
         .profile(name)
         .ok_or_else(|| anyhow::anyhow!("unknown provider: {name}"))?;
-    settings
-        .refresh_oauth_if_needed(profile, &agent.tools.client)
-        .await?;
     let provider = provider::create_profile(
         profile,
         settings.key(profile),
         model,
         agent.tools.client.clone(),
     )?;
-    // Persist the model selected in the UI so it becomes the default after
-    // restart and replaces the provider's previous default.
-    if !model.trim().is_empty() && profile.model != model {
-        settings.set_default_model(name, model)?;
+    // Selection is a local state transition. Do not refresh OAuth or rewrite
+    // the full provider document on picker selection; the dedicated atomic
+    // active-model record restores the exact tuple on the next launch.
+    settings.set_last_selection(name, model)?;
+    if let Some(profile) = settings
+        .providers
+        .iter_mut()
+        .find(|profile| profile.name == name)
+    {
+        profile.model = model.to_owned();
     }
     let mut config = (*agent.config).clone();
     config.provider = name.into();
@@ -5426,45 +7661,226 @@ async fn switch_provider(
     Ok(())
 }
 
-async fn available_models(agent: &Agent, settings: &Settings) -> Vec<(String, String)> {
+async fn available_models(
+    agent: &Agent,
+    settings: &Settings,
+) -> (Vec<(String, String)>, Vec<String>) {
     use futures::future::join_all;
     let profiles: Vec<_> = settings
         .providers
         .iter()
-        .filter(|p| {
-            !p.base_url.is_empty() && (settings.key(p).is_some() || settings.no_key_needed(p))
-        })
-        .cloned()
+        .filter(|profile| settings.can_use(profile))
+        .map(|profile| (profile.clone(), settings.key(profile)))
         .collect();
     let client = agent.tools.client.clone();
-    let results = join_all(profiles.into_iter().map(|profile| {
+    let results = join_all(profiles.into_iter().map(|(profile, key)| {
         let client = client.clone();
-        let key = settings.key(&profile);
         async move {
-            let mut models = if let Ok(provider) =
-                provider::create_profile(&profile, key, &profile.model, client)
-            {
-                tokio::time::timeout(Duration::from_secs(5), provider.list_models())
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
+            let provider = match provider::create_profile(&profile, key, &profile.model, client) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    let _ = error;
+                    return (
+                        configured_model_row(&profile),
+                        Some(format!("{} · model discovery unavailable", profile.name)),
+                    );
+                }
             };
-            if !profile.model.is_empty() {
+            let discovered =
+                match tokio::time::timeout(Duration::from_secs(5), provider.list_models()).await {
+                    Ok(Ok(models)) => models,
+                    Ok(Err(error)) => {
+                        return (
+                            configured_model_row(&profile),
+                            Some(format!(
+                                "{} · model discovery failed: {}",
+                                profile.name,
+                                discovery_error(&error.to_string())
+                            )),
+                        )
+                    }
+                    Err(_) => {
+                        return (
+                            configured_model_row(&profile),
+                            Some(format!("{} · model discovery timed out", profile.name)),
+                        )
+                    }
+                };
+            let mut models = discovered;
+            if !profile.model.is_empty() && profile.kind != "openai_chatgpt_plan" {
                 models.push(profile.model.clone());
             }
             models.sort();
             models.dedup();
-            models
-                .into_iter()
-                .map(|model| (profile.name.clone(), model))
-                .collect::<Vec<_>>()
+            (
+                models
+                    .into_iter()
+                    .map(|model| (profile.name.clone(), model))
+                    .collect::<Vec<_>>(),
+                None,
+            )
         }
     }))
     .await;
-    results.into_iter().flatten().collect()
+    let mut model_rows = Vec::new();
+    let mut errors = Vec::new();
+    for (rows, error) in results {
+        model_rows.extend(rows);
+        if let Some(error) = error {
+            errors.push(error);
+        }
+    }
+    (normalize_model_rows(model_rows), errors)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelCatalogCache {
+    fetched_at: u64,
+    models: Vec<(String, String)>,
+}
+
+fn configured_model_rows(settings: &Settings) -> Vec<(String, String)> {
+    settings
+        .providers
+        .iter()
+        .filter(|profile| settings.can_use(profile) && !profile.model.trim().is_empty())
+        .map(|profile| (profile.name.clone(), profile.model.clone()))
+        .collect()
+}
+
+fn ready_model_rows(settings: &Settings, rows: Vec<(String, String)>) -> Vec<(String, String)> {
+    normalize_model_rows(
+        rows.into_iter()
+            .filter(|(name, _)| {
+                settings
+                    .profile(name)
+                    .is_some_and(|profile| settings.can_use(profile))
+            })
+            .collect(),
+    )
+}
+
+fn model_catalog_cache_path(settings: &Settings) -> std::path::PathBuf {
+    settings.dir.join("model_catalog.json")
+}
+
+fn load_model_catalog_cache(
+    settings: &Settings,
+) -> (Vec<(String, String)>, Option<std::time::Instant>) {
+    let path = model_catalog_cache_path(settings);
+    let Ok(bytes) = std::fs::read(path) else {
+        return (Vec::new(), None);
+    };
+    let Ok(cache) = serde_json::from_slice::<ModelCatalogCache>(&bytes) else {
+        return (Vec::new(), None);
+    };
+    let now = std::time::SystemTime::now();
+    let fetched = std::time::UNIX_EPOCH + Duration::from_secs(cache.fetched_at);
+    let age = now.duration_since(fetched).unwrap_or_default();
+    let fetched_instant = std::time::Instant::now()
+        .checked_sub(age)
+        .unwrap_or_else(std::time::Instant::now);
+    (normalize_model_rows(cache.models), Some(fetched_instant))
+}
+
+fn save_model_catalog_cache(settings: &Settings, models: &[(String, String)]) {
+    let cache = ModelCatalogCache {
+        fetched_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        models: models.to_vec(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&cache) else {
+        return;
+    };
+    let path = model_catalog_cache_path(settings);
+    let temporary = path.with_extension("json.tmp");
+    if std::fs::write(&temporary, bytes).is_ok() {
+        let _ = std::fs::rename(temporary, path);
+    }
+}
+
+fn discovery_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("not in this chatgpt account") {
+        return "model unavailable to this ChatGPT account; run /models refresh".into();
+    }
+    if lower.contains("bad or missing api key") || lower.contains("api key is required") {
+        return "API key missing or rejected; open /providers to configure it".into();
+    }
+    if lower.contains("cannot connect to provider") {
+        return "provider unreachable; check URL, DNS, TLS and connectivity".into();
+    }
+    if lower.contains("dns") || lower.contains("resolve") {
+        "DNS resolution failed".into()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "request timed out".into()
+    } else if lower.contains("401") || lower.contains("403") || lower.contains("unauthorized") {
+        "authentication or permission required".into()
+    } else if lower.contains("404") || lower.contains("not found") {
+        "model discovery endpoint unsupported".into()
+    } else {
+        "provider request failed".into()
+    }
+}
+
+fn configured_model_row(profile: &ProviderProfile) -> Vec<(String, String)> {
+    if profile.model.is_empty() {
+        Vec::new()
+    } else {
+        vec![(profile.name.clone(), profile.model.clone())]
+    }
+}
+
+fn normalize_model_rows(mut rows: Vec<(String, String)>) -> Vec<(String, String)> {
+    // Provider/profile is part of identity: identical model IDs from two
+    // providers must remain separate selectable rows.
+    rows.sort();
+    rows.dedup();
+    rows
+}
+
+/// Replace one provider's rows with the complete result of its latest
+/// discovery while preserving every other provider/profile in the catalog.
+/// The configured model is retained as a manual fallback when a provider's
+/// endpoint omits it from the remote response.
+fn merge_provider_models(
+    catalog: &[(String, String)],
+    provider: &str,
+    discovered: Vec<String>,
+    configured: &str,
+) -> Vec<(String, String)> {
+    let mut merged = catalog
+        .iter()
+        .filter(|(name, _)| name != provider)
+        .cloned()
+        .collect::<Vec<_>>();
+    merged.extend(
+        discovered
+            .into_iter()
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| (provider.to_owned(), model)),
+    );
+    if !configured.trim().is_empty() {
+        merged.push((provider.to_owned(), configured.to_owned()));
+    }
+    normalize_model_rows(merged)
+}
+
+/// Rows to keep from the previous catalog when discovery fails: exactly the
+/// cached rows whose provider reported an error this refresh, so a flaky
+/// network never wipes known models and a fixed provider still refreshes.
+fn retain_failed_rows(catalog: &[(String, String)], errors: &[String]) -> Vec<(String, String)> {
+    catalog
+        .iter()
+        .filter(|row| {
+            errors
+                .iter()
+                .any(|error| error.starts_with(&format!("{} ·", row.0)))
+        })
+        .cloned()
+        .collect()
 }
 
 /// True when a prompt looks like it wants the CTF autopilot (flag, challenge,
@@ -5488,6 +7904,49 @@ fn parse_fork_args(args: &str) -> (Option<usize>, String) {
     }
 }
 
+/// Build the copy-safe representation of the current session.
+///
+/// Clipboard export intentionally uses transcript state rather than the
+/// rendered terminal buffer. This preserves complete text while avoiding
+/// borders, truncation, spinner frames, and other presentation-only details.
+/// Secrets are redacted at this boundary before they leave the process.
+fn transcript_for_clipboard(entries: &[Entry], flags: &[(String, String)]) -> String {
+    let mut output = String::new();
+    for entry in entries {
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(match entry.speaker {
+            Speaker::User => "YOU",
+            Speaker::Agent => "WROSECODE",
+            Speaker::Tool => "TOOL",
+            Speaker::System => "INFO",
+        });
+        output.push('\n');
+        output.push_str(&crate::crash::redact(&entry.text));
+    }
+
+    if !flags.is_empty() {
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str("FLAGS\n");
+        for (index, (flag, source)) in flags.iter().enumerate() {
+            if index > 0 {
+                output.push('\n');
+            }
+            output.push_str(&crate::crash::redact(flag));
+            if !source.trim().is_empty() {
+                output.push_str("  · ");
+                output.push_str(&crate::crash::redact(source));
+            }
+        }
+    }
+
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_command(
     line: &str,
     agent: &mut Agent,
@@ -5496,6 +7955,7 @@ async fn run_command(
     session: &mut Session,
     events: &mut mpsc::UnboundedReceiver<Progress>,
     permissions: &mut mpsc::UnboundedReceiver<PermissionRequest>,
+    terminal_guard: &TerminalGuard,
 ) -> Result<()> {
     let session_dir = Session::dir()?;
     let (name, args) = line
@@ -5541,10 +8001,78 @@ async fn run_command(
                 );
             }
         }
+        "/copy" => {
+            if !args.is_empty() && !args.eq_ignore_ascii_case("all") {
+                ui.push(Speaker::System, "Usage: /copy [all]");
+            } else {
+                let text = transcript_for_clipboard(&ui.entries, &ui.flag_log);
+                if text.is_empty() {
+                    ui.status = "Nothing to copy · the current session is empty".into();
+                } else {
+                    match crate::ctf::copy_to_clipboard(&text) {
+                        Ok(()) => {
+                            ui.status = format!(
+                                "Copied all session content · {} transcript entries",
+                                ui.entries.len()
+                            );
+                        }
+                        Err(error) => ui.push(
+                            Speaker::System,
+                            format!(
+                                "Copy failed: {error}\nInstall wl-copy (Wayland), xclip, or xsel and retry /copy."
+                            ),
+                        ),
+                    }
+                }
+            }
+        }
+        "/mode" => {
+            const MODES: [(&str, &str); 5] = [
+                ("general", "explore, plan, edit, verify"),
+                ("ctf", "recon, exploit, flag verification"),
+                ("bounty", "scoped bug bounty, non-destructive proof"),
+                ("build", "full build agent"),
+                ("plan", "read-only plan agent"),
+            ];
+            let requested = if args.trim().is_empty() {
+                let labels: Vec<String> = MODES
+                    .iter()
+                    .map(|(mode, description)| {
+                        let active =
+                            agent.mode == *mode || (agent.mode == "bugbounty" && *mode == "bounty");
+                        format!("{} {mode} · {description}", if active { "●" } else { " " })
+                    })
+                    .collect();
+                picker(ui, "Mode", labels)?.map(|index| MODES[index].0.to_string())
+            } else {
+                Some(args.trim().to_ascii_lowercase())
+            };
+            if let Some(requested) = requested {
+                let mode = if requested == "bounty" {
+                    "bugbounty"
+                } else {
+                    requested.as_str()
+                };
+                if switch_mode(agent, ui, mode).is_err() {
+                    ui.push(
+                        Speaker::System,
+                        "Usage: /mode general|ctf|bounty|build|plan",
+                    );
+                } else {
+                    if mode == "bugbounty" {
+                        ui.push(
+                            Speaker::System,
+                            "Bug-bounty mode. Run /bugbounty <target> --scope … to arm an authorized scope before any network test.",
+                        );
+                    }
+                    ui.status = format!("{} mode", ui.mode);
+                    ui.push(Speaker::System, format!("{} mode active", ui.mode));
+                }
+            }
+        }
         "/build" | "/plan" => {
             let mode = name.trim_start_matches('/');
-            agent.set_mode(mode)?;
-            ui.mode = mode.to_ascii_uppercase();
+            switch_mode(agent, ui, mode)?;
             if mode == "plan" && !agent.config.planner_model.is_empty() {
                 ui.push(
                     Speaker::System,
@@ -5558,11 +8086,14 @@ async fn run_command(
             }
         }
         "/agents" => {
-            let modes = ["build", "plan", "general"];
+            let modes = ["build", "plan", "general", "ctf", "bugbounty"];
             let user = crate::markdown::discover_agents(&agent.config.root);
             let mut labels: Vec<String> = modes
                 .iter()
-                .map(|mode| format!("{} {mode}", if agent.mode == *mode { "●" } else { " " }))
+                .map(|mode| {
+                    let active = agent.mode == *mode;
+                    format!("{} {mode}", if active { "●" } else { " " })
+                })
                 .collect();
             let active = agent.agent_name.clone();
             labels.extend(user.iter().map(|selected_agent| {
@@ -5591,8 +8122,7 @@ async fn run_command(
                         format!("{} agent active ({})", selected.name, selected.description),
                     );
                 } else if let Some(mode) = modes.get(index) {
-                    agent.set_mode(mode)?;
-                    ui.mode = mode.to_ascii_uppercase();
+                    switch_mode(agent, ui, mode)?;
                     ui.push(Speaker::System, format!("{mode} agent active"));
                 }
             }
@@ -5691,22 +8221,51 @@ async fn run_command(
         "/verbosity" => {
             let current = ui.verbosity.clone();
             let mode = if args.is_empty() {
-                ask_line(ui, "Verbosity (compact/normal/verbose)", &current)?
+                ask_line(ui, "Verbosity (on/off/compact/normal/verbose)", &current)?
             } else {
                 Some(args.into())
             };
             if let Some(mode) = mode {
-                if matches!(mode.as_str(), "compact" | "normal" | "verbose") {
-                    ui.verbosity = mode.clone();
-                    ui.push(Speaker::System, format!("Verbosity: {mode}"));
+                let canonical =
+                    crate::config::normalize_verbosity(&mode.to_ascii_lowercase()).to_string();
+                if matches!(canonical.as_str(), "compact" | "normal" | "verbose") {
+                    ui.verbosity = canonical.clone();
+                    // Switching off re-collapses previous automatic verbose
+                    // expansions without losing user-expanded tool details.
+                    let ids: Vec<String> = ui.tool_cells.keys().cloned().collect();
+                    for id in ids {
+                        ui.refresh_cell(&id);
+                    }
+                    ui.push(
+                        Speaker::System,
+                        format!("Verbosity: {canonical} · session only"),
+                    );
                 } else {
                     ui.push(
                         Speaker::System,
-                        "Verbosity must be compact, normal, or verbose",
+                        "Usage: /verbosity on|off|compact|normal|verbose",
                     );
                 }
             }
         }
+        "/activity" => match args.trim() {
+            "" => ui.push(
+                Speaker::System,
+                format!(
+                    "Activity rail: {} (wide terminals >=110 columns). Use /activity on|off",
+                    if ui.activity_rail { "on" } else { "off" }
+                ),
+            ),
+            "on" => {
+                ui.activity_rail = true;
+                ui.push(Speaker::System, "Live activity rail enabled");
+            }
+            "off" => {
+                ui.activity_rail = false;
+                ui.push(Speaker::System, "Live activity rail disabled");
+            }
+            _ => ui.push(Speaker::System, "Usage: /activity on|off"),
+        },
         "/stats" => {
             // The same eight panels as the dashboard, printed as text
             // (spec 3.2: `/stats` must be readable without the grid).
@@ -5747,13 +8306,23 @@ async fn run_command(
             );
         }
         "/flags" => {
-            let flags = agent.ctf.history(args);
+            let query = args.trim().to_ascii_lowercase();
+            let flags = ui
+                .flag_log
+                .iter()
+                .filter(|(flag, source)| {
+                    query.is_empty()
+                        || flag.to_ascii_lowercase().contains(&query)
+                        || source.to_ascii_lowercase().contains(&query)
+                })
+                .map(|(flag, source)| format!("{flag}\t{source}"))
+                .collect::<Vec<_>>();
             ui.push(
                 Speaker::System,
                 if flags.is_empty() {
-                    "No matching flags".into()
+                    "No flags found in the current session".into()
                 } else {
-                    flags.join("\n")
+                    format!("Current session flags:\n{}", flags.join("\n"))
                 },
             );
         }
@@ -5801,42 +8370,38 @@ async fn run_command(
             );
         }
         "/ctf" => {
-            let mut options = crate::autopilot::Options::default();
-            let mut words = args.split_whitespace().peekable();
-            while let Some(word) = words.next() {
-                match word {
-                    "--flag-format" => options.flag_format = words.next().map(str::to_string),
-                    "--category" => options.category = words.next().map(str::to_string),
-                    "--remote" => options.remote = words.next().map(str::to_string),
-                    "--budget" => match words.next() {
-                        Some(value) => options.budget = crate::autopilot::Budget::parse(value)?,
-                        None => {
-                            ui.push(
-                                Speaker::System,
-                                "--budget needs a value (steps, or steps=…,tokens=…,seconds=…)",
-                            );
-                            return Ok(());
-                        }
-                    },
-                    "--parallel" => {
-                        match words.next().and_then(|value| value.parse::<usize>().ok()) {
-                            Some(value) => options.parallel = value,
-                            None => {
-                                ui.push(Speaker::System, "--parallel needs a number");
-                                return Ok(());
-                            }
-                        }
-                    }
-                    other if other.starts_with("--") => {
-                        ui.push(
-                            Speaker::System,
-                            format!("Unknown flag {other}. Try /ctf [target] [--flag-format F] [--category C] [--remote host:port] [--budget B] [--parallel N]"),
-                        );
-                        return Ok(());
-                    }
-                    other => options.target = other.to_string(),
-                }
+            // No target means SWITCH MODE only. Previously /ctf silently
+            // started unlimited autopilot on ".", trapping later input in the
+            // queue while the model spun forever without a challenge.
+            if args.trim().is_empty() {
+                agent.set_mode("ctf")?;
+                ui.mode = "CTF".into();
+                agent.ctf.begin_run();
+                agent.ctf.unlock_category();
+                let root = agent.config.root.clone();
+                let scope = crate::autopilot::Scope::for_target("", &root, None);
+                agent.tools.set_scope(Some(scope.clone()));
+                ui.category = agent.ctf.category.clone();
+                ui.status = "CTF mode ready".into();
+                ui.push(Speaker::System, format!("SCOPE   {}", scope.describe()));
+                ui.push(
+                    Speaker::System,
+                    "CTF agent ready. Enter a challenge prompt, or use /ctf <file|dir|url|description> for autonomous flag solving. Use /build to switch back.",
+                );
+                return Ok(());
             }
+            let options = match crate::autopilot::parse_command_args(args) {
+                Ok(options) => options,
+                Err(error) => {
+                    ui.push(
+                        Speaker::System,
+                        format!("{error}. Try /ctf [target or description] [--flag-format F] [--category C] [--remote host:port] [--budget B] [--parallel N]"),
+                    );
+                    return Ok(());
+                }
+            };
+            agent.set_mode("ctf")?;
+            ui.mode = "CTF".into();
             let root = agent.config.root.clone();
             let scope = crate::autopilot::Scope::for_target(
                 &options.target,
@@ -5847,7 +8412,48 @@ async fn run_command(
             if let Some(pattern) = &options.flag_format {
                 agent.ctf = agent.ctf.clone().with_flag_format(pattern)?;
             }
+            agent.ctf.begin_run();
             agent.ctf.lock_category();
+            ui.status = "Scanning local CTF evidence…".into();
+            ui.render()?;
+            if let Some(verified) = crate::autopilot::preflight_local_flag_async(
+                agent.ctf.clone(),
+                root.clone(),
+                options.target.clone(),
+            )
+            .await
+            {
+                let category = options
+                    .category
+                    .clone()
+                    .unwrap_or_else(|| crate::ctf::categorize(&root, &options.target));
+                agent.ctf.category = category.clone();
+                ui.category = category.clone();
+                ui.push(Speaker::System, format!("SCOPE   {}", scope.describe()));
+                ui.push(
+                    Speaker::System,
+                    "TOOLS   local artifact verifier (model probes skipped)",
+                );
+                ui.push(Speaker::System, format!("GUESS   {category}"));
+                ui.push(
+                    Speaker::System,
+                    format!("✔ flag verified: {} ({})", verified.flag, verified.evidence),
+                );
+                ui.flag_log
+                    .push((verified.flag.clone(), format!("file:{}", options.target)));
+                ui.verified = true;
+                ui.status = "CTF solved".into();
+                sync_session(session, agent, ui);
+                if session.summary == "New session" {
+                    session.summary = format!("ctf {}", options.target);
+                }
+                let flags = vec![verified.flag];
+                match crate::report::writeup_challenge(&root, session, &flags, None) {
+                    Ok(path) => ui.push(Speaker::System, format!("Writeup: {}", path.display())),
+                    Err(error) => ui.push(Speaker::System, format!("Writeup failed: {error:#}")),
+                }
+                return Ok(());
+            }
             let inventory = crate::autopilot::tool_inventory();
             ui.push(Speaker::System, format!("SCOPE   {}", scope.describe()));
             ui.push(Speaker::System, format!("TOOLS   {}", inventory.describe()));
@@ -5910,16 +8516,17 @@ async fn run_command(
                 };
                 steps += 1;
                 let head: String = reply.trim().chars().take(160).collect();
+                let progress = if options.budget.steps == 0 {
+                    format!("[{steps}]")
+                } else {
+                    format!("[{steps}/{}]", options.budget.steps)
+                };
                 ui.push(
                     Speaker::System,
-                    format!(
-                        "[{steps}/{}] {}",
-                        options.budget.steps,
-                        head.replace('\n', " ")
-                    ),
+                    format!("{progress} {}", head.replace('\n', " ")),
                 );
                 let tokens = agent.usage.input + agent.usage.output;
-                let hits = agent.ctf.recorded_hits();
+                let hits = agent.ctf.current_hits();
                 if let Some(verified) = crate::autopilot::verify(&agent.ctf, &hits) {
                     ui.push(
                         Speaker::System,
@@ -5960,16 +8567,14 @@ async fn run_command(
                     break;
                 }
                 brief = format!(
-                    "Continue. {} step(s) used, {} tokens spent, budget {} steps / {} tokens / {} seconds.\n{brief}",
+                    "Continue. {} step(s) used, {} tokens spent, budget {}.\n{brief}",
                     steps,
                     tokens,
-                    options.budget.steps,
-                    options.budget.tokens,
-                    options.budget.seconds,
+                    options.budget.describe(),
                 );
             }
             let tokens = agent.usage.input + agent.usage.output;
-            let hits = agent.ctf.recorded_hits();
+            let hits = agent.ctf.current_hits();
             if let Some(reason) = stop_reason {
                 if let Some(candidate) = crate::autopilot::candidate_note(&agent.ctf, &hits) {
                     if last_candidate.as_deref() != Some(candidate.as_str()) {
@@ -5988,6 +8593,144 @@ async fn run_command(
             match crate::report::writeup_challenge(&root, session, &flags, notes.as_deref()) {
                 Ok(path) => ui.push(Speaker::System, format!("Writeup: {}", path.display())),
                 Err(error) => ui.push(Speaker::System, format!("Writeup failed: {error:#}")),
+            }
+        }
+        "/bugbounty" => {
+            // `/bugbounty` with no arguments switches mode only. It must not
+            // invent a scope: reports are generated from verified findings,
+            // and verification requires an explicitly armed program scope.
+            let root = agent.config.root.clone();
+            if args.trim().is_empty() {
+                agent.set_mode("bugbounty")?;
+                ui.mode = "BOUNTY".into();
+                match crate::bugbounty::Workspace::load(&root)? {
+                    Some(workspace) => {
+                        ui.push(Speaker::System, workspace.status(&root));
+                        ui.push(
+                            Speaker::System,
+                            "No network scope is armed. Rerun /bugbounty <target> --scope <host> to continue the run; the `bugbounty` tool can still list local findings.",
+                        );
+                    }
+                    None => ui.push(
+                        Speaker::System,
+                        "Bug-bounty mode ready. Use /bugbounty <target> --scope host[,*.wildcard] [--scope-file PATH] [--exclude HOST] [--program NAME] [--budget …] [--parallel N]. /build switches back.",
+                    ),
+                }
+                return Ok(());
+            }
+            let options = match crate::bugbounty::parse_command_args(args) {
+                Ok(options) => options,
+                Err(error) => {
+                    ui.push(
+                        Speaker::System,
+                        format!(
+                            "{error}. Try /bugbounty <target> --scope host[,*.wildcard] [--scope-file PATH] [--exclude HOST] [--program NAME] [--budget …] [--parallel N]"
+                        ),
+                    );
+                    return Ok(());
+                }
+            };
+            let scope = match crate::bugbounty::build_scope(&root, &options) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    ui.push(Speaker::System, format!("{error}"));
+                    return Ok(());
+                }
+            };
+            agent.set_mode("bugbounty")?;
+            ui.mode = "BOUNTY".into();
+            agent.tools.set_scope(Some(scope.clone()));
+            let mut workspace = crate::bugbounty::Workspace::load_or_init(
+                &root,
+                &options.program,
+                &options.target,
+                &scope,
+            )?;
+            ui.push(Speaker::System, format!("PROGRAM {}", workspace.program));
+            ui.push(Speaker::System, format!("SCOPE   {}", scope.describe()));
+            ui.push(
+                Speaker::System,
+                format!(
+                    "WORKSPACE {}",
+                    crate::bugbounty::Workspace::path(&root).display()
+                ),
+            );
+            if workspace.created_at != 0 {
+                ui.push(Speaker::System, workspace.status(&root));
+            }
+            let mut brief = crate::bugbounty::brief(&options, &scope, &workspace, &root);
+            let started = std::time::Instant::now();
+            let mut steps = 0_usize;
+            let mut last_reply: Option<String> = None;
+            let mut repeats = 0_usize;
+            let stop_reason: String;
+            loop {
+                ui.status = format!("Bug bounty · step {}", steps + 1);
+                let entries_before = ui.entries.len();
+                let messages_before = agent.messages.len();
+                if !run_turn_queue(agent, ui, &brief, events, permissions).await? {
+                    stop_reason = "permission denied".into();
+                    break;
+                }
+                let fresh = &ui.entries[entries_before..];
+                let reply = fresh
+                    .iter()
+                    .rev()
+                    .find(|entry| matches!(entry.speaker, Speaker::Agent))
+                    .map(|entry| entry.text.clone());
+                let cancelled = fresh.iter().any(|entry| {
+                    matches!(entry.speaker, Speaker::System)
+                        && entry.text.starts_with("Turn cancelled")
+                });
+                let Some(reply) = reply else {
+                    stop_reason = if cancelled || agent.messages.len() <= messages_before {
+                        "stopped by the user".into()
+                    } else {
+                        "the last turn produced no reply".into()
+                    };
+                    break;
+                };
+                steps += 1;
+                workspace = crate::bugbounty::after_turn(&root, &workspace)?;
+                let tokens = agent.usage.input + agent.usage.output;
+                let head: String = reply.trim().chars().take(160).collect();
+                let progress = if options.budget.steps == 0 {
+                    format!("[{steps}]")
+                } else {
+                    format!("[{steps}/{}]", options.budget.steps)
+                };
+                ui.push(
+                    Speaker::System,
+                    format!("{progress} {}", head.replace('\n', " ")),
+                );
+                if reply.contains("BOUNTY COMPLETE") {
+                    stop_reason = "the agent declared the run complete".into();
+                    break;
+                }
+                if last_reply.as_deref() == Some(reply.trim()) {
+                    repeats += 1;
+                    if repeats >= 2 {
+                        stop_reason =
+                            "the agent repeated itself twice; stopping instead of looping".into();
+                        break;
+                    }
+                } else {
+                    repeats = 0;
+                    last_reply = Some(reply.trim().to_string());
+                }
+                if let Some(reason) = options.budget.exhausted(steps, tokens, started.elapsed()) {
+                    stop_reason = format!("budget exhausted ({reason})");
+                    break;
+                }
+                brief = crate::bugbounty::continuation_brief(&workspace, &root, steps, tokens);
+            }
+            let tokens = agent.usage.input + agent.usage.output;
+            let outcome =
+                crate::bugbounty::finish(&root, &mut workspace, steps, tokens, &stop_reason);
+            ui.push(Speaker::System, crate::bugbounty::stop_report(&outcome));
+            sync_session(session, agent, ui);
+            if session.summary == "New session" {
+                session.summary = format!("bugbounty {}", options.target);
             }
         }
         "/compact" => {
@@ -6275,7 +9018,11 @@ async fn run_command(
             *session = Session::fresh();
             agent.messages.clear();
             agent.pinned.clear();
-            ui.entries.clear();
+            agent.tools.set_scope(None);
+            ui.clear_session_flags();
+            ui.clear_transcript();
+            ui.plan.clear();
+            ui.dash_activity.clear();
             ui.push(Speaker::System, "New session started");
         }
         "/move" => {
@@ -6443,6 +9190,14 @@ async fn run_command(
                 ui.push(Speaker::System, format!("Installed packages:\n{rows}"));
             }
         }
+        "/skills" if args == "reload" => {
+            skills::invalidate_cache(&agent.config.root, &agent.config.skill_dirs);
+            agent.skills = skills::discover(&agent.config.root, &agent.config.skill_dirs)?;
+            ui.push(
+                Speaker::System,
+                format!("Reloaded {} skills from disk", agent.skills.len()),
+            );
+        }
         "/skills" if args.starts_with("install ") => {
             let source = args["install ".len()..].trim();
             if source.is_empty() {
@@ -6453,6 +9208,7 @@ async fn run_command(
             } else {
                 match package::install(&skills::default_skills_dir(), source).await {
                     Ok(names) => {
+                        skills::invalidate_cache(&agent.config.root, &agent.config.skill_dirs);
                         agent.skills =
                             skills::discover(&agent.config.root, &agent.config.skill_dirs)?;
                         ui.push(
@@ -6471,6 +9227,7 @@ async fn run_command(
             } else {
                 match package::uninstall(&skills::default_skills_dir(), name) {
                     Ok(entry) => {
+                        skills::invalidate_cache(&agent.config.root, &agent.config.skill_dirs);
                         agent.skills =
                             skills::discover(&agent.config.root, &agent.config.skill_dirs)?;
                         ui.push(
@@ -6510,6 +9267,9 @@ async fn run_command(
         "/connect" => {
             connect(agent, ui, settings).await?;
         }
+        "/auth" | "/chatgpt" => {
+            auth_command(args, agent, ui, settings).await?;
+        }
         "/providers" => {
             provider_screen(agent, ui, settings).await?;
         }
@@ -6526,20 +9286,66 @@ async fn run_command(
                     ),
                 );
             }
-            let models = available_models(agent, settings).await;
+            let force_refresh = args.trim().eq_ignore_ascii_case("refresh");
+            let stale = ui
+                .model_catalog_fetched
+                .map(|when| when.elapsed() >= Duration::from_secs(600))
+                .unwrap_or(true);
+            // Normal picker opening is local-only. Network discovery is an
+            // explicit refresh so DNS/TLS/provider latency never blocks model
+            // selection or makes a stale catalog disappear.
+            if force_refresh {
+                let started = std::time::Instant::now();
+                let (models, errors) = available_models(agent, settings).await;
+                // Failed discovery never wipes what we knew: keep the cached
+                // rows for exactly the providers that errored.
+                let mut merged = models;
+                merged.extend(retain_failed_rows(&ui.model_catalog, &errors));
+                ui.model_catalog = ready_model_rows(settings, merged);
+                ui.model_catalog_errors = errors;
+                ui.model_catalog_fetched = Some(started);
+                save_model_catalog_cache(settings, &ui.model_catalog);
+            } else if stale {
+                ui.model_catalog_errors = vec![
+                    "Model catalog is stale · showing cached/configured models · use /models refresh"
+                        .into(),
+                ];
+            }
+            if force_refresh {
+                for error in ui.model_catalog_errors.clone() {
+                    ui.push(Speaker::System, error);
+                }
+            }
+            let models = ready_model_rows(settings, ui.model_catalog.clone());
             if models.is_empty() {
                 ui.push(
                     Speaker::System,
-                    "No configured models: add one with /connect or /providers".to_string(),
+                    "No connected models. Run /chatgpt login or /providers, then /models refresh."
+                        .to_string(),
                 );
             } else {
+                // Identity stays `(provider id, model)`; only the label
+                // prefers the human display name. Sorted rows keep every
+                // provider's models grouped together.
                 let labels = models
                     .iter()
-                    .map(|(name, model)| format!("{name}  /  {model}"))
+                    .map(|(name, model)| {
+                        let display = settings
+                            .profile(name)
+                            .map(Settings::display)
+                            .unwrap_or(name);
+                        format!("{display}  /  {model}")
+                    })
                     .collect();
                 if let Some(index) = picker(ui, "Models", labels)? {
-                    switch_provider(agent, ui, settings, &models[index].0, &models[index].1)
-                        .await?;
+                    switch_provider_checked(
+                        agent,
+                        ui,
+                        settings,
+                        &models[index].0,
+                        &models[index].1,
+                    )
+                    .await?;
                 }
             }
         }
@@ -6550,17 +9356,16 @@ async fn run_command(
             let path =
                 std::env::temp_dir().join(format!("wrosecode-prompt-{}.txt", std::process::id()));
             std::fs::write(&path, "")?;
-            execute!(io::stdout(), LeaveAlternateScreen, cursor::Show)?;
-            terminal::disable_raw_mode()?;
+            terminal_guard.suspend();
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
             let parts: Vec<_> = editor.split_whitespace().collect();
             let status = std::process::Command::new(parts[0])
                 .args(&parts[1..])
                 .arg(&path)
                 .status();
-            terminal::enable_raw_mode()?;
-            execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+            terminal_guard.resume()?;
             ui.renderer.size = (0, 0);
+            ui.renderer.full_redraw = true;
             status?
                 .success()
                 .then_some(())
@@ -6599,9 +9404,9 @@ fn ask_provider_name(ui: &mut Ui, settings: &Settings) -> Result<Option<String>>
         let valid =
             Settings::validate_name(&ui.input).is_ok() && settings.profile(&ui.input).is_none();
         ui.status = if valid {
-            "Provider name valid • Enter accept • Esc cancel".into()
+            "Step 1/8 · Provider ID valid • Enter accept • Esc cancel".into()
         } else {
-            "Name must be unique and use a-z, 0-9, - or _".into()
+            "Step 1/8 · Use a unique ID: a-z, 0-9, - or _".into()
         };
         ui.render()?;
         let event = event::read()?;
@@ -6678,8 +9483,41 @@ async fn provider_form(
             }
         }
         let previous = existing.clone();
+        // Step 2 — display label. Esc cancels the whole form.
+        let default_display = previous
+            .as_ref()
+            .map(|profile| Settings::display(profile).to_string())
+            .filter(|label| label != &name)
+            .unwrap_or_default();
+        let Some(display) = ask_line(
+            ui,
+            "Step 2/8 · Display name (blank keeps the ID)",
+            &default_display,
+        )?
+        else {
+            return Ok(());
+        };
+        // Step 3 — API compatibility, offered as a choice instead of a
+        // free-text field. Esc cancels the whole form.
+        let kind = if let Some(profile) = &previous {
+            profile.kind.clone()
+        } else {
+            let choice = picker(
+                ui,
+                "Step 3/8 · API type",
+                vec![
+                    "OpenAI-compatible  ·  /v1/models + chat completions".into(),
+                    "Anthropic-compatible  ·  /v1/models + messages".into(),
+                ],
+            )?;
+            match choice {
+                Some(0) => "openai_compat".to_string(),
+                Some(_) => "anthropic".to_string(),
+                None => return Ok(()),
+            }
+        };
         let default_url = previous.as_ref().map(|p| p.base_url.as_str()).unwrap_or("");
-        let Some(base_url) = ask_line(ui, "Base URL", default_url)? else {
+        let Some(base_url) = ask_line(ui, "Step 4/8 · Base URL", default_url)? else {
             return Ok(());
         };
         let base_url = Settings::normalize_url(&base_url)?;
@@ -6701,8 +9539,7 @@ async fn provider_form(
                 .unwrap_or_else(|| "missing".into())
         );
         ui.render()?;
-        let Some(entered_key) =
-            ask_secret(ui, "API key (empty keeps current; local gateways may omit)")?
+        let Some(entered_key) = ask_secret(ui, "Step 5/8 · API key (masked; empty keeps current)")?
         else {
             return Ok(());
         };
@@ -6713,20 +9550,9 @@ async fn provider_form(
         } else {
             Some(entered_key.clone())
         };
-        let kind = if let Some(profile) = &previous {
-            profile.kind.clone()
-        } else {
-            let Some(kind) = ask_line(ui, "Kind (openai_compat or anthropic)", "openai_compat")?
-            else {
-                return Ok(());
-            };
-            kind
-        };
-        if !matches!(kind.as_str(), "openai_compat" | "anthropic") {
-            anyhow::bail!("kind must be openai_compat or anthropic");
-        }
         let mut profile = ProviderProfile {
             name: name.clone(),
+            display_name: display.clone(),
             kind,
             base_url,
             model: previous
@@ -6761,9 +9587,24 @@ async fn provider_form(
                 .map(|p| p.oauth_scope.clone())
                 .unwrap_or_default(),
         };
-        if key.is_none() && !settings.no_key_needed(&profile) && !entered_key.starts_with("env:") {
-            anyhow::bail!("API key is required for {name}");
+        if entered_key.starts_with("env:") && key.is_none() {
+            ui.push(
+                Speaker::System,
+                format!(
+                    "{entered_key} is not set in the environment. Set it and retry /providers."
+                ),
+            );
+            return Ok(());
         }
+        if key.is_none() && !settings.no_key_needed(&profile) {
+            ui.push(
+                Speaker::System,
+                format!("{name} needs an API key. Reopen /providers to finish setup, or use /chatgpt login."),
+            );
+            return Ok(());
+        }
+        ui.status = "Step 6/8 · Discovering every accessible model…".into();
+        ui.render()?;
         let suggested = if profile.model.is_empty() {
             if let Ok(provider) =
                 provider::create_profile(&profile, key.clone(), "", agent.tools.client.clone())
@@ -6775,7 +9616,11 @@ async fn provider_form(
                     .unwrap_or_default();
                 if found.is_empty() {
                     String::new()
-                } else if let Some(index) = picker(ui, "Available models", found.clone())? {
+                } else if let Some(index) = picker(
+                    ui,
+                    "Step 6/8 · Choose an optional default model",
+                    found.clone(),
+                )? {
                     found[index].clone()
                 } else {
                     String::new()
@@ -6786,13 +9631,15 @@ async fn provider_form(
         } else {
             profile.model.clone()
         };
-        let Some(model) = ask_line(ui, "Default model (optional)", &suggested)? else {
+        let Some(model) = ask_line(ui, "Step 6/8 · Default model (optional)", &suggested)? else {
             return Ok(());
         };
         profile.model = model;
         if previous.is_none() {
             loop {
-                let Some(header) = ask_line(ui, "Extra header K=V (blank to finish)", "")? else {
+                let Some(header) =
+                    ask_line(ui, "Step 6/8 · Extra header K=V (blank to finish)", "")?
+                else {
                     return Ok(());
                 };
                 if header.is_empty() {
@@ -6812,6 +9659,8 @@ async fn provider_form(
                 profile.headers.insert(name.into(), value.into());
             }
         }
+        ui.status = "Step 7/8 · Testing provider connection…".into();
+        ui.render()?;
         let result = if let Ok(provider) = provider::create_profile(
             &profile,
             key.clone(),
@@ -6828,7 +9677,7 @@ async fn provider_form(
             ui.push(Speaker::System, format!("Connection test failed: {error}"));
             let choice = ask_line(
                 ui,
-                "Type SAVE to save anyway, EDIT to retry, Esc to cancel",
+                "Connection failed · type SAVE to keep, EDIT to retry, Esc to cancel",
                 "",
             )?;
             match choice.as_deref() {
@@ -6856,6 +9705,66 @@ async fn provider_form(
                 format!("Saved {name}; connection needs attention"),
             );
         }
+        // Step 8: immediately populate the live catalog with every model. The
+        // previous flow only retained the optional default, so users saw one
+        // row until they manually ran `/models refresh`.
+        ui.status = "Step 8/8 · Loading the complete model catalog…".into();
+        ui.render()?;
+        match provider::create_profile(
+            &profile,
+            key.clone(),
+            &profile.model,
+            agent.tools.client.clone(),
+        ) {
+            Ok(provider) => {
+                match tokio::time::timeout(Duration::from_secs(15), provider.list_models()).await {
+                    Ok(Ok(discovered)) if !discovered.is_empty() => {
+                        ui.model_catalog = merge_provider_models(
+                            &ui.model_catalog,
+                            &name,
+                            discovered,
+                            &profile.model,
+                        );
+                        ui.model_catalog_errors
+                            .retain(|error| !error.starts_with(&format!("{name} ·")));
+                        ui.model_catalog_fetched = Some(std::time::Instant::now());
+                        save_model_catalog_cache(settings, &ui.model_catalog);
+                        let count = ui
+                            .model_catalog
+                            .iter()
+                            .filter(|row| row.0 == name)
+                            .count();
+                        ui.push(
+                            Speaker::System,
+                            format!("{name}: discovered {count} accessible models"),
+                        );
+                    }
+                    Ok(Ok(_)) => ui.push(
+                        Speaker::System,
+                        format!("{name}: discovery returned no models; configured model retained"),
+                    ),
+                    Ok(Err(error)) => ui.push(
+                        Speaker::System,
+                        format!(
+                            "{name} · model discovery failed: {} · cached/configured models retained",
+                            discovery_error(&error.to_string())
+                        ),
+                    ),
+                    Err(_) => ui.push(
+                        Speaker::System,
+                        format!("{name} · model discovery timed out · cached/configured models retained"),
+                    ),
+                }
+            }
+            Err(error) => ui.push(
+                Speaker::System,
+                format!(
+                    "{name} · model discovery unavailable: {}",
+                    discovery_error(&error.to_string())
+                ),
+            ),
+        }
+        ui.status = "Ready · provider saved; run /models to select any discovered model".into();
         if !profile.model.is_empty() {
             switch_provider(agent, ui, settings, &name, &profile.model).await?;
         }
@@ -6970,6 +9879,7 @@ async fn oauth_connect(
     let path = crate::oauth::store_tokens(&home, &name, &tokens)?;
     settings.upsert_provider(ProviderProfile {
         name: name.clone(),
+        display_name: String::new(),
         kind: "openai_compat".into(),
         base_url,
         model: model.clone(),
@@ -7006,6 +9916,212 @@ async fn oauth_connect(
     Ok(())
 }
 
+/// Official Sign in with ChatGPT flow for local/open-source plan usage.
+/// Credentials are kept by chatgpt_auth, never in providers.toml.
+async fn chatgpt_login(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings) -> Result<()> {
+    let store = crate::chatgpt_auth::Store::current()?;
+    let label =
+        ask_line(ui, "ChatGPT account label", "personal")?.unwrap_or_else(|| "personal".into());
+    Settings::validate_name(&label)?;
+    let previous = store.account(&label)?;
+    let pending = crate::chatgpt_auth::begin(&store, previous).await?;
+    ui.push(
+        Speaker::System,
+        "◆ CHATGPT AUTH\n  Opening browser…".to_string(),
+    );
+    let _ = crate::oauth::open_browser(&pending.url);
+    ui.push(
+        Speaker::System,
+        "  ◌ Waiting for authorization…  (Esc cancels)".to_string(),
+    );
+    ui.render()?;
+    let client = agent.tools.client.clone();
+    let login_store = store.clone();
+    let login_label = label.clone();
+    let mut login = tokio::spawn(async move {
+        crate::chatgpt_auth::finish(&login_store, &login_label, pending, &client).await
+    });
+    let started = std::time::Instant::now();
+    let credentials = loop {
+        tokio::select! {
+            result = &mut login => {
+                break result.context("ChatGPT login task stopped")??;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {
+                if event::poll(Duration::from_millis(0))? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.code == KeyCode::Esc {
+                            login.abort();
+                            ui.push(Speaker::System, "× ChatGPT login cancelled".to_string());
+                            return Ok(());
+                        }
+                    }
+                }
+                ui.status = format!("◌ Waiting for authorization… {}s · Esc cancel", started.elapsed().as_secs());
+                ui.render()?;
+            }
+        }
+    };
+    let plan = if credentials.plan_enabled() {
+        "enabled"
+    } else {
+        "not authorized"
+    };
+    let account_name = if credentials.email.is_empty() {
+        "signed-in account"
+    } else {
+        &credentials.email
+    };
+    ui.push(
+        Speaker::System,
+        format!("✓ ChatGPT connected\n  account: {account_name}\n  plan usage: {plan}"),
+    );
+    if !credentials.plan_enabled() {
+        ui.push(
+            Speaker::System,
+            "Plan usage was not authorized; no inference request was sent.".to_string(),
+        );
+        return Ok(());
+    }
+    let profile = ProviderProfile {
+        name: label.clone(),
+        display_name: String::new(),
+        kind: "openai_chatgpt_plan".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        model: String::new(),
+        key_ref: String::new(),
+        headers: BTreeMap::new(),
+        auth_method: "chatgpt".into(),
+        oauth_client_id: credentials.client_id.clone(),
+        oauth_issuer: "https://auth.openai.com".into(),
+        oauth_scope:
+            "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct".into(),
+        think: None,
+        think_map: None,
+        builtin: false,
+    };
+    settings.upsert_provider(profile)?;
+    let saved = settings
+        .profile(&label)
+        .context("ChatGPT profile was not saved")?;
+    let provider = provider::create_profile(saved, None, "", agent.tools.client.clone())?;
+    let models = tokio::time::timeout(Duration::from_secs(10), provider.list_models())
+        .await
+        .context("ChatGPT model discovery timed out")??;
+    let selected = if models.is_empty() {
+        anyhow::bail!("ChatGPT returned no eligible models")
+    } else if models.len() == 1 {
+        models[0].clone()
+    } else {
+        let Some(index) = picker(ui, "ChatGPT models (plan usage)", models.clone())? else {
+            return Ok(());
+        };
+        models[index].clone()
+    };
+    settings.set_default_model(&label, &selected)?;
+    switch_provider(agent, ui, settings, &label, &selected).await?;
+    ui.push(
+        Speaker::System,
+        format!("✓ Ready · {label} / {selected} · using ChatGPT plan"),
+    );
+    Ok(())
+}
+
+async fn auth_command(
+    args: &str,
+    agent: &mut Agent,
+    ui: &mut Ui,
+    settings: &mut Settings,
+) -> Result<()> {
+    match commands::parse_auth(args).map_err(|error| anyhow::anyhow!(error))? {
+        commands::AuthCommand::LoginChatGpt => chatgpt_login(agent, ui, settings).await,
+        commands::AuthCommand::Status => {
+            let store = crate::chatgpt_auth::Store::current()?;
+            match store.active()? {
+                Some((label, credentials)) => {
+                    let refresh_error = if credentials.expires_soon() {
+                        crate::chatgpt_auth::refresh_if_needed(&agent.tools.client, &store, &label)
+                            .await
+                            .err()
+                            .map(|error| error.to_string())
+                    } else {
+                        None
+                    };
+                    let current = store.account(&label)?.unwrap_or(credentials);
+                    let token = match refresh_error {
+                        Some(error) => format!("expiring (refresh failed: {error})"),
+                        None if current.expires_soon() => "expiring".into(),
+                        None => "valid".into(),
+                    };
+                    ui.push(
+                        Speaker::System,
+                        format!(
+                            "ChatGPT\n  account: {label}\n  status: connected\n  plan usage: {}\n  token: {token}",
+                            if current.plan_enabled() {
+                                "enabled"
+                            } else {
+                                "not authorized"
+                            }
+                        ),
+                    );
+                }
+                None => ui.push(
+                    Speaker::System,
+                    "ChatGPT\n  status: not connected".to_string(),
+                ),
+            }
+            Ok(())
+        }
+        commands::AuthCommand::Accounts => {
+            let store = crate::chatgpt_auth::Store::current()?;
+            let rows = store
+                .accounts()?
+                .into_iter()
+                .map(|(label, active, credentials)| {
+                    format!(
+                        "{} {label}  {}",
+                        if active { "●" } else { "○" },
+                        credentials
+                            .map(|c| if c.plan_enabled() {
+                                "plan enabled"
+                            } else {
+                                "identity only"
+                            })
+                            .unwrap_or("signed out")
+                    )
+                })
+                .collect::<Vec<_>>();
+            ui.push(
+                Speaker::System,
+                if rows.is_empty() {
+                    "No ChatGPT accounts connected".into()
+                } else {
+                    format!("ChatGPT accounts\n{}", rows.join("\n"))
+                },
+            );
+            Ok(())
+        }
+        commands::AuthCommand::Switch(label) => {
+            let store = crate::chatgpt_auth::Store::current()?;
+            store.switch(&label)?;
+            let profile = settings
+                .profile(&label)
+                .cloned()
+                .context("no provider profile for ChatGPT account")?;
+            if profile.model.is_empty() {
+                anyhow::bail!("ChatGPT account has no selected model; run /models")
+            }
+            switch_provider(agent, ui, settings, &label, &profile.model).await
+        }
+        commands::AuthCommand::Logout(label) => {
+            let store = crate::chatgpt_auth::Store::current()?;
+            let revoked = crate::chatgpt_auth::logout(&agent.tools.client, &store, &label).await?;
+            ui.push(Speaker::System, if revoked { format!("✓ Logged out of ChatGPT account {label}") } else { format!("✓ Removed local ChatGPT credentials for {label}; remote revocation was unavailable") });
+            Ok(())
+        }
+    }
+}
+
 async fn provider_screen(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings) -> Result<()> {
     ui.set_input(String::new());
     ui.selected = 0;
@@ -7013,10 +10129,19 @@ async fn provider_screen(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings
         let matches: Vec<_> = settings
             .providers
             .iter()
-            .filter(|profile| profile.name.contains(&ui.input.to_ascii_lowercase()))
+            .filter(|profile| {
+                let query = ui.input.to_ascii_lowercase();
+                profile.name.contains(&query)
+                    || Settings::display(profile)
+                        .to_ascii_lowercase()
+                        .contains(&query)
+            })
             .cloned()
             .collect();
-        let mut rows = vec!["+ Add custom provider".to_string()];
+        let mut rows = vec![
+            "+ Sign in with ChatGPT  ·  browser OAuth".to_string(),
+            "+ Add API-key / custom provider".to_string(),
+        ];
         rows.extend(matches.iter().map(|profile| {
             format!(
                 "{} {:<18} {:<14} {:<42} {}",
@@ -7025,7 +10150,7 @@ async fn provider_screen(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings
                 } else {
                     "○"
                 },
-                profile.name,
+                Settings::display(profile),
                 profile.kind,
                 profile.base_url,
                 settings.status(profile)
@@ -7035,7 +10160,7 @@ async fn provider_screen(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings
         ui.picker = Some(("Providers".into(), rows));
         ui.picker_all = None;
         ui.picker_query.clear();
-        ui.status = "Enter select · a add · e edit · d delete · t test · Esc back".into();
+        ui.status = "Enter setup · a add custom · e edit · d delete · t test · Esc back".into();
         ui.render()?;
         let event = event::read()?;
         if let Event::Paste(text) = &event {
@@ -7053,7 +10178,7 @@ async fn provider_screen(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings
             }
             let selected = ui
                 .selected
-                .checked_sub(1)
+                .checked_sub(2)
                 .and_then(|index| matches.get(index))
                 .cloned();
             match key.code {
@@ -7064,9 +10189,9 @@ async fn provider_screen(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings
                     return Ok(());
                 }
                 KeyCode::Up => ui.selected = ui.selected.saturating_sub(1),
-                KeyCode::Down => ui.selected = (ui.selected + 1).min(matches.len()),
+                KeyCode::Down => ui.selected = (ui.selected + 1).min(matches.len() + 1),
                 KeyCode::PageUp => ui.selected = ui.selected.saturating_sub(5),
-                KeyCode::PageDown => ui.selected = (ui.selected + 5).min(matches.len()),
+                KeyCode::PageDown => ui.selected = (ui.selected + 5).min(matches.len() + 1),
                 KeyCode::Backspace | KeyCode::Delete => {
                     ui.backspace();
                     ui.selected = 0;
@@ -7156,6 +10281,10 @@ async fn provider_screen(agent: &mut Agent, ui: &mut Ui, settings: &mut Settings
                     }
                 }
                 KeyCode::Enter if ui.selected == 0 => {
+                    ui.picker = None;
+                    chatgpt_login(agent, ui, settings).await?;
+                }
+                KeyCode::Enter if ui.selected == 1 => {
                     ui.picker = None;
                     provider_form(None, agent, ui, settings).await?;
                 }
@@ -7279,6 +10408,22 @@ mod tests {
     }
 
     #[test]
+    fn copy_all_formats_the_session_and_redacts_secrets() {
+        let mut ui = shell();
+        ui.push(Speaker::User, "Inspect the project");
+        ui.push(Speaker::Agent, "api_key=copy-secret-value");
+        ui.flag_log
+            .push(("FLAG{EXAMPLE}".into(), "README.md".into()));
+
+        let copied = transcript_for_clipboard(&ui.entries, &ui.flag_log);
+
+        assert!(copied.contains("YOU\nInspect the project"));
+        assert!(copied.contains("WROSECODE\napi_key=***"));
+        assert!(copied.contains("FLAGS\nFLAG{EXAMPLE}  · README.md"));
+        assert!(!copied.contains("copy-secret-value"));
+    }
+
+    #[test]
     fn fork_args_split_a_message_number_from_the_name() {
         assert_eq!(parse_fork_args(""), (None, String::new()));
         assert_eq!(parse_fork_args("backup"), (None, "backup".to_string()));
@@ -7312,7 +10457,15 @@ mod tests {
     fn theme_registry_is_stable_and_round_trips() {
         assert_eq!(
             theme_names(),
-            ["dark", "light", "solarized", "dracula", "nord", "mono"]
+            [
+                "dark",
+                "light",
+                "solarized",
+                "dracula",
+                "nord",
+                "mono",
+                "studio"
+            ]
         );
         for (position, name) in theme_names().iter().enumerate() {
             assert_eq!(theme_position(name), Some(position), "{name}");
@@ -7451,8 +10604,10 @@ mod tests {
             "model",
             "project",
             "status",
-            "prompt",
+            "Ask WROSECODE",
             "│ > ",
+            "┌",
+            "└",
         ] {
             assert!(
                 joined.contains(needle),
@@ -7477,30 +10632,33 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_leads_with_the_run_state_and_key_fields() {
+    fn composer_info_line_names_mode_and_model() {
         let mut ui = shell();
         fill_transcript(&mut ui, 5);
         let (frame, _) = ui.compose(200, 40);
-        let status = frame
-            .iter()
-            .map(|row| &row.text)
-            .find(|text| text.contains("tok ") && text.contains("think:"))
-            .expect("a status bar row");
-        for needle in ["think:", "tok ", "step ", "/"] {
-            assert!(status.contains(needle), "status shows {needle:?}: {status}");
-        }
-        let model = status
-            .find(&ui.model)
-            .expect("the model is named in the status bar");
-        let tokens = status.find("tok ").expect("token counts");
-        assert!(model < tokens, "model leads the line: {status}");
+        // No telemetry bar: usage details live in Ctrl+B / /stats.
         assert!(
-            status.starts_with(&format!(" {}", ui.status)),
-            "the state word opens the line: {status}"
+            !frame.iter().any(|row| row.text.contains("ctx ")),
+            "no status bar telemetry"
+        );
+        let info = &frame[frame.len() - 3].text;
+        assert!(info.contains("◈ BUILD"), "mode leads: {info}");
+        assert!(info.contains(&ui.model), "model named: {info}");
+        assert!(info.contains("/ for commands"), "hint present: {info}");
+        assert!(
+            frame[0].text.contains(&ui.provider) && frame[0].text.contains(&ui.model),
+            "the minimal header names provider and model: {}",
+            frame[0].text
         );
         assert!(
-            status.contains("session test"),
-            "the status line names the resumable session: {status}"
+            frame[frame.len() - 1].text.contains("Esc cancel"),
+            "footer shortcuts: {:?}",
+            frame[frame.len() - 1].text
+        );
+        assert!(
+            frame[frame.len() - 2].text.starts_with("└"),
+            "composer box closes above the footer: {:?}",
+            frame[frame.len() - 2].text
         );
     }
 
@@ -7555,19 +10713,23 @@ mod tests {
             "a long command needs several wrapped rows: {rows:?}"
         );
         assert!(
-            rows[0].starts_with(" TOOL "),
-            "the label stays on the first row: {:?}",
+            rows[0].starts_with("run "),
+            "tool rows carry no label prefix: {:?}",
             rows[0]
         );
+        assert!(
+            !rows.iter().any(|row| row.contains("TOOL")),
+            "no legacy labels: {rows:?}"
+        );
         let mut seen = String::new();
-        // The command wraps to exactly seven rows here; the eighth row is
-        // the (separately capped) output body.
-        assert_eq!(rows.len(), 8, "command rows plus output: {rows:?}");
-        for (index, row) in rows.iter().enumerate().take(7) {
+        // The command wraps to six rows here; the seventh row is the
+        // (separately capped) output body.
+        assert_eq!(rows.len(), 7, "command rows plus output: {rows:?}");
+        for (index, row) in rows.iter().enumerate().take(6) {
             let body = if index == 0 {
-                row.strip_prefix(" TOOL  ").unwrap_or(row)
+                row.as_str()
             } else {
-                row.strip_prefix("       ").unwrap_or(row)
+                row.strip_prefix("  ").unwrap_or(row)
             };
             seen.push_str(body);
         }
@@ -7584,7 +10746,66 @@ mod tests {
     }
 
     #[test]
-    fn subagent_tree_caps_running_work_and_collapses_finished_children() {
+    fn tool_output_states_read_green_amber_red_on_dark() {
+        let mut ui = shell();
+        ui.push(Speaker::User, "list files");
+        ui.push(
+            Speaker::Tool,
+            "✓ Ran shell ls -la /home/kali/Desktop  0.0s\n   └─ 127 lines · expand for details",
+        );
+        ui.push(Speaker::Tool, "◌ Running tests");
+        ui.push(Speaker::Tool, "✗ Edit file failed\n   access denied");
+        let (frame, _) = ui.compose(100, 30);
+        let title = frame
+            .iter()
+            .find(|row| row.text.contains("Ran shell ls"))
+            .expect("tool title renders");
+        assert_eq!(title.fg, Color::Green, "done title highlighted green");
+        assert_ne!(title.bg, Color::Reset, "dark background, never transparent");
+        let detail = frame
+            .iter()
+            .find(|row| row.text.contains("127 lines"))
+            .expect("tool detail renders");
+        assert_eq!(
+            detail.fg, WROSE_DIM_GREEN,
+            "detail lines match in muted green"
+        );
+        assert_eq!(detail.bg, title.bg, "one dark surface");
+        let running = frame
+            .iter()
+            .find(|row| row.text.contains("Running tests"))
+            .expect("running row renders");
+        assert_eq!(
+            running.fg, WROSE_AMBER,
+            "running processes glow amber, not green"
+        );
+        let failed = frame
+            .iter()
+            .find(|row| row.text.contains("Edit file failed"))
+            .expect("failed row renders");
+        assert_eq!(failed.fg, WROSE_ERROR, "failures read muted red");
+    }
+
+    #[test]
+    fn thinking_and_errors_keep_their_voice() {
+        let mut ui = shell();
+        ui.begin_turn();
+        ui.push(Speaker::System, "✗ Provider request failed");
+        let (frame, _) = ui.compose(100, 30);
+        let thinking = frame
+            .iter()
+            .find(|row| row.text.contains("Thinking"))
+            .expect("thinking cell renders");
+        assert_eq!(thinking.fg, WROSE_AMBER, "thinking glows amber");
+        let error = frame
+            .iter()
+            .find(|row| row.text.contains("Provider request failed"))
+            .expect("error renders");
+        assert_eq!(error.fg, WROSE_ERROR, "failures stay muted red");
+    }
+
+    #[test]
+    fn timeline_does_not_reserve_a_subagent_tree() {
         let mut ui = shell();
         for index in 0..10 {
             ui.tool_cells.insert(
@@ -7607,12 +10828,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            joined.contains("SUBAGENT TREE  10 running"),
-            "the tree counts in-flight work:\n{joined}"
+            !joined.contains("SUBAGENT TREE"),
+            "no permanent tree:\n{joined}"
         );
         assert!(
-            joined.contains("more running"),
-            "overflow collapses to a count instead of growing:\n{joined}"
+            joined.contains("Ask WROSECODE"),
+            "composer owns the bottom:\n{joined}"
         );
 
         for cell in ui.tool_cells.values_mut() {
@@ -7627,16 +10848,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            joined.contains("SUBAGENT TREE  0 running"),
-            "nothing running is explicit:\n{joined}"
-        );
-        assert!(
-            joined.contains("✓ 4 subagents done"),
-            "finished work collapses to one line:\n{joined}"
-        );
-        assert!(
-            !joined.contains("Delegated part 9"),
-            "finished titles leave the tree pane:\n{joined}"
+            !joined.contains("SUBAGENT TREE"),
+            "finished work has no reserved pane:\n{joined}"
         );
     }
 
@@ -7715,6 +10928,38 @@ mod tests {
                 .any(|line| line.contains("last turn 4.2s · reasoning 1280 tok")),
             "{thinking:?}"
         );
+    }
+
+    #[test]
+    fn the_thinking_panel_reports_the_announced_model_stage() {
+        let mut ui = shell();
+        ui.apply_progress(Progress::ModelStage("Preparing request context…".into()));
+        let stats = ui.dash_stats();
+        assert_eq!(stats.stage, "Preparing request context…");
+        let (_, thinking) = dashboard_panels(&stats, 100)
+            .into_iter()
+            .find(|(title, _)| *title == "THINKING")
+            .expect("the THINKING panel");
+        assert!(
+            thinking
+                .iter()
+                .any(|line| line.contains("stage: Preparing request context…")),
+            "{thinking:?}"
+        );
+
+        // A stage announced while a tool is live is still a stage: dropping
+        // it would leave a long turn with no progress signal at all.
+        ui.apply_progress(Progress::ToolBegin {
+            id: "t1".into(),
+            title: "Read read_file src/main.rs".into(),
+        });
+        ui.apply_progress(Progress::ModelStage("Sending prompt to model".into()));
+        assert_eq!(ui.dash_stats().stage, "Sending prompt to model");
+
+        // Transient UI state must not be mistaken for the model stage.
+        ui.apply_progress(Progress::TextDelta("hi".into()));
+        assert_eq!(ui.status, "Streaming");
+        assert_eq!(ui.dash_stats().stage, "Streaming");
     }
 
     #[test]
@@ -7797,6 +11042,420 @@ mod tests {
 
     fn shell() -> Ui {
         Ui::from_meta(UiMeta::for_test(), "test".into())
+    }
+
+    #[test]
+    fn model_catalog_keeps_same_model_id_for_distinct_profiles() {
+        let rows = normalize_model_rows(vec![
+            ("groq".into(), "openai/gpt-oss-120b".into()),
+            ("custom".into(), "openai/gpt-oss-120b".into()),
+            ("groq".into(), "openai/gpt-oss-120b".into()),
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.0 == "groq"));
+        assert!(rows.iter().any(|row| row.0 == "custom"));
+    }
+
+    #[test]
+    fn discovered_models_group_five_deep_under_one_provider() {
+        // The reported bug: only one model per provider survived. Every
+        // discovered id must remain its own selectable row, sorted.
+        let rows = normalize_model_rows(vec![
+            ("mine".into(), "model-3".into()),
+            ("mine".into(), "model-1".into()),
+            ("mine".into(), "model-5".into()),
+            ("mine".into(), "model-2".into()),
+            ("mine".into(), "model-4".into()),
+        ]);
+        assert_eq!(
+            rows.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+            vec!["model-1", "model-2", "model-3", "model-4", "model-5"],
+            "all five models stay listed under the provider"
+        );
+    }
+
+    #[test]
+    fn saving_a_provider_replaces_its_old_default_with_all_discovered_models() {
+        let catalog = vec![
+            ("mine".into(), "old-default".into()),
+            ("other".into(), "other-1".into()),
+        ];
+        let merged = merge_provider_models(
+            &catalog,
+            "mine",
+            vec!["model-1".into(), "model-2".into(), "model-3".into()],
+            "model-2",
+        );
+        assert_eq!(
+            merged,
+            vec![
+                ("mine".into(), "model-1".into()),
+                ("mine".into(), "model-2".into()),
+                ("mine".into(), "model-3".into()),
+                ("other".into(), "other-1".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_discovery_keeps_configured_model_as_manual_fallback() {
+        let merged = merge_provider_models(
+            &[("mine".into(), "old-default".into())],
+            "mine",
+            Vec::new(),
+            "manual-model",
+        );
+        assert_eq!(merged, vec![("mine".into(), "manual-model".into())]);
+    }
+
+    #[test]
+    fn failed_discovery_retains_only_the_errored_providers_rows() {
+        let catalog = vec![
+            ("up".into(), "a".into()),
+            ("down".into(), "b".into()),
+            ("down".into(), "c".into()),
+        ];
+        let kept = retain_failed_rows(&catalog, &["down · model discovery failed: x".into()]);
+        assert_eq!(
+            kept,
+            vec![("down".into(), "b".into()), ("down".into(), "c".into())],
+            "cached rows survive a failed refresh, others refresh away"
+        );
+        assert!(
+            retain_failed_rows(&catalog, &[]).is_empty(),
+            "a clean refresh replaces everything"
+        );
+    }
+
+    #[test]
+    fn studio_mode_uses_full_width_clean_tool_timeline() {
+        let mut ui = shell();
+        ui.theme = theme_index("studio");
+        ui.verbosity = "normal".into();
+        ui.push(Speaker::User, "inspect the project");
+        ui.apply_progress(Progress::ToolBegin {
+            id: "read-clean".into(),
+            title: "Read read_file src/main.rs".into(),
+        });
+        ui.apply_progress(Progress::ToolEnd {
+            id: "read-clean".into(),
+            ok: true,
+            output: "5 lines inspected".into(),
+            elapsed_ms: 145,
+        });
+        ui.push(Speaker::Agent, "Done.\nAll relevant files were inspected.");
+        let (frame, _) = ui.compose(132, 45);
+        let text = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Read  src/main.rs"), "{text}");
+        assert!(text.contains("145ms"), "{text}");
+        assert!(text.contains("5 lines inspected"), "{text}");
+        assert!(text.contains("  ◈ WROSECODE"), "{text}");
+        assert!(!text.contains("LIVE TOOLS"), "{text}");
+        assert!(!text.contains("┌─ ◈ WROSECODE"), "{text}");
+        assert!(frame.iter().all(|row| row.text.chars().count() <= 132));
+        assert!(frame.iter().all(|row| row.bg != Color::Reset));
+    }
+
+    #[test]
+    fn studio_streamed_and_final_answer_match() {
+        let prompt = "Quick summary:\n\nA short paragraph.\n";
+        for split in 1..=prompt.len() {
+            if !prompt.is_char_boundary(split) {
+                continue;
+            }
+            let mut ui = shell();
+            ui.draft = prompt[..split].to_string();
+            let (cached, tail) = ui.prepare_draft(79, false, STUDIO_PANEL);
+            let mut rendered: Vec<String> = ui
+                .draft_cache
+                .rows
+                .iter()
+                .map(|(row, _)| row.clone())
+                .collect();
+            assert_eq!(rendered.len(), cached);
+            rendered.extend(tail.into_iter().map(|(row, _)| row));
+            let full: Vec<String> = render_agent_body(&prompt[..split], 79, false, STUDIO_PANEL)
+                .into_iter()
+                .map(|(row, _)| row)
+                .collect();
+            assert_eq!(rendered, full, "stream diverged at split {split}");
+        }
+    }
+
+    #[test]
+    fn shell_tool_card_shows_only_its_own_live_output() {
+        let mut ui = shell();
+        ui.verbosity = "verbose".into();
+        ui.apply_progress(Progress::ToolBegin {
+            id: "shell-own".into(),
+            title: "Ran shell: cargo test".into(),
+        });
+        ui.dash_procs.push(crate::tools::shell::ProcSnapshot {
+            pid: 999,
+            command: "something else".into(),
+            cwd: "/tmp".into(),
+            started: std::time::Instant::now(),
+            running: true,
+            exit_code: None,
+            timed_out: false,
+            cpu_pct: None,
+            rss_kb: None,
+            tail: "unrelated output".into(),
+        });
+        ui.dash_procs.push(crate::tools::shell::ProcSnapshot {
+            pid: 1000,
+            command: "cargo test".into(),
+            cwd: "/tmp".into(),
+            started: std::time::Instant::now(),
+            running: true,
+            exit_code: None,
+            timed_out: false,
+            cpu_pct: Some(32.5),
+            rss_kb: Some(8192),
+            tail: "Compiling crate\nRunning 5 tests".into(),
+        });
+        ui.refresh_cell("shell-own");
+        let row = ui.tool_rows["shell-own"];
+        let text = &ui.entries[row].text;
+        assert!(text.contains("Run  cargo test"), "{text}");
+        assert!(text.contains("Running 5 tests"), "{text}");
+        assert!(text.contains("Compiling crate"), "{text}");
+        assert!(
+            text.contains("PID 1000 · CPU 32.5% · RAM 8.0 MiB (process tree)"),
+            "{text}"
+        );
+        assert!(!text.contains("unrelated output"), "{text}");
+        // Off is a presentation change: no CPU/RAM line or long output.
+        ui.verbosity = "normal".into();
+        ui.refresh_cell("shell-own");
+        let compact = &ui.entries[row].text;
+        assert!(!compact.contains("PID 1000"), "{compact}");
+        assert!(compact.contains("Running 5 tests"), "{compact}");
+        assert!(!compact.contains("Compiling crate"), "{compact}");
+    }
+
+    #[test]
+    fn wide_layout_shows_the_live_activity_rail() {
+        let mut ui = shell();
+        ui.activity_rail = true;
+        ui.push(Speaker::User, "inspect the repository");
+        ui.apply_progress(Progress::ToolBegin {
+            id: "shell-1".into(),
+            title: "Ran shell: rg --files".into(),
+        });
+        let (running, _) = ui.compose(140, 32);
+        let running_text = running
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(running_text.contains("ACTIVITY"), "{running_text}");
+        assert!(running_text.contains("LIVE TOOLS"), "{running_text}");
+        assert!(running_text.contains("◌ Ran shell"));
+        // Footer / box bottom / info own the last three rows; the prompt
+        // box sits just above them.
+        let prompt_row = running.len() - 4;
+        assert!(running[prompt_row].text.starts_with("│ >"));
+        assert!(
+            running[running.len() - 1].text.contains("Esc cancel"),
+            "footer owns the last row"
+        );
+        assert!(
+            running[running.len() - 2].text.starts_with("└"),
+            "composer box closes above the footer"
+        );
+        assert!(
+            running[running.len() - 3].text.contains("◈ BUILD"),
+            "info line names the mode"
+        );
+
+        ui.apply_progress(Progress::ToolEnd {
+            id: "shell-1".into(),
+            ok: true,
+            output: "exit=0\nfiles".into(),
+            elapsed_ms: 42,
+        });
+        let finished = ui
+            .compose(140, 32)
+            .0
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(finished.contains("✓"));
+    }
+
+    #[test]
+    fn activity_rail_is_responsive_and_toggleable() {
+        let mut ui = shell();
+        ui.activity_rail = true;
+        ui.push(Speaker::User, "inspect code and update plan");
+        ui.apply_progress(Progress::ToolBegin {
+            id: "read".into(),
+            title: "Read read_file src/main.rs".into(),
+        });
+        ui.apply_progress(Progress::ToolBegin {
+            id: "mcp".into(),
+            title: "Ran mcp__workspace__search query".into(),
+        });
+        let (wide, _) = ui.compose(117, 39);
+        let text = wide
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("LIVE TOOLS"), "{text}");
+        assert!(text.contains("read_file"), "{text}");
+        assert!(text.contains("mcp__workspace__search"), "{text}");
+        assert!(wide.iter().all(|row| row.text.chars().count() <= 117));
+
+        let (narrow, _) = ui.compose(85, 39);
+        let narrow_text = narrow
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!narrow_text.contains("LIVE TOOLS"));
+        ui.activity_rail = false;
+        let (disabled, _) = ui.compose(117, 39);
+        assert!(!disabled.iter().any(|row| row.text.contains("LIVE TOOLS")));
+    }
+
+    #[test]
+    fn plan_progress_updates_single_main_transcript_cell() {
+        let mut ui = shell();
+        ui.begin_turn();
+        ui.apply_progress(Progress::Plan(vec![
+            ("Discover relevant files".into(), false),
+            ("Run tests".into(), false),
+        ]));
+        let row = ui.plan_row.expect("visible plan row");
+        assert!(ui.entries[row].text.contains("0/2 complete"));
+        let length = ui.entries.len();
+        ui.apply_progress(Progress::Plan(vec![
+            ("Discover relevant files".into(), true),
+            ("Run tests".into(), false),
+        ]));
+        assert_eq!(ui.plan_row, Some(row));
+        assert_eq!(
+            ui.entries.len(),
+            length,
+            "update does not spam the transcript"
+        );
+        assert!(ui.entries[row].text.contains("1/2 complete"));
+        assert!(ui.entries[row].text.contains("✓ Discover relevant files"));
+    }
+
+    #[test]
+    fn normal_read_group_finishes_when_the_last_tool_completes() {
+        let mut ui = shell();
+        ui.verbosity = "compact".into();
+        ui.apply_progress(Progress::ToolBegin {
+            id: "grouped-read".into(),
+            title: "Read read_file Cargo.toml".into(),
+        });
+        let group_row = ui.ro_ids["grouped-read"].0;
+        assert!(ui.entries[group_row].text.contains("Exploring"));
+        ui.apply_progress(Progress::ToolEnd {
+            id: "grouped-read".into(),
+            ok: true,
+            output: "package name".into(),
+            elapsed_ms: 13,
+        });
+        assert_eq!(ui.groups[&group_row].inflight, 0);
+        assert!(ui.entries[group_row].text.contains("Explored"));
+        assert!(!ui.entries[group_row].text.contains("Exploring"));
+    }
+
+    #[test]
+    fn activity_rail_retains_grouped_read_search_results() {
+        let mut ui = shell();
+        ui.activity_rail = true;
+        ui.verbosity = "compact".into();
+        ui.push(Speaker::User, "search source");
+        ui.apply_progress(Progress::ToolBegin {
+            id: "browse".into(),
+            title: "Searched grep security".into(),
+        });
+        ui.apply_progress(Progress::ToolEnd {
+            id: "browse".into(),
+            ok: true,
+            output: "no matches".into(),
+            elapsed_ms: 9,
+        });
+        assert!(
+            !ui.tool_cells.contains_key("browse"),
+            "read group is collapsed"
+        );
+        let (frame, _) = ui.compose(117, 39);
+        let text = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("RECENT RESULTS"), "{text}");
+        assert!(text.contains("Search  security"), "{text}");
+    }
+
+    #[test]
+    fn wide_activity_rail_shows_redacted_streaming_shell_output() {
+        let mut ui = shell();
+        ui.activity_rail = true;
+        ui.push(Speaker::User, "run a local command");
+        ui.apply_progress(Progress::ToolBegin {
+            id: "shell-1".into(),
+            title: "Ran shell: cargo test".into(),
+        });
+        ui.dash_procs.push(crate::tools::shell::ProcSnapshot {
+            pid: 123,
+            command: "cargo test".into(),
+            cwd: "/tmp".into(),
+            started: std::time::Instant::now(),
+            running: true,
+            exit_code: None,
+            timed_out: false,
+            cpu_pct: None,
+            rss_kb: None,
+            tail: "Compiling module\nRunning unit tests\n".into(),
+        });
+        ui.dash_data_at = Some(std::time::Instant::now());
+        let (frame, _) = ui.compose(117, 39);
+        let visible = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(visible.contains("LIVE SHELL OUTPUT"), "{visible}");
+        assert!(visible.contains("Running unit tests"), "{visible}");
+    }
+
+    #[test]
+    fn model_tool_elapsed_updates_while_it_is_running() {
+        let mut ui = shell();
+        ui.verbosity = "verbose".into();
+        ui.apply_progress(Progress::ToolBegin {
+            id: "scan".into(),
+            title: "Searched grep security".into(),
+        });
+        let row = ui.tool_cells["scan"].row;
+        ui.tick_thinking();
+        assert!(
+            ui.entries[row].text.contains("0ms"),
+            "{}",
+            ui.entries[row].text
+        );
+        ui.apply_progress(Progress::ToolEnd {
+            id: "scan".into(),
+            ok: true,
+            output: "found test result".into(),
+            elapsed_ms: 100,
+        });
+        assert!(ui.entries[row].text.contains("✓"));
+        assert!(ui.entries[row].text.contains("100ms"));
     }
 
     fn fill_transcript(ui: &mut Ui, entries: usize) {
@@ -7891,12 +11550,78 @@ mod tests {
     }
 
     #[test]
+    fn long_session_frame_render_skips_unchanged_transcript_entries() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 1200);
+        ui.compose(110, 35);
+        let rebuilt = ui.transcript_rebuilds;
+        let rewrapped = ui.entries_rewrapped;
+        for _ in 0..40 {
+            ui.compose(110, 35);
+        }
+        assert_eq!(
+            ui.transcript_rebuilds, rebuilt,
+            "idle frames do not rebuild"
+        );
+        assert_eq!(ui.entries_rewrapped, rewrapped);
+        let index = ui.entries.len() - 3;
+        ui.set_entry_text(index, "edited recent row".into());
+        ui.compose(110, 35);
+        assert_eq!(
+            ui.entries_rewrapped - rewrapped,
+            (ui.entries.len() - index) as u64,
+            "only the changed entry and its descendants need wrapping"
+        );
+    }
+
+    #[test]
+    fn clearing_transcript_invalidates_old_activity_references() {
+        let mut ui = shell();
+        ui.push(Speaker::System, "plan row");
+        ui.plan_row = Some(ui.entries.len() - 1);
+        ui.think_row = Some(ui.entries.len() - 1);
+        ui.compose(110, 35);
+        ui.clear_transcript();
+        assert!(ui.plan_row.is_none());
+        assert!(ui.think_row.is_none());
+        // Completion event from an old task must be harmless after a reset.
+        ui.set_entry_text(9000, "stale task output".into());
+        ui.push(Speaker::User, "a new session");
+        ui.compose(110, 35);
+        assert!(ui
+            .entries
+            .iter()
+            .all(|entry| entry.text != "stale task output"));
+    }
+
+    #[test]
+    fn huge_single_line_tool_output_does_not_expand_into_unbounded_rows() {
+        let giant = "λ".repeat(180_000);
+        let block = expanded_block(&giant, Some(0));
+        assert!(block.contains("line shortened for responsiveness"));
+        assert!(block.contains("display capped"));
+        assert!(block.len() < 10_000, "UI text is bounded: {}", block.len());
+        let rendered =
+            render_tool_rows(&format!(" ✓  tool result{block}"), 100, true, Color::Black);
+        assert!(
+            rendered.len() < 150,
+            "would stall renderer: {} rows",
+            rendered.len()
+        );
+        let normal = expanded_block("line one\nline two", Some(0));
+        assert!(normal.contains("line one\nline two"));
+        assert!(!normal.contains("line shortened"));
+    }
+
+    #[test]
     fn transcript_cache_only_rebuilds_when_the_wrapped_lines_change() {
         let mut ui = shell();
         fill_transcript(&mut ui, 40);
         ui.compose(80, 24);
         let first = ui.transcript_rebuilds;
         assert_eq!(first, 1);
+        let rewrapped = ui.entries_rewrapped;
+        assert_eq!(rewrapped, ui.entries.len() as u64);
 
         for _ in 0..5 {
             ui.scroll_up(3);
@@ -7913,6 +11638,23 @@ mod tests {
         ui.compose(80, 24);
         let after_entry = ui.transcript_rebuilds;
         assert!(after_entry > first, "new content invalidates the cache");
+        assert_eq!(
+            ui.entries_rewrapped - rewrapped,
+            1,
+            "appending must wrap only the new entry"
+        );
+
+        // Growth that does not add entries (the streaming draft, spinner
+        // ticks) must never re-wrap committed entries.
+        let before_draft = ui.entries_rewrapped;
+        ui.draft.push_str("streaming line\n");
+        ui.compose(80, 24);
+        ui.draft.push_str("second streaming line\n");
+        ui.compose(80, 24);
+        assert_eq!(
+            ui.entries_rewrapped, before_draft,
+            "draft growth must not invalidate the committed transcript"
+        );
 
         ui.compose(60, 24);
         let after_width = ui.transcript_rebuilds;
@@ -7924,6 +11666,66 @@ mod tests {
             ui.transcript_rebuilds > after_width,
             "verbosity changes the wrapped output"
         );
+    }
+
+    #[test]
+    fn long_single_line_agent_answers_wrap_instead_of_clipping() {
+        // Regression: non-verbose mode clipped every prose line to one
+        // screen width, silently hiding the rest of a long paragraph or a
+        // minified one-line answer. The full text must reach the transcript.
+        let answer = "X".repeat(500);
+        for verbose in [false, true] {
+            let rows = render_agent_body(&answer, 40, verbose, Color::Black);
+            let visible: String = rows
+                .iter()
+                .map(|(row, _)| row.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                visible.matches('X').count(),
+                answer.len(),
+                "verbose={verbose}: the wrapped body must contain every character"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_draft_render_matches_full_render() {
+        // The live draft uses an append-only cache: complete lines are
+        // wrapped once and only the trailing partial line is re-wrapped.
+        // Its output must be byte-identical to rendering the whole text,
+        // at every possible split point, including fence boundaries.
+        let text = "intro line\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\
+                    a very long tail line that needs wrapping because it exceeds the width \
+                    by quite a margin\nlast\n";
+        let panel = Color::Black;
+        // Split 0 is not a live-draft state: `compose` only prepares the
+        // draft when it is non-empty. Every incremental state that can
+        // actually render must match the full render.
+        for split in 1..=text.len() {
+            if !text.is_char_boundary(split) {
+                continue;
+            }
+            let mut ui = shell();
+            let (width, verbose) = (60usize, false);
+            ui.draft.push_str(&text[..split]);
+            let (_cached, tail) = ui.prepare_draft(width, verbose, panel);
+            let mut incremental: Vec<String> = ui
+                .draft_cache
+                .rows
+                .iter()
+                .map(|(row, _)| row.clone())
+                .collect();
+            incremental.extend(tail.into_iter().map(|(row, _)| row));
+            let full: Vec<String> = render_agent_body(&text[..split], width, verbose, panel)
+                .into_iter()
+                .map(|(row, _)| row)
+                .collect();
+            assert_eq!(
+                incremental, full,
+                "split {split} diverged from the full render"
+            );
+        }
     }
 
     #[test]
@@ -7943,58 +11745,80 @@ mod tests {
                     row.text
                 );
             }
-            assert_eq!(
-                frame[height - 1].text,
-                "│ > ",
-                "the prompt owns the last row"
+            // Footer owns the last row, the box bottom the one above, the
+            // info line above that (tiny terminals clip the footer text).
+            assert!(
+                frame[height - 1].text.contains("Esc cancel")
+                    || frame[height - 1].text.contains("/ commands"),
+                "the footer owns the last row: {:?}",
+                frame[height - 1].text
             );
-            let expected_edge = format!("┌{}", "─".repeat(width.saturating_sub(1)));
-            if height >= 10 {
-                assert_eq!(
-                    frame[height - 4].text,
-                    expected_edge,
-                    "normal terminals keep a full input panel"
-                );
-                assert_eq!(
-                    frame[height - 2].text,
-                    "│",
-                    "empty prompt space stays visibly inside the input panel"
-                );
-            } else {
-                assert_eq!(
-                    frame[height - 2].text,
-                    expected_edge,
-                    "tiny terminals keep the compact one-line prompt"
-                );
-            }
+            assert!(
+                frame[height - 2].text.starts_with("└"),
+                "the composer box closes above the footer: {:?}",
+                frame[height - 2].text
+            );
             assert!(
                 frame[0].text.starts_with(" WROSECODE"),
                 "row 0 is the slim header: {:?}",
                 frame[0].text
             );
-            assert_eq!(
-                cursor,
-                (4, (height - 1) as u16),
-                "the caret sits in the empty prompt"
-            );
 
-            if height >= 7 {
+            if height >= 24 {
+                // Tall terminals: header + thin rule + breathing room, then
+                // the transcript starts immediately in prompt bubbles.
                 assert!(
-                    frame[1].text.chars().all(|ch| ch == '─'),
-                    "row 1 is the full-width rule: {:?}",
+                    frame[1].text.chars().any(|ch| ch == '─'),
+                    "row 1 is the thin rule: {:?}",
                     frame[1].text
                 );
                 assert!(
-                    frame[2].text.starts_with(" TRANSCRIPT  31"),
-                    "row 2 is the transcript header: {:?}",
+                    frame[2].text.is_empty(),
+                    "row 2 is breathing room: {:?}",
                     frame[2].text
                 );
-            } else {
-                // A four-row terminal is too short for a transcript: the
-                // status line takes the slot under the mode header.
                 assert!(
-                    frame[1].text.starts_with(" Ready"),
-                    "row 1 is the status line: {:?}",
+                    frame[3..9].iter().any(|row| row.text.starts_with("› ")),
+                    "prompts open the transcript: {:?}",
+                    frame[3].text
+                );
+                assert!(
+                    frame.iter().any(|row| row.text.contains("Ask WROSECODE")),
+                    "the composer labels its purpose"
+                );
+                // Empty draft: placeholder row inside the box.
+                assert_eq!(
+                    cursor,
+                    (4, (height - 4) as u16),
+                    "the caret sits in the prompt box"
+                );
+                assert!(
+                    frame[height - 4].text.starts_with("│ >"),
+                    "the prompt sits inside the box: {:?}",
+                    frame[height - 4].text
+                );
+                assert!(
+                    frame[height - 3].text.contains("◈ BUILD"),
+                    "the info line names the mode: {:?}",
+                    frame[height - 3].text
+                );
+            } else if height >= 7 {
+                assert!(
+                    frame[1].text.is_empty() || frame[1].text.starts_with("│ >"),
+                    "row 1 is breathing room or composer: {:?}",
+                    frame[1].text
+                );
+                assert_eq!(
+                    cursor.1,
+                    (height - 4) as u16,
+                    "the caret sits in the prompt box: {cursor:?}"
+                );
+            } else {
+                // A four-row terminal keeps header, prompt, info, footer.
+                assert_eq!(cursor.1, 1, "the caret sits in the prompt: {cursor:?}");
+                assert!(
+                    frame[1].text.starts_with("│ >"),
+                    "row 1 is the prompt: {:?}",
                     frame[1].text
                 );
             }
@@ -8007,6 +11831,613 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn medium_terminal_stays_single_column() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 4);
+        let (frame, _) = ui.compose(120, 35);
+        assert!(
+            frame.iter().all(|row| row.text.chars().count() <= 120),
+            "no overflow at 120 columns"
+        );
+        assert!(
+            frame[frame.len() - 3].text.contains("◈ BUILD"),
+            "info line survives at 120 columns"
+        );
+        assert!(
+            frame.iter().any(|row| row.text.starts_with("› ")),
+            "prompts render unboxed at 120 columns"
+        );
+    }
+
+    /// Single-column contract across the required terminal sizes: exact row
+    /// counts, full-width conversation with prompt bubbles, a boxed
+    /// composer, footer ownership, and an opaque viewport.
+    #[test]
+    fn premium_layout_holds_across_required_sizes() {
+        for (width, height) in [
+            (160u16, 45u16),
+            (140, 40),
+            (120, 35),
+            (100, 30),
+            (80, 24),
+            (60, 20),
+        ] {
+            let mut ui = shell();
+            fill_transcript(&mut ui, 12);
+            ui.mcp_live = vec![("gh".into(), 3)];
+            let (frame, cursor) = ui.compose(width, height);
+            let (w, h) = (width as usize, height as usize);
+            assert_eq!(frame.len(), h, "exact rows at {w}x{h}");
+            for (index, row) in frame.iter().enumerate() {
+                assert!(
+                    row.text.chars().count() <= w,
+                    "row {index} overflows at {w}x{h}: {:?}",
+                    row.text
+                );
+                // Opaque viewport: no transparent cells leak the desktop.
+                assert_ne!(
+                    row.bg,
+                    Color::Reset,
+                    "row {index} has explicit bg at {w}x{h}"
+                );
+            }
+            assert!(
+                frame[0].text.starts_with(" WROSECODE"),
+                "header at {w}x{h}: {:?}",
+                frame[0].text
+            );
+            assert!(
+                frame[h - 1].text.contains("Esc cancel"),
+                "footer owns last row at {w}x{h}: {:?}",
+                frame[h - 1].text
+            );
+            assert!(
+                frame[h - 2].text.starts_with("└"),
+                "composer box closes at {w}x{h}: {:?}",
+                frame[h - 2].text
+            );
+            assert!(
+                frame[h - 3].text.contains("◈ BUILD"),
+                "info line inside box at {w}x{h}"
+            );
+            assert!(
+                frame.iter().any(|row| row.text.contains("◈ THINK")),
+                "think status bar at {w}x{h}"
+            );
+            // Grok-clean prompts: a cyan `›` marker, no boxes in the
+            // transcript (composer and snapshot keep theirs).
+            assert!(
+                frame.iter().any(|row| row.text.starts_with("› ")),
+                "user marker at {w}x{h}"
+            );
+            assert!(
+                frame
+                    .iter()
+                    .any(|row| row.text.starts_with("┌") && row.text.chars().count() == w),
+                "full-width composer box at {w}x{h}"
+            );
+            assert!(cursor.1 < h as u16, "cursor inside frame at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn think_mode_shows_status_bar() {
+        let mut ui = shell();
+        assert!(ui.think_bar_visible(), "medium ships visible");
+        let (frame, _) = ui.compose(100, 30);
+        let bar = frame
+            .iter()
+            .find(|row| row.text.contains("THINK"))
+            .expect("think status bar renders");
+        assert!(
+            bar.text.contains("medium") && bar.text.contains("5/20"),
+            "bar names the live level: {:?}",
+            bar.text
+        );
+        assert_ne!(bar.bg, Color::Reset, "bar sits on the dark viewport");
+        // The bar owns exactly one row, directly above the composer box.
+        let box_top = frame
+            .iter()
+            .rposition(|row| row.text.starts_with("┌"))
+            .expect("composer box opens");
+        let bar_row = frame.iter().position(|row| row.text.contains("THINK"));
+        assert_eq!(bar_row, Some(box_top - 1), "bar hugs the box top");
+
+        ui.think = ThinkLevel::Off;
+        assert!(!ui.think_bar_visible(), "off hides the bar");
+        let (frame, _) = ui.compose(100, 30);
+        assert!(
+            !frame.iter().any(|row| row.text.contains("THINK")),
+            "no bar, no reserved row"
+        );
+    }
+
+    #[test]
+    fn git_refresh_backs_off_while_idle() {
+        let now = std::time::Instant::now();
+        let ten_seconds_ago = now - std::time::Duration::from_secs(10);
+        assert!(
+            git_stale(Some(ten_seconds_ago), now, true),
+            "10s stale refreshes while busy"
+        );
+        assert!(
+            !git_stale(Some(ten_seconds_ago), now, false),
+            "10s stale stays cached while idle"
+        );
+        assert!(git_stale(None, now, false), "first sync always runs");
+    }
+
+    #[test]
+    fn idle_sessions_want_no_animation() {
+        let mut ui = shell();
+        assert!(
+            !ui.wants_animation(),
+            "a quiet prompt costs no periodic frames"
+        );
+        ui.busy = true;
+        assert!(ui.wants_animation(), "a running turn animates");
+        ui.busy = false;
+        ui.dashboard = true;
+        assert!(ui.wants_animation(), "live panels animate");
+    }
+
+    #[test]
+    fn chrome_fingerprint_moves_only_on_visible_change() {
+        let mut ui = shell();
+        let calm = ui.chrome_fingerprint();
+        assert_eq!(
+            ui.chrome_fingerprint(),
+            calm,
+            "re-reading idle state is stable"
+        );
+        ui.usage.input += 1;
+        assert_ne!(ui.chrome_fingerprint(), calm, "token growth repaints");
+        let moved = ui.chrome_fingerprint();
+        ui.spinner = ui.spinner.wrapping_add(1);
+        assert_eq!(
+            ui.chrome_fingerprint(),
+            moved,
+            "spinner ticks alone never repaint"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_snapshot_lists_real_state() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 2);
+        ui.mcp_live = vec![("local-tools".into(), 7)];
+        ui.lsp_enabled = true;
+        ui.lsp_live = vec![("rust-analyzer".into(), true)];
+        ui.lsp_dead = vec!["typescript-language-server --stdio".into()];
+        ui.git_branch = "main".into();
+        ui.git_files = 2;
+        ui.git_added = 10;
+        ui.git_removed = 3;
+        let snapshot = ui.session_snapshot();
+        for needle in [
+            "SESSION",
+            &ui.model,
+            "local-tools",
+            "rust-analyzer",
+            "typescript-language-server",
+            "unavailable",
+            "main",
+            "/stats",
+        ] {
+            assert!(
+                snapshot.contains(needle),
+                "snapshot shows {needle:?}:\n{snapshot}"
+            );
+        }
+        // Nothing connected: no invented servers, GIT omitted outside repos.
+        let mut ui = shell();
+        ui.git_branch.clear();
+        let snapshot = ui.session_snapshot();
+        assert!(snapshot.contains("no servers connected"), "{snapshot}");
+        assert!(
+            !snapshot.contains("GIT") && !snapshot.contains("git "),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("SESSION") && snapshot.contains("details"),
+            "snapshot reads as one block: {snapshot}"
+        );
+    }
+
+    #[test]
+    fn snapshot_shows_only_real_integrations() {
+        let mut ui = shell();
+        // LSP with nothing live reports exactly that — never fake servers.
+        ui.lsp_enabled = true;
+        assert!(
+            ui.session_snapshot().contains("no live servers"),
+            "{}",
+            ui.session_snapshot()
+        );
+        ui.lsp_enabled = false;
+        assert!(
+            !ui.session_snapshot().contains("lsp"),
+            "disabled LSP stays hidden"
+        );
+        // CTF section only in CTF mode.
+        assert!(!ui.session_snapshot().contains("ctf"));
+        ui.mode = "CTF".into();
+        assert!(ui.session_snapshot().contains("ctf"));
+    }
+
+    #[test]
+    fn unicode_and_long_prompts_wrap_without_overlap() {
+        let mut ui = shell();
+        ui.push(Speaker::User, format!("héllo {} 🎉", "wörld ".repeat(40)));
+        ui.set_input("emoji 🎉 test ".repeat(20));
+        ui.cursor = ui.input.len();
+        for (w, h) in [(160u16, 45u16), (100, 30), (80, 24)] {
+            let (frame, cursor) = ui.compose(w, h);
+            assert_eq!(frame.len(), h as usize);
+            for row in &frame {
+                assert!(row.text.chars().count() <= w as usize);
+                assert_ne!(row.bg, Color::Reset);
+            }
+            assert!(cursor.1 < h);
+        }
+    }
+
+    #[test]
+    fn slash_palette_floats_above_composer_without_overlap() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 8);
+        ui.set_input("/mod".into());
+        ui.cursor = ui.input.len();
+        ui.palette = true;
+        let (frame, _) = ui.compose(120, 35);
+        let palette_row = frame
+            .iter()
+            .position(|row| row.text.contains("/models"))
+            .expect("palette lists /models");
+        let footer = frame.len() - 1;
+        let prompt = frame.len() - 4;
+        let box_top = frame
+            .iter()
+            .rposition(|row| row.text.starts_with("┌"))
+            .expect("composer box opens above the prompt");
+        assert!(palette_row < box_top, "palette floats above composer");
+        assert!(frame[footer].text.contains("Esc cancel"), "footer intact");
+        assert!(frame[prompt].text.starts_with("│ >"), "composer intact");
+    }
+
+    #[test]
+    fn user_marker_glows_while_banner_stays_quiet() {
+        let mut ui = shell();
+        ui.push(Speaker::User, String::from("list dir in desktop"));
+        let (frame, _) = ui.compose(100, 32);
+        // Welcome banner stays quiet muted even though it mentions thinking.
+        let banner = frame
+            .iter()
+            .find(|row| row.text.contains("WROSECODE v"))
+            .expect("banner renders");
+        assert_eq!(banner.fg, Color::Grey, "banner muted: {:?}", banner.fg);
+        // User marker carries the cyan accent via per-character colours.
+        let prompt = frame
+            .iter()
+            .find(|row| row.text.starts_with("› "))
+            .expect("prompt renders");
+        assert_eq!(
+            prompt.colors,
+            Some(vec![theme(0).accent, theme(0).accent]),
+            "marker accent"
+        );
+    }
+
+    #[test]
+    fn assistant_fences_render_labeled_containers() {
+        let mut ui = shell();
+        ui.push(
+            Speaker::Agent,
+            "try this:\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\ndone.",
+        );
+        let (frame, _) = ui.compose(100, 30);
+        let text = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("┌─ rust"), "labeled top border:\n{text}");
+        assert!(text.contains("fn main() {"), "code kept:\n{text}");
+        assert!(
+            text.contains("│     println!(\"hi\");"),
+            "indentation preserved:\n{text}"
+        );
+        assert!(!text.contains("```"), "no raw fences leak:\n{text}");
+        // The whole result — prose and code — sits in one charcoal box.
+        let code_row = frame
+            .iter()
+            .find(|row| row.text.contains("fn main()"))
+            .expect("code row renders");
+        assert_ne!(code_row.bg, Color::Reset);
+        let prose = frame
+            .iter()
+            .find(|row| row.text.contains("try this:"))
+            .expect("prose renders");
+        assert_eq!(prose.bg, code_row.bg, "one container for the whole result");
+        assert!(
+            text.contains("┌─ ◈ WROSECODE"),
+            "result box carries the title:\n{text}"
+        );
+    }
+
+    #[test]
+    fn fence_edge_cases_stay_graceful() {
+        // Unclosed fence renders to the end instead of leaking backticks.
+        let rows = entry_rows(
+            &Entry {
+                speaker: Speaker::Agent,
+                text: "half:\n```python\nx = 1".into(),
+            },
+            60,
+            false,
+            Color::Black,
+        );
+        let text: Vec<&str> = rows.iter().map(|(line, _)| line.as_str()).collect();
+        assert!(text.iter().any(|line| line.contains("┌─ python")));
+        assert!(text.iter().any(|line| line.contains("x = 1")));
+        assert!(!text.iter().any(|line| line.contains("```")));
+        // No language tag degrades to a `code` label, not an empty one.
+        let rows = entry_rows(
+            &Entry {
+                speaker: Speaker::Agent,
+                text: "```\nplain\n```".into(),
+            },
+            60,
+            false,
+            Color::Black,
+        );
+        assert!(rows.iter().any(|(line, _)| line.contains("┌─ code")));
+        // A very long code line wraps inside the walls instead of clipping.
+        let long = "y = \"".to_string() + &"z".repeat(200) + "\"";
+        let rows = entry_rows(
+            &Entry {
+                speaker: Speaker::Agent,
+                text: format!("```\n{long}\n```"),
+            },
+            60,
+            false,
+            Color::Black,
+        );
+        for (line, _) in &rows {
+            assert!(line.chars().count() <= 60, "row fits: {line:?}");
+        }
+        assert!(
+            rows.iter()
+                .filter(|(line, _)| line.starts_with("│"))
+                .count()
+                > 3,
+            "long line wraps to several boxed rows"
+        );
+        // Plain prose gets the result box but no code container inside it.
+        let rows = entry_rows(
+            &Entry {
+                speaker: Speaker::Agent,
+                text: "just words".into(),
+            },
+            60,
+            false,
+            Color::Black,
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|(line, _)| line.starts_with("┌"))
+                .count(),
+            1,
+            "only the result box, no code container"
+        );
+    }
+
+    #[test]
+    fn expanded_tool_output_renders_a_bordered_box() {
+        let mut ui = shell();
+        ui.push(Speaker::User, "run it");
+        let row = ui.entries.len();
+        ui.tool_cells.insert(
+            "t1".into(),
+            ToolCell {
+                title: "shell ls".into(),
+                running: false,
+                ok: true,
+                output: "exit=0\na\nb".into(),
+                elapsed_ms: 42,
+                exit_code: Some(0),
+                row,
+            },
+        );
+        ui.expanded.insert(row);
+        let text = ui.cell_text("t1", &ui.tool_cells["t1"].clone());
+        ui.push(Speaker::Tool, text);
+        let (frame, _) = ui.compose(100, 30);
+        let text = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("┌─ output · exit=0"),
+            "box header names status and exit:\n{text}"
+        );
+        assert!(text.contains("│ a"), "output boxed:\n{text}");
+        assert!(
+            !text.contains("▓WROSE-OUT▓") && !text.contains("▓WROSE-END▓"),
+            "sentinels never reach the screen:\n{text}"
+        );
+        let body = frame
+            .iter()
+            .find(|row| row.text.contains("│ a"))
+            .expect("output row renders");
+        let title = frame
+            .iter()
+            .find(|row| row.text.contains("shell ls"))
+            .expect("title renders");
+        assert_ne!(body.bg, title.bg, "output box contrasts with title");
+    }
+
+    #[test]
+    fn composer_box_glows_cyan_only_while_editing() {
+        let mut ui = shell();
+        fill_transcript(&mut ui, 2);
+        let (frame, _) = ui.compose(100, 30);
+        let bottom = frame
+            .iter()
+            .rfind(|row| row.text.starts_with("└"))
+            .expect("composer box closes");
+        assert_eq!(bottom.fg, theme(0).accent, "focused chrome glows cyan");
+        let prompt = frame
+            .iter()
+            .find(|row| row.text.starts_with("│ >"))
+            .expect("prompt row renders");
+        let walls: Vec<Color> = prompt.colors.clone().expect("walls painted");
+        assert_eq!(walls[0], theme(0).accent, "left wall cyan");
+        assert_eq!(*walls.last().expect("right wall"), theme(0).accent);
+
+        ui.navigation_mode = true;
+        let (frame, _) = ui.compose(100, 30);
+        let bottom = frame
+            .iter()
+            .rfind(|row| row.text.starts_with("└"))
+            .expect("box still closes");
+        assert_eq!(bottom.fg, theme(0).muted, "blurred chrome stays gray");
+    }
+
+    #[test]
+    fn yolo_permission_is_visible_in_splash_and_header() {
+        let mut ui = shell();
+        ui.permission = "yolo".into();
+        let (splash, _) = ui.compose(90, 25);
+        assert!(splash.iter().any(|row| row.text.contains("YOLO")));
+        ui.push(Speaker::System, "working");
+        let (frame, _) = ui.compose(90, 25);
+        assert!(frame.iter().any(|row| row.text.contains("[YOLO]")));
+    }
+
+    #[test]
+    fn boxes_hold_at_every_required_size() {
+        let code = "here:\n```bash\nls -la /home/kali/Desktop\n```";
+        for (w, h) in [(160u16, 45u16), (120, 35), (80, 24)] {
+            let mut ui = shell();
+            ui.push(Speaker::Agent, String::from(code));
+            let (frame, cursor) = ui.compose(w, h);
+            let (w, h) = (w as usize, h as usize);
+            assert_eq!(frame.len(), h);
+            for (index, row) in frame.iter().enumerate() {
+                assert!(
+                    row.text.chars().count() <= w,
+                    "row {index} overflows at {w}x{h}"
+                );
+                assert_ne!(row.bg, Color::Reset, "opaque at {w}x{h}");
+            }
+            assert!(
+                frame.iter().any(|row| row.text.contains("┌─ bash")),
+                "code container at {w}x{h}"
+            );
+            assert!(
+                frame[h - 1].text.contains("Esc cancel"),
+                "footer at {w}x{h}"
+            );
+            assert!(cursor.1 < h as u16, "cursor visible at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn flags_panel_pins_last_five_full_flags() {
+        let mut ui = shell();
+        ui.mode = "CTF".into();
+        fill_transcript(&mut ui, 2);
+        for i in 0..7 {
+            ui.record_flag(
+                format!("HTB{{flag_{i}_y{}}}", "x".repeat(30)),
+                format!("tool:{i}"),
+            );
+        }
+        assert_eq!(ui.flag_log.len(), 7);
+        let (frame, _) = ui.compose(100, 30);
+        let text = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Newest five shown in full — wrapped rows rejoin to the whole flag.
+        let rejoined: String = text
+            .lines()
+            .filter(|line| line.starts_with("│"))
+            .map(|line| {
+                line.strip_prefix("│ ")
+                    .or_else(|| line.strip_prefix("│"))
+                    .unwrap_or(line)
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        for i in 2..7 {
+            assert!(
+                rejoined.contains(&format!("flag_{i}_")),
+                "flag {i} shown whole:\n{text}"
+            );
+        }
+        assert!(
+            !rejoined.contains("flag_0_") && !rejoined.contains("flag_1_"),
+            "older flags fall off the pinned window:\n{text}"
+        );
+        assert!(
+            text.contains("+2 more · /flags"),
+            "exact overflow count:\n{text}"
+        );
+        // Short screens pin two with an exact count instead.
+        let (frame, _) = ui.compose(100, 12);
+        let text = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("FLAGS FOUND") && text.contains("+6 more · /flags"),
+            "compact panel:\n{text}"
+        );
+    }
+
+    #[test]
+    fn git_omitted_from_snapshot_outside_repo() {
+        let mut ui = shell();
+        ui.git_branch.clear();
+        assert!(
+            !ui.session_snapshot().contains("git"),
+            "no GIT outside a repo"
+        );
+        ui.git_branch = "main".into();
+        ui.git_files = 2;
+        ui.git_added = 10;
+        ui.git_removed = 3;
+        let snapshot = ui.session_snapshot();
+        assert!(
+            snapshot.contains("main"),
+            "branch shown in a repo: {snapshot}"
+        );
+        assert!(snapshot.contains("+10"), "{snapshot}");
+    }
+
+    #[test]
+    fn provider_retry_reset_discards_partial_stream_instead_of_committing_it() {
+        let mut ui = shell();
+        ui.apply_progress(Progress::TextDelta("partial failed answer".into()));
+        assert_eq!(ui.draft, "partial failed answer");
+        ui.apply_progress(Progress::ResetText);
+        assert!(ui.draft.is_empty());
+        assert!(
+            !ui.entries
+                .iter()
+                .any(|entry| entry.text.contains("partial failed answer")),
+            "retry leaked a failed partial response into the transcript"
+        );
+        ui.apply_progress(Progress::Heartbeat);
+        assert!(ui.status == "Model active" || ui.status == "Streaming");
     }
 
     #[test]
@@ -8032,9 +12463,10 @@ mod tests {
             "a scrolled-up view stays put while the draft grows"
         );
         assert!(
-            frame[2].text.contains("↓ 0 new lines  (End to jump)"),
-            "the header advertises the jump hint while detached: {:?}",
-            frame[2].text
+            frame
+                .iter()
+                .any(|row| row.text.contains("↓ 0 new lines  (End to jump)")),
+            "the composer rule advertises the jump hint while detached"
         );
 
         ui.scroll_end();
@@ -8048,15 +12480,18 @@ mod tests {
     }
 
     #[test]
-    fn queued_messages_are_visible_in_the_status_line() {
+    fn queued_messages_appear_in_the_composer_rule() {
         let mut ui = shell();
         fill_transcript(&mut ui, 10);
         ui.busy = true;
-        ui.status = "Thinking".into();
         ui.pending.push("second request".into());
         let (frame, _) = ui.compose(80, 24);
-        let status = &frame[19].text;
-        assert!(status.contains("queued 1"), "status: {status}");
+        let rule = frame
+            .iter()
+            .map(|row| &row.text)
+            .find(|text| text.contains("1 queued"))
+            .expect("rule shows the queued count");
+        assert!(rule.contains("Working"), "rule: {rule}");
     }
 
     #[test]
@@ -8176,17 +12611,21 @@ mod tests {
             "the chip does not touch the draft until Enter"
         );
 
-        // The chip owns a row between the separator and the prompt panel.
+        // The chip owns a row between the composer rule and the prompt.
         let (frame, _) = ui.compose(100, 30);
         assert!(
-            frame[26].text.contains("[Pasted 300 lines]"),
-            "chip row: {:?}",
-            frame[26].text
+            frame
+                .iter()
+                .any(|row| row.text.contains("[Pasted 300 lines]")),
+            "chip row present"
         );
         assert!(
-            frame[24].text.contains("Ready") || frame[24].text.starts_with(' '),
-            "the status line shifts up to make room: {:?}",
-            frame[24].text
+            frame[frame.len() - 1].text.contains("Esc cancel"),
+            "footer survives the chip"
+        );
+        assert!(
+            frame[frame.len() - 3].text.contains("◈ BUILD"),
+            "info line survives the chip"
         );
     }
 
@@ -8203,13 +12642,31 @@ mod tests {
             "the draft grows by line"
         );
         let (frame, (_, y)) = ui.compose(100, 30);
-        assert_eq!(y, 29, "the caret sits on the draft's last row");
+        assert_eq!(
+            y, 26,
+            "the caret sits on the draft's last row inside the box"
+        );
         assert!(
-            frame[28].text.starts_with("│ > one"),
+            frame[25].text.starts_with("│ > one"),
             "{:?}",
+            frame[25].text
+        );
+        assert!(frame[26].text.contains("two"), "{:?}", frame[26].text);
+        assert!(
+            frame[27].text.contains("◈ BUILD"),
+            "info line inside the box: {:?}",
+            frame[27].text
+        );
+        assert!(
+            frame[28].text.starts_with("└"),
+            "box closes above the footer: {:?}",
             frame[28].text
         );
-        assert!(frame[29].text.contains("two"), "{:?}", frame[29].text);
+        assert!(
+            frame[29].text.contains("Esc cancel"),
+            "footer owns the last row: {:?}",
+            frame[29].text
+        );
 
         // Ten lines remain in the source while the eight-row viewport follows
         // the caret and makes the earlier rows reachable by moving it up.
@@ -8221,21 +12678,21 @@ mod tests {
         ui.cursor = ui.input.len();
         assert_eq!(wrap_input(&ui.input, 95).len(), 10, "all rows are counted");
         let (frame, (_, y)) = ui.compose(100, 30);
-        assert_eq!(y, 29, "the caret stays on the bottom row of the box");
+        assert_eq!(y, 26, "the caret stays on the bottom row of the box");
         assert!(
-            frame[29].text.contains("line9"),
+            frame[26].text.contains("line9"),
             "the window follows the caret: {:?}",
-            frame[29].text
+            frame[26].text
         );
         assert!(
-            frame[22].text.contains("line2"),
+            frame[19].text.contains("line2"),
             "the viewport shows the latest rows: {:?}",
-            frame[22].text
+            frame[19].text
         );
         assert!(
-            frame[22].text.starts_with("│ ↳ "),
+            frame[19].text.starts_with("│   "),
             "a scrolled window marks its first row: {:?}",
-            frame[22].text
+            frame[19].text
         );
         assert_eq!(
             ui.input.split('\n').count(),
@@ -8246,11 +12703,11 @@ mod tests {
         // The caret walks up: the window follows it back toward the top.
         ui.cursor = 0;
         let (frame, (_, y)) = ui.compose(100, 30);
-        assert_eq!(y, 22, "caret on the first visible row");
+        assert_eq!(y, 19, "caret on the first visible row");
         assert!(
-            frame[22].text.starts_with("│ > line0"),
+            frame[19].text.starts_with("│ > line0"),
             "{:?}",
-            frame[22].text
+            frame[19].text
         );
     }
 
@@ -8464,6 +12921,102 @@ mod tests {
     }
 
     #[test]
+    fn normal_mode_suppresses_ctf_flag_banner_and_panel() {
+        let mut ui = shell();
+        ui.record_flag("flag{old_session}".into(), "saved".into());
+        ui.apply_progress(Progress::FlagFound {
+            flag: "flag{should_be_hidden}".into(),
+            source: "tool".into(),
+        });
+        assert_eq!(ui.flag_log.len(), 1);
+        assert_eq!(ui.flags_found, 1);
+        assert!(!ui
+            .entries
+            .iter()
+            .any(|entry| entry.text.contains("FLAG DETECTED")));
+        let (frame, _) = ui.compose(80, 24);
+        assert!(!frame.iter().any(|row| row.text.contains("FLAGS FOUND")));
+    }
+
+    #[test]
+    fn flags_are_pinned_deduplicated_and_do_not_touch_input() {
+        let mut ui = shell();
+        ui.mode = "CTF".into();
+        ui.set_input("draft text".into());
+        let cursor = ui.cursor;
+        ui.apply_progress(Progress::FlagFound {
+            flag: "flag{one}".into(),
+            source: "tool:stdout".into(),
+        });
+        ui.apply_progress(Progress::FlagFound {
+            flag: "flag{one}".into(),
+            source: "model".into(),
+        });
+        ui.apply_progress(Progress::FlagFound {
+            flag: "HTB{two}".into(),
+            source: "tool:stderr".into(),
+        });
+        assert_eq!(ui.flags_found, 2);
+        assert_eq!(ui.flag_log.len(), 2);
+        assert_eq!(ui.input, "draft text");
+        assert_eq!(ui.cursor, cursor);
+        let (frame, _) = ui.compose(80, 24);
+        let text = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("FLAGS FOUND"));
+        assert!(text.contains("flag{one}"));
+        assert!(text.contains("HTB{two}"));
+        assert!(text.contains("│") && text.contains("╰"));
+    }
+
+    #[test]
+    fn split_stream_flags_from_assistant_and_tool_output_are_pinned() {
+        let mut ui = shell();
+        ui.mode = "CTF".into();
+        ui.set_input("keep me".into());
+        let cursor = ui.cursor;
+        ui.apply_progress(Progress::TextDelta("answer flag{split_".into()));
+        ui.apply_progress(Progress::TextDelta("assistant}".into()));
+        ui.apply_progress(Progress::ToolEnd {
+            id: "stderr-1".into(),
+            ok: true,
+            output: "captured HTB{stderr_case}".into(),
+            elapsed_ms: 1,
+        });
+        assert!(ui
+            .flag_log
+            .iter()
+            .any(|(flag, _)| flag == "flag{split_assistant}"));
+        assert!(ui
+            .flag_log
+            .iter()
+            .any(|(flag, _)| flag == "HTB{stderr_case}"));
+        assert_eq!(ui.input, "keep me");
+        assert_eq!(ui.cursor, cursor);
+    }
+
+    #[test]
+    fn pinned_flags_are_bounded_on_narrow_resize_and_survive_clear() {
+        let mut ui = shell();
+        ui.mode = "CTF".into();
+        for index in 0..40 {
+            ui.apply_progress(Progress::FlagFound {
+                flag: format!("flag{{{index}}}"),
+                source: "stream".into(),
+            });
+        }
+        let (frame, _) = ui.compose(40, 10);
+        assert!(frame.iter().all(|row| row.text.chars().count() <= 40));
+        assert!(frame.iter().any(|row| row.text.contains("more")));
+        ui.clear_transcript();
+        assert_eq!(ui.flag_log.len(), 40);
+        assert_eq!(ui.flags_found, 40);
+    }
+
+    #[test]
     fn rate_limit_errors_classify_separately() {
         assert_eq!(classify_error("HTTP 429 Too Many Requests"), "rate_limit");
         assert_eq!(classify_error("rate limit exceeded"), "rate_limit");
@@ -8572,7 +13125,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for title in [
-            "PROCESSES",
+            "ACTIVITY / PROCESSES",
             "THINKING",
             "TIMELINE",
             "PLAN",
@@ -8615,6 +13168,91 @@ mod tests {
             .join("\n");
         assert!(joined.contains("line one"));
         assert!(joined.contains("line two"));
+    }
+
+    #[test]
+    fn dashboard_shows_every_agent_tool_not_only_shell_processes() {
+        let mut ui = shell();
+        ui.apply_progress(Progress::ToolBegin {
+            id: "read-1".into(),
+            title: "Read read_file src/main.rs".into(),
+        });
+        ui.apply_progress(Progress::ToolBegin {
+            id: "delegate-2".into(),
+            title: "Delegated delegate_task review changes".into(),
+        });
+        let stats = ui.dash_stats();
+        assert_eq!(stats.activities.len(), 2);
+        assert!(stats.activities.iter().all(|activity| activity.running));
+        let panel = dashboard_panels(&stats, 90).remove(0).1.join("\n");
+        assert!(panel.contains("Read  src/main.rs"), "{panel}");
+        assert!(panel.contains("Agent  review changes"), "{panel}");
+
+        ui.apply_progress(Progress::ToolEnd {
+            id: "read-1".into(),
+            ok: true,
+            output: "file contents".into(),
+            elapsed_ms: 18,
+        });
+        let stats = ui.dash_stats();
+        assert!(!stats.activities[1].running);
+        assert_eq!(stats.activities[1].ok, Some(true));
+        assert_eq!(stats.activities[1].elapsed_ms, 18);
+
+        ui.dashboard = true;
+        ui.dash_focus = 0;
+        ui.dash_sel = 0;
+        ui.dash_open();
+        let (title, body) = ui.dash_detail.as_ref().expect("operation detail");
+        assert_eq!(title, "AGENT ACTIVITY");
+        assert!(body.contains("delegate_task"), "{body}");
+        ui.dash_signal(true);
+        assert_eq!(ui.status, "Agent activity is not an OS process");
+    }
+
+    #[test]
+    fn verbose_mode_preserves_individual_read_tool_cells() {
+        let mut ui = shell();
+        ui.verbosity = "verbose".into();
+        ui.apply_progress(Progress::ToolBegin {
+            id: "read-verbose".into(),
+            title: "Read read_file src/main.rs".into(),
+        });
+        assert!(ui.ro_ids.is_empty(), "verbose reads should not be grouped");
+        assert!(ui.tool_rows.contains_key("read-verbose"));
+        ui.apply_progress(Progress::ToolEnd {
+            id: "read-verbose".into(),
+            ok: true,
+            output: "visible read result".into(),
+            elapsed_ms: 5,
+        });
+        let row = *ui.tool_rows.get("read-verbose").expect("tool row");
+        assert!(ui.entries[row].text.contains("visible read result"));
+    }
+
+    #[test]
+    fn dashboard_scrolls_to_selected_tool_in_bounded_process_panel() {
+        let stats = DashStats {
+            activities: (0..30)
+                .map(|index| ActivityStat {
+                    id: format!("a{index}"),
+                    title: format!("Read read_file unique-{index}"),
+                    running: true,
+                    ..ActivityStat::default()
+                })
+                .collect(),
+            ..DashStats::default()
+        };
+        let (frame, _) = compose_grid(&stats, 100, 24, dashboard_theme(true), 0, 25, None);
+        let text = frame
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("unique-25"),
+            "selected row must stay visible: {text}"
+        );
     }
 
     #[test]
@@ -8675,6 +13313,7 @@ mod tests {
     #[test]
     fn result_block_reports_verification_and_failures() {
         let mut ui = shell();
+        ui.verbosity = "verbose".into();
         ui.push(Speaker::Agent, "the flag is flag{ok}");
         ui.task_begin();
         ui.verified = true;
@@ -8701,6 +13340,7 @@ mod tests {
         assert!(text.contains("saved ~"), "{text}");
 
         let mut ui = shell();
+        ui.verbosity = "verbose".into();
         ui.task_begin();
         ui.record_error("network");
         ui.push_result_block(&[]);
@@ -8708,6 +13348,7 @@ mod tests {
         assert!(text.contains("── RESULT ─ ✗ failed"), "{text}");
 
         let mut ui = shell();
+        ui.verbosity = "verbose".into();
         ui.task_begin();
         ui.push_result_block(&[]);
         let text = &ui.entries.last().expect("a result block was pushed").text;
@@ -8886,15 +13527,11 @@ mod tests {
             },
         );
 
-        // Collapsed cells preview first three + last two lines (spec 3.1).
+        // Routine successful cells remain compact in normal mode.
         let cell = ui.tool_cells["t1"].clone();
         let text = ui.cell_text("t1", &cell);
-        assert!(text.contains("✓ shell ls  1.5s"), "{text}");
-        assert!(text.contains("⋮ 5 more lines"), "{text}");
-        assert!(
-            text.contains("line 1") && text.contains("line 10"),
-            "{text}"
-        );
+        assert!(text.contains("✓  shell ls   1.5s"), "{text}");
+        assert!(text.contains("10 lines · line 10"), "{text}");
         assert!(!text.contains("line 6"), "{text}");
 
         // Enter / Ctrl+O expands, and a second press collapses again.
@@ -8921,8 +13558,8 @@ mod tests {
         );
         let cell = ui.tool_cells["t2"].clone();
         let text = ui.cell_text("t2", &cell);
-        assert!(text.contains("✗ shell false"), "{text}");
-        assert!(text.contains("└ exit 1"), "{text}");
+        assert!(text.contains("×  shell false"), "{text}");
+        assert!(text.contains("▓WROSE-OUT▓ exit=1"), "{text}");
         assert!(text.contains("boom"), "{text}");
 
         // A running cell shows no output until it finishes.
@@ -8940,7 +13577,7 @@ mod tests {
         );
         let cell = ui.tool_cells["t3"].clone();
         let text = ui.cell_text("t3", &cell);
-        assert!(text.contains("shell sleep  …"), "{text}");
+        assert!(text.contains("◌  shell sleep"), "{text}");
         assert!(!text.contains("hidden"), "{text}");
     }
 
@@ -8973,7 +13610,7 @@ mod tests {
         );
         let tree = ui.child_lines("g1", 1);
         assert!(tree.contains("├─ ✓ read a.rs  0.1s"), "{tree}");
-        assert!(tree.contains("└─ ⠋ grep b  …"), "{tree}");
+        assert!(tree.contains("└─ ◌ grep b  …"), "{tree}");
 
         // The collapsed `▸ Explored` group counts finished work and still
         // marks in-flight children.
@@ -8988,6 +13625,6 @@ mod tests {
             searches: 0,
             inflight: 1,
         };
-        assert_eq!(group_text(&live), "⠋ ▸ Explored  1 file · 0 searches  …");
+        assert_eq!(group_text(&live), "◌ ▸ Exploring  1 file · 0 searches");
     }
 }

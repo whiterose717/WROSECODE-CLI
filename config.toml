@@ -5,10 +5,10 @@
 # CLI flags always win over the values here.
 
 [ui]
-# dark | light | solarized | dracula | nord | wrose-dark
-theme = "wrose-dark"
+# studio | dark | light | solarized | dracula | nord | wrose-dark
+theme = "studio"
 # compact | normal | verbose
-verbosity = "normal"
+verbosity = "verbose"
 alternate_screen = true
 # off = native terminal text selection (default); "on" enables click-to-expand
 # and wheel handling inside the app (WROSECODE_MOUSE=1 does the same).
@@ -22,14 +22,15 @@ smooth_scroll_lines = 1
 # Thinking mode: off | low | medium | high | max | auto. Ctrl+T cycles it,
 # /think <level> sets it, --think overrides it. auto starts at medium,
 # escalates after repeated failures, and drops back after progress.
-think = "medium"
+think = "auto"
 # 0 = answer immediately, 20 = longest reasoning budget — the strength the
 # mode above maps to (only used when no think mode is configured).
 thinking_level = 5
 # Upper bound for the worker pool. The agent lowers this itself for easy turns.
 max_parallel_tasks = 20
 # Wall-clock limit for a single `shell` command before it is killed.
-shell_timeout_seconds = 30
+# Long archive/build/CTF commands may override this per call up to 3600s.
+shell_timeout_seconds = 60
 tool_retries = 3
 fallback_provider = ""
 fallback_model = ""

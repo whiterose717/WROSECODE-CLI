@@ -27,11 +27,11 @@ static FIRST_PAINT_MS: OnceLock<u128> = OnceLock::new();
 /// The wordmark. Lives here because the splash owns branding; `Ui::compose`
 /// renders the same block as its header while the transcript is empty.
 pub const LOGO: [&str; 5] = [
-    "██╗    ██╗██████╗  ██████╗ ███████╗███████╗ ██████╗ ██████╗ ███████╗",
-    "██║    ██║██╔══██╗██╔═══██╗██╔════╝██╔════╝██╔════╝██╔═══██╗██╔════╝",
-    "██║ █╗ ██║██████╔╝██║   ██║███████╗█████╗  ██║     ██║   ██║█████╗  ",
-    "██║███╗██║██╔══██╗██║   ██║╚════██║██╔══╝  ██║     ██║   ██║██╔══╝  ",
-    "╚███╔███╔╝██║  ██║╚██████╔╝███████║███████╗╚██████╗╚██████╔╝███████╗",
+    "██╗    ██╗██████╗  ██████╗ ███████╗███████╗ ██████╗ ██████╗  ██████╗ ███████╗",
+    "██║    ██║██╔══██╗██╔═══██╗██╔════╝██╔════╝██╔════╝██╔═══██╗██╔══██╗██╔════╝",
+    "██║ █╗ ██║██████╔╝██║   ██║███████╗█████╗  ██║     ██║   ██║██║  ██║█████╗  ",
+    "██║███╗██║██╔══██╗██║   ██║╚════██║██╔══╝  ██║     ██║   ██║██║  ██║██╔══╝  ",
+    "╚███╔███╔╝██║  ██║╚██████╔╝███████║███████╗╚██████╗╚██████╔╝ ██████╔╝███████╗",
 ];
 
 /// Milliseconds from process start to the first painted frame, recorded by
@@ -138,6 +138,7 @@ fn reveal_lines(mut lines: Vec<String>, stage: u8) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::ColorSupport;
 
     #[test]
     fn budget_is_fifty_milliseconds() {
@@ -149,6 +150,7 @@ mod tests {
         let lines = banner(Some(12));
         assert_eq!(lines.len(), 8, "five logo rows, version, status, timing");
         assert!(lines[0].starts_with("██╗"));
+        assert!(lines[5].starts_with("  WROSECODE v"));
         assert!(
             lines[5].contains(env!("CARGO_PKG_VERSION")),
             "the version row: {:?}",
@@ -164,6 +166,18 @@ mod tests {
             "the timing row: {:?}",
             lines[7]
         );
+    }
+
+    #[test]
+    fn wide_banner_keeps_all_logo_rows_intact() {
+        let lines = paint_lines(80, ColorSupport::None, None);
+        let logo: Vec<_> = LOGO.iter().map(|line| (*line).to_string()).collect();
+        assert_eq!(&lines[..LOGO.len()], logo.as_slice());
+        assert!(lines[LOGO.len()].starts_with("  WROSECODE v"));
+        // The middle rows contain the distinctive vertical/rounded D glyph
+        // immediately before the final E; this guards against reverting to
+        // the old eight-glyph WROSECOE artwork.
+        assert!(LOGO[2].contains("██║  ██║█████╗"));
     }
 
     #[test]

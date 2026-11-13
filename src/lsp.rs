@@ -104,6 +104,23 @@ impl Lsp {
         }
     }
 
+    /// Live servers for the TUI sidebar: (server key, ready). Empty when LSP
+    /// is disabled or nothing has spawned yet — the sidebar omits the section.
+    /// Read-only and lock-free for the caller (the caller already holds the
+    /// mutex); never spawns anything.
+    pub fn live_servers(&self) -> Vec<(String, bool)> {
+        if !self.settings.enabled {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, bool)> = self
+            .servers
+            .iter()
+            .map(|(key, server)| (key.clone(), server.ready))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Fast warm-up: spawn the server for this file's language and write the
     /// `initialize` request, without waiting for the reply. Called when a
     /// file is read, which usually happens before the edit that needs the
@@ -122,12 +139,26 @@ impl Lsp {
         if self.servers.contains_key(&key) || self.dead.contains(&key) {
             return;
         }
-        if let Err(error) = self.spawn(&key, &argv).await {
+        if self.spawn(&key, &argv).await.is_err() {
             // A missing binary is normal; remember it so every later edit
-            // does not pay the spawn attempt again.
-            eprintln!("lsp: {error:#}");
+            // does not pay the spawn attempt again. Never eprintln here:
+            // the TUI owns the terminal while agent tasks run, and raw
+            // stderr bytes corrupt the active frame (they surfaced inside
+            // the composer). State stays queryable via `dead_servers`.
             self.dead.insert(key);
         }
+    }
+
+    /// Server keys that failed to start or initialize and will not be
+    /// retried — e.g. a missing `typescript-language-server` binary. Read-only
+    /// surfacing for the TUI's Ctrl+B snapshot; never spawns anything.
+    pub fn dead_servers(&self) -> Vec<String> {
+        if !self.settings.enabled {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = self.dead.iter().cloned().collect();
+        out.sort();
+        out
     }
 
     /// The diagnostics for a file right after we wrote it, rendered for the
@@ -143,12 +174,11 @@ impl Lsp {
         if self.dead.contains(&key) {
             return None;
         }
-        if !self.servers.contains_key(&key) {
-            if let Err(error) = self.spawn(&key, &argv).await {
-                eprintln!("lsp: {error:#}");
-                self.dead.insert(key);
-                return None;
-            }
+        if !self.servers.contains_key(&key) && self.spawn(&key, &argv).await.is_err() {
+            // Same rule as `spawn_for`: no raw stderr while the TUI may
+            // own the screen; the failure stays visible via `dead_servers`.
+            self.dead.insert(key);
+            return None;
         }
         self.await_initialize(&key).await?;
 
@@ -573,6 +603,30 @@ mod tests {
         let bytes = b"Content-Type: application/vscode-jsonrpc\r\n\r\n{}";
         let mut reader = BufReader::new(bytes.as_slice());
         assert!(read_frame(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dead_servers_surface_without_touching_the_terminal() {
+        let root = dir("dead");
+        let mut settings = LspSettings::default();
+        settings.commands.insert(
+            "zz".to_string(),
+            vec!["wrosecode-definitely-missing-lsp".to_string()],
+        );
+        let mut lsp = Lsp::new(root.clone(), settings);
+        let target = Path::new("x.zz");
+        // A missing binary degrades silently: no eprintln may escape while
+        // the TUI owns the screen (it used to corrupt the composer frame).
+        lsp.spawn_for(target).await;
+        let dead = lsp.dead_servers();
+        assert_eq!(dead.len(), 1, "one failed server recorded: {dead:?}");
+        assert!(
+            dead[0].contains("wrosecode-definitely-missing-lsp"),
+            "names the binary: {dead:?}"
+        );
+        // …and diagnostics stay silent for it from then on.
+        assert!(lsp.diagnostics_after_edit(target).await.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

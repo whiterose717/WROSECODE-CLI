@@ -1,6 +1,6 @@
 {
   "name": "wrosecode",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A terminal coding agent written in Rust",
   "license": "MIT",
   "keywords": [

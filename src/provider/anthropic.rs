@@ -106,6 +106,14 @@ impl Anthropic {
 
 #[async_trait]
 impl Provider for Anthropic {
+    fn capabilities(&self) -> super::ProviderCapabilities {
+        // Anthropic supports explicit `cache_control` prefix caching and
+        // native extended-thinking budgets.
+        super::ProviderCapabilities::baseline()
+            .cached()
+            .with_reasoning_controls()
+    }
+
     async fn chat_stream_with_think(
         &self,
         system: &str,
@@ -144,9 +152,10 @@ impl Provider for Anthropic {
         let mut stream = resp.bytes_stream();
         let mut pending = Vec::new();
         let mut blocks: BTreeMap<usize, StreamBlock> = BTreeMap::new();
+        let mut first_delta = false;
         let mut usage = Usage::default();
         loop {
-            let next = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+            let next = tokio::time::timeout(super::STREAM_IDLE_TIMEOUT, stream.next())
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!("provider stream timed out while waiting for output")
@@ -154,8 +163,12 @@ impl Provider for Anthropic {
             let Some(chunk) = next else {
                 break;
             };
-            pending.extend_from_slice(&chunk?);
-            while let Some(event) = super::take_sse_event(&mut pending) {
+            let chunk = chunk.context("Anthropic stream failed")?;
+            if let Some(tx) = progress {
+                let _ = tx.send(Progress::Heartbeat);
+            }
+            pending.extend_from_slice(&chunk);
+            for event in super::take_sse_events(&mut pending)? {
                 for line in event.lines().filter_map(|line| line.strip_prefix("data: ")) {
                     let data: Value =
                         serde_json::from_str(line).context("invalid Anthropic stream event")?;
@@ -197,6 +210,13 @@ impl Provider for Anthropic {
                                     StreamBlock::Text(text) => {
                                         let piece = delta["text"].as_str().unwrap_or_default();
                                         text.push_str(piece);
+                                        if !first_delta {
+                                            first_delta = true;
+                                            crate::trace::global_event(
+                                                "provider_first_delta",
+                                                "anthropic",
+                                            );
+                                        }
                                         if let Some(tx) = progress {
                                             let _ = tx.send(Progress::TextDelta(piece.into()));
                                         }
@@ -230,10 +250,10 @@ impl Provider for Anthropic {
             content.push(match block {
                 StreamBlock::Text(text) => Content::Text(text),
                 StreamBlock::Tool { id, name, input } => Content::Call(ToolCall {
+                    item_id: None,
                     id,
                     name,
-                    input: serde_json::from_str(if input.is_empty() { "{}" } else { &input })
-                        .context("invalid streamed tool input")?,
+                    input: super::decode_tool_args(&input),
                 }),
             });
         }
@@ -249,30 +269,38 @@ impl Provider for Anthropic {
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         let base = self.endpoint.trim_end_matches("/messages");
-        let mut request = self
-            .client
-            .get(format!("{base}/models"))
-            .header("anthropic-version", "2023-06-01");
-        if !self.key.is_empty() {
-            request = request.header("x-api-key", &self.key);
+        let mut models = Vec::new();
+        // Anthropic pagination (`has_more` + `last_id` via `after_id`),
+        // bounded so a lying pager cannot loop forever.
+        let mut after: Option<String> = None;
+        for _ in 0..10 {
+            let mut url = format!("{base}/models?limit=100");
+            if let Some(cursor) = &after {
+                url.push_str(&format!("&after_id={cursor}"));
+            }
+            let mut request = self
+                .client
+                .get(&url)
+                .header("anthropic-version", "2023-06-01");
+            if !self.key.is_empty() {
+                request = request.header("x-api-key", &self.key);
+            }
+            for (name, value) in &self.headers {
+                request = request.header(name, value);
+            }
+            let response = super::send_retry(request).await?;
+            if !response.status().is_success() {
+                bail!("{}", super::classify_status(response.status()));
+            }
+            let data: Value = response.json().await.context("invalid models response")?;
+            let (page, next) = parse_models_page(&data);
+            models.extend(page);
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
         }
-        for (name, value) in &self.headers {
-            request = request.header(name, value);
-        }
-        let response = super::send_retry(request).await?;
-        if !response.status().is_success() {
-            bail!("{}", super::classify_status(response.status()));
-        }
-        let data: Value = response.json().await.context("invalid models response")?;
-        Ok(data["data"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item["id"].as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(models)
     }
 
     async fn probe_chat(&self) -> anyhow::Result<()> {
@@ -306,6 +334,29 @@ enum StreamBlock {
         name: String,
         input: String,
     },
+}
+
+/// Split one `GET /v1/models` page into model IDs plus the next-page
+/// cursor (`has_more` + `last_id`, falling back to the last item id).
+/// Empty IDs are dropped so a ragged page cannot poison the picker.
+fn parse_models_page(data: &Value) -> (Vec<String>, Option<String>) {
+    let mut models = data["data"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["id"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    models.retain(|id| !id.trim().is_empty());
+    let next = data["has_more"].as_bool().unwrap_or(false).then(|| {
+        data["last_id"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| models.last().cloned())
+    });
+    (models, next.flatten())
 }
 
 #[cfg(test)]
@@ -417,7 +468,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(rx.try_recv().unwrap(), Progress::TextDelta(text) if text == "hello"));
+        let streamed = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+            Progress::TextDelta(text) => Some(text),
+            _ => None,
+        });
+        assert_eq!(streamed.as_deref(), Some("hello"));
         assert!(matches!(&response.content[0], Content::Text(text) if text == "hello"));
         server.await.unwrap();
     }
@@ -483,5 +538,77 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn models_pages_yield_ids_and_cursors() {
+        let page = serde_json::json!({
+            "data": [{"id": "a"}, {"id": "b"}, {"id": ""}, {"nope": 1}],
+            "has_more": true,
+            "last_id": "b",
+        });
+        assert_eq!(
+            parse_models_page(&page),
+            (
+                vec!["a".to_string(), "b".to_string()],
+                Some("b".to_string())
+            ),
+            "empty IDs drop, last_id wins"
+        );
+        let last = serde_json::json!({
+            "data": [{"id": "c"}],
+            "has_more": false,
+        });
+        assert_eq!(
+            parse_models_page(&last),
+            (vec!["c".to_string()], None),
+            "final page has no cursor"
+        );
+        // No last_id: fall back to the last item so pagination continues.
+        let fallback = serde_json::json!({
+            "data": [{"id": "x"}, {"id": "y"}],
+            "has_more": true,
+        });
+        assert_eq!(
+            parse_models_page(&fallback).1,
+            Some("y".to_string()),
+            "cursor falls back to the last id"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_follows_pagination() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for page in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap();
+                let head = String::from_utf8_lossy(&request[..n]).into_owned();
+                let payload = if page == 0 {
+                    assert!(head.starts_with("GET /v1/models"), "{head}");
+                    assert!(head.contains("limit=100"), "{head}");
+                    assert!(!head.contains("after_id"), "{head}");
+                    r#"{"data":[{"id":"a"},{"id":"b"}],"has_more":true,"last_id":"b"}"#
+                } else {
+                    assert!(head.contains("after_id=b"), "{head}");
+                    r#"{"data":[{"id":"c"}],"has_more":false}"#
+                };
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload);
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let provider = Anthropic {
+            client: reqwest::Client::new(),
+            key: "test".into(),
+            model: "test".into(),
+            endpoint: format!("{base}/messages"),
+            headers: BTreeMap::new(),
+            think_map: None,
+        };
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models, vec!["a", "b", "c"], "both pages merge in order");
+        server.await.unwrap();
     }
 }

@@ -16,11 +16,16 @@ pub async fn export(client: &reqwest::Client, snapshot: &MetricsSnapshot) {
             ]}]
         }]
     });
-    let _ = client
-        .post(format!("{}/v1/metrics", endpoint.trim_end_matches('/')))
-        .json(&payload)
-        .send()
-        .await;
+    // Best-effort and bounded: telemetry shares the unbounded streaming
+    // client, so a stalled collector must never hang shutdown or a turn.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client
+            .post(format!("{}/v1/metrics", endpoint.trim_end_matches('/')))
+            .json(&payload)
+            .send(),
+    )
+    .await;
 }
 
 fn gauge(name: &str, value: f64) -> serde_json::Value {

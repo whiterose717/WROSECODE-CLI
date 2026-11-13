@@ -27,6 +27,15 @@ pub struct Session {
     /// The session this one was forked from — the edge `/tree` draws.
     #[serde(default)]
     pub parent: Option<String>,
+    /// Flags discovered during this session. Project-wide detector history
+    /// remains in `.ctf/flags.log`, but the TUI and `/flags` are session-local.
+    #[serde(default)]
+    pub flags: Vec<(String, String)>,
+    /// Web account that owns this session ("" for local CLI sessions).
+    /// Device-bound web requests filter by this so users never see each
+    /// other's histories on a shared device.
+    #[serde(default)]
+    pub account_id: String,
 }
 
 /// Human age for `/sessions` labels and CLI listings.
@@ -91,6 +100,8 @@ impl Session {
             transcript: Vec::new(),
             pinned: Vec::new(),
             parent: None,
+            flags: Vec::new(),
+            account_id: String::new(),
         }
     }
     pub fn dir() -> Result<PathBuf> {
@@ -139,6 +150,7 @@ impl Session {
                             let mut input = call.input.clone();
                             redact_json(&mut input);
                             Content::Call(crate::provider::ToolCall {
+                                item_id: call.item_id.clone(),
                                 id: call.id.clone(),
                                 name: call.name.clone(),
                                 input,
@@ -489,6 +501,7 @@ mod tests {
             content: vec![
                 Content::Text(text.into()),
                 Content::Call(ToolCall {
+                    item_id: None,
                     id: "call-1".into(),
                     name: "shell".into(),
                     input: serde_json::json!({"command": "ls"}),
@@ -633,6 +646,7 @@ mod tests {
             Message {
                 role: "assistant".into(),
                 content: vec![Content::Call(ToolCall {
+                    item_id: None,
                     id: "call-1".into(),
                     name: "shell".into(),
                     input: serde_json::json!({"command": format!("echo {secret}")}),

@@ -58,6 +58,15 @@ impl OpenAiCompat {
 
 #[async_trait]
 impl Provider for OpenAiCompat {
+    fn capabilities(&self) -> super::ProviderCapabilities {
+        // Chat-completions compatible endpoints support automatic prefix
+        // caching; parallel tool calls and strict schemas are model/endpoint
+        // dependent, so they stay off until an adapter can prove them.
+        super::ProviderCapabilities::baseline()
+            .cached()
+            .with_reasoning_controls()
+    }
+
     async fn chat_stream_with_think(
         &self,
         system: &str,
@@ -143,10 +152,12 @@ impl Provider for OpenAiCompat {
         let mut stream = response.bytes_stream();
         let mut pending = Vec::new();
         let mut text = String::new();
+        let mut first_delta = false;
         let mut calls: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
         let mut usage = Usage::default();
-        loop {
-            let next = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+        let mut finished = false;
+        'stream: loop {
+            let next = tokio::time::timeout(super::STREAM_IDLE_TIMEOUT, stream.next())
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!("provider stream timed out while waiting for output")
@@ -154,18 +165,47 @@ impl Provider for OpenAiCompat {
             let Some(chunk) = next else {
                 break;
             };
-            pending.extend_from_slice(&chunk?);
-            while let Some(event) = super::take_sse_event(&mut pending) {
-                for line in event.lines().filter_map(|line| line.strip_prefix("data: ")) {
-                    if line == "[DONE]" {
-                        continue;
+            let chunk = chunk?;
+            if let Some(sender) = progress {
+                let _ = sender.send(Progress::Heartbeat);
+            }
+            pending.extend_from_slice(&chunk);
+            for event in super::take_sse_events(&mut pending)? {
+                for line in event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+                {
+                    if line.trim() == "[DONE]" {
+                        finished = true;
+                        break 'stream;
                     }
                     let value: Value =
                         serde_json::from_str(line).context("invalid streamed response")?;
+                    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+                        bail!(
+                            "provider stream error: {}",
+                            error["message"]
+                                .as_str()
+                                .unwrap_or("unknown provider error")
+                        );
+                    }
+                    if value["choices"].as_array().is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            choice
+                                .get("finish_reason")
+                                .is_some_and(|reason| !reason.is_null())
+                        })
+                    }) {
+                        finished = true;
+                    }
                     update_usage(&mut usage, &value["usage"]);
                     let delta = &value["choices"][0]["delta"];
                     if let Some(piece) = delta["content"].as_str() {
                         text.push_str(piece);
+                        if !first_delta {
+                            first_delta = true;
+                            crate::trace::global_event("provider_first_delta", "openai_compat");
+                        }
                         if let Some(sender) = progress {
                             let _ = sender.send(Progress::TextDelta(piece.into()));
                         }
@@ -188,7 +228,7 @@ impl Provider for OpenAiCompat {
                 }
             }
         }
-        if !pending.is_empty() {
+        if !finished && !pending.is_empty() {
             let event = String::from_utf8_lossy(&pending);
             for line in event.lines().filter_map(|line| line.strip_prefix("data: ")) {
                 if line == "[DONE]" {
@@ -203,16 +243,19 @@ impl Provider for OpenAiCompat {
                 }
             }
         }
+        if !finished {
+            bail!("provider stream ended before completion; partial response discarded");
+        }
         let mut content = Vec::new();
         if !text.is_empty() {
             content.push(Content::Text(text));
         }
         for (_, (id, name, args)) in calls {
             content.push(Content::Call(ToolCall {
+                item_id: None,
                 id,
                 name,
-                input: serde_json::from_str(if args.is_empty() { "{}" } else { &args })
-                    .context("invalid streamed tool input")?,
+                input: super::decode_tool_args(&args),
             }));
         }
         if content.is_empty() {
@@ -225,36 +268,38 @@ impl Provider for OpenAiCompat {
     }
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         let base = self.endpoint.trim_end_matches("/chat/completions");
-        let mut request = self.client.get(format!("{base}/models"));
-        if let Some(key) = &self.key {
-            if !key.is_empty() {
-                request = request.bearer_auth(key);
+        let mut models = Vec::new();
+        // OpenAI-style pagination (`has_more` + `after`): most servers
+        // answer on page one, but large catalogs (proxies, aggregators)
+        // span pages. Bounded so a lying pager cannot loop forever.
+        let mut after: Option<String> = None;
+        for _ in 0..10 {
+            let mut url = format!("{base}/models?limit=100");
+            if let Some(cursor) = &after {
+                url.push_str(&format!("&after={cursor}"));
+            }
+            let mut request = self.client.get(&url);
+            if let Some(key) = &self.key {
+                if !key.is_empty() {
+                    request = request.bearer_auth(key);
+                }
+            }
+            for (name, value) in &self.headers {
+                request = request.header(name, value);
+            }
+            let response = super::send_retry(request).await?;
+            if !response.status().is_success() {
+                bail!("{}", super::classify_status(response.status()));
+            }
+            let data: Value = response.json().await.context("invalid models response")?;
+            let (page, next) = parse_models_page(&data);
+            models.extend(page);
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
             }
         }
-        for (name, value) in &self.headers {
-            request = request.header(name, value);
-        }
-        let response = super::send_retry(request).await?;
-        if !response.status().is_success() {
-            bail!("{}", super::classify_status(response.status()));
-        }
-        let data: Value = response.json().await.context("invalid models response")?;
-        let items = data["data"]
-            .as_array()
-            .or_else(|| data["models"].as_array());
-        Ok(items
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        item["id"]
-                            .as_str()
-                            .or_else(|| item["name"].as_str())
-                            .map(str::to_owned)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(models)
     }
 
     async fn probe_chat(&self) -> anyhow::Result<()> {
@@ -279,6 +324,37 @@ impl Provider for OpenAiCompat {
     }
 }
 
+/// Split one `GET /models` page into model IDs plus the next-page cursor.
+/// Accepts `{"data": [...]}`, `{"models": [...]}`, and bare `[...]` bodies;
+/// IDs come from `id`, falling back to `name`. The cursor follows OpenAI
+/// pagination (`has_more` + last id) and is `None` on the final page.
+fn parse_models_page(data: &Value) -> (Vec<String>, Option<String>) {
+    let items = data
+        .as_array()
+        .or_else(|| data["data"].as_array())
+        .or_else(|| data["models"].as_array());
+    let mut models = items
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item["id"]
+                        .as_str()
+                        .or_else(|| item["name"].as_str())
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    models.retain(|id| !id.trim().is_empty());
+    let next = data["has_more"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| models.last().cloned())
+        .flatten();
+    (models, next)
+}
+
 fn parse_response(data: &Value) -> anyhow::Result<Response> {
     let message = &data["choices"][0]["message"];
     if message.is_null() {
@@ -291,14 +367,15 @@ fn parse_response(data: &Value) -> anyhow::Result<Response> {
     if let Some(calls) = message["tool_calls"].as_array() {
         for call in calls {
             content.push(Content::Call(ToolCall {
+                item_id: None,
                 id: call["id"].as_str().context("tool id missing")?.into(),
                 name: call["function"]["name"]
                     .as_str()
                     .context("function name missing")?
                     .into(),
-                input: serde_json::from_str(
+                input: super::decode_tool_args(
                     call["function"]["arguments"].as_str().unwrap_or("{}"),
-                )?,
+                ),
             }));
         }
     }
@@ -349,6 +426,7 @@ fn estimate_usage(system: &str, messages: &[Message], content: &[Content]) -> Us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn map(level: &str, value: ThinkValue) -> BTreeMap<String, ThinkValue> {
         let mut map = BTreeMap::new();
@@ -413,5 +491,160 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn models_pages_accept_every_list_shape() {
+        // `{"data": [...]}` with `id`.
+        let data = serde_json::json!({
+            "data": [{"id": "a"}, {"id": "b"}],
+            "has_more": true,
+        });
+        assert_eq!(
+            parse_models_page(&data),
+            (
+                vec!["a".to_string(), "b".to_string()],
+                Some("b".to_string())
+            ),
+            "cursor falls back to the last id"
+        );
+        // `{"models": [...]}` with `name` fallback, blank IDs dropped.
+        let named = serde_json::json!({
+            "models": [{"name": "x"}, {"id": ""}, {"id": "y"}],
+        });
+        assert_eq!(
+            parse_models_page(&named),
+            (vec!["x".to_string(), "y".to_string()], None),
+            "name fallback, blanks dropped, no cursor on last page"
+        );
+        // Bare `[...]` bodies some gateways emit.
+        let bare = serde_json::json!([{"id": "z"}]);
+        assert_eq!(
+            parse_models_page(&bare),
+            (vec!["z".to_string()], None),
+            "root arrays parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_follows_pagination() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for page in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap();
+                let head = String::from_utf8_lossy(&request[..n]).into_owned();
+                let payload = if page == 0 {
+                    assert!(head.starts_with("GET /v1/models"), "{head}");
+                    assert!(head.contains("limit=100"), "{head}");
+                    assert!(!head.contains("after="), "{head}");
+                    r#"{"data":[{"id":"m1"},{"id":"m2"}],"has_more":true}"#
+                } else {
+                    assert!(head.contains("after=m2"), "{head}");
+                    r#"{"data":[{"id":"m3"}],"has_more":false}"#
+                };
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload);
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let provider = OpenAiCompat {
+            client: reqwest::Client::new(),
+            endpoint: format!("{base}/chat/completions"),
+            key: None,
+            model: String::new(),
+            headers: BTreeMap::new(),
+            think_map: None,
+        };
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models, vec!["m1", "m2", "m3"], "both pages merge in order");
+        server.await.unwrap();
+    }
+    async fn mock_stream(
+        body: &str,
+        keep_open: bool,
+    ) -> (OpenAiCompat, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let body = body.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 65536];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            socket
+                .write_all(format!("{:x}\r\n{}\r\n", body.len(), body).as_bytes())
+                .await
+                .unwrap();
+            if keep_open {
+                std::future::pending::<()>().await;
+            } else {
+                socket.write_all(b"0\r\n\r\n").await.unwrap();
+            }
+        });
+        (
+            OpenAiCompat {
+                client: reqwest::Client::new(),
+                endpoint,
+                key: None,
+                model: "mock".into(),
+                headers: BTreeMap::new(),
+                think_map: None,
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn done_finishes_without_waiting_for_socket_close() {
+        let (provider, server) = mock_stream(
+            "data:{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata:[DONE]\n\n",
+            true,
+        )
+        .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            provider.chat_stream("test", &[], &[], false, None),
+        )
+        .await;
+        server.abort();
+        let reply = result
+            .expect("DONE must finish while the socket remains open")
+            .unwrap();
+        assert!(matches!(&reply.content[0], Content::Text(text) if text == "Hello"));
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_does_not_execute_partial_tool_calls() {
+        let (provider, server) = mock_stream(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n", false
+        ).await;
+        let error = provider
+            .chat_stream("test", &[], &[], false, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("before completion"), "{error}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_provider_error_preserves_diagnostic() {
+        let (provider, server) = mock_stream(
+            "data: {\"error\":{\"message\":\"model unavailable\"}}\n\n",
+            false,
+        )
+        .await;
+        let error = provider
+            .chat_stream("test", &[], &[], false, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("model unavailable"), "{error}");
+        server.await.unwrap();
     }
 }

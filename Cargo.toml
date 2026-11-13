@@ -1,6 +1,6 @@
 [package]
 name = "wrosecode"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "MIT"
 description = "Terminal coding agent with explicit tool permissions"
@@ -21,9 +21,13 @@ syn = { version = "=2.0.119", features = ["full", "parsing"] }
 toml = "=1.1.6"
 toml_edit = "=0.25.15"
 keyring = { version = "=3.6.1", default-features = false, features = ["linux-native"] }
+libc = "=0.2.190"
 tokio = { version = "=1.47.1", features = ["full"] }
 walkdir = "=2.5.0"
-axum = { version = "=0.8.9", features = ["json"] }
+axum = { version = "=0.8.9", features = ["json", "ws"] }
+tokio-tungstenite = "=0.26.2"
+futures-util = "=0.3.31"
+async-stream = "=0.3.5"
 base64 = "=0.23.1"
 ring = "=0.17.14"
 rand = "=0.10.3"

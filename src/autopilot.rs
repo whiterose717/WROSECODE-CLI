@@ -11,7 +11,9 @@ use crate::ctf::{self, CtfEngine, FlagHit};
 use crate::skills;
 use crate::tools::shell;
 use anyhow::Result;
+use futures::stream::{self, StreamExt};
 use std::collections::BTreeSet;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -22,6 +24,7 @@ use std::time::{Duration, Instant};
 pub struct Scope {
     roots: Vec<PathBuf>,
     hosts: Vec<String>,
+    excluded_hosts: Vec<String>,
 }
 
 impl Scope {
@@ -29,31 +32,87 @@ impl Scope {
     /// directory becomes a root (alongside the session working directory),
     /// a URL contributes its host, and `--remote host:port` adds a host.
     pub fn for_target(target: &str, root: &Path, remote: Option<&str>) -> Self {
-        let mut roots = vec![root.to_path_buf()];
-        let path = Path::new(target);
+        let mut scope =
+            Self::from_parts(root, std::iter::empty::<&str>(), std::iter::empty::<&str>());
+        if let Some(host) = host_entry(target) {
+            scope.hosts.push(host);
+        }
+        if let Some(remote) = remote.and_then(host_entry) {
+            scope.hosts.push(remote);
+        }
+        scope.add_local_root(target);
+        scope.normalize();
+        scope
+    }
+
+    /// Build a bug-bounty allowlist using explicit included hosts only.
+    /// Target URL must not implicitly widen program scope. Local target
+    /// directories are still permitted as workspace roots.
+    /// Excluded hosts always win over includes.
+    pub fn for_bounty<S, E, X, Y>(root: &Path, target: &str, includes: S, excludes: E) -> Self
+    where
+        S: IntoIterator<Item = X>,
+        E: IntoIterator<Item = Y>,
+        X: AsRef<str>,
+        Y: AsRef<str>,
+    {
+        let mut scope = Self::from_parts(root, includes, excludes);
+        scope.add_local_root(target);
+        scope.normalize();
+        scope
+    }
+
+    fn from_parts<S, E, X, Y>(root: &Path, includes: S, excludes: E) -> Self
+    where
+        S: IntoIterator<Item = X>,
+        E: IntoIterator<Item = Y>,
+        X: AsRef<str>,
+        Y: AsRef<str>,
+    {
+        Self {
+            roots: vec![root.to_path_buf()],
+            hosts: includes
+                .into_iter()
+                .filter_map(|entry| host_entry(entry.as_ref()))
+                .collect(),
+            excluded_hosts: excludes
+                .into_iter()
+                .filter_map(|entry| host_entry(entry.as_ref()))
+                .collect(),
+        }
+    }
+
+    fn add_local_root(&mut self, target: &str) {
+        let trimmed = target.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let path = Path::new(trimmed);
         if path.exists() {
             let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            if !roots.contains(&canonical) {
-                roots.push(canonical);
+            if !self.roots.contains(&canonical) {
+                self.roots.push(canonical);
             }
         }
-        let mut hosts = BTreeSet::new();
-        if let Some(host) = url_host(target) {
-            hosts.insert(host);
-        }
-        if let Some(remote) = remote {
-            let normalized = remote
-                .trim()
-                .trim_start_matches("http://")
-                .trim_start_matches("https://");
-            if !normalized.is_empty() {
-                hosts.insert(normalized.to_ascii_lowercase());
-            }
-        }
-        Self {
-            roots,
-            hosts: hosts.into_iter().collect(),
-        }
+    }
+
+    fn normalize(&mut self) {
+        self.hosts.sort();
+        self.hosts.dedup();
+        self.excluded_hosts.sort();
+        self.excluded_hosts.dedup();
+    }
+
+    pub fn allowed_hosts(&self) -> &[String] {
+        &self.hosts
+    }
+
+    pub fn excluded_hosts(&self) -> &[String] {
+        &self.excluded_hosts
+    }
+
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
     }
 
     /// The allowlist line shown when the autopilot starts.
@@ -69,7 +128,14 @@ impl Scope {
         } else {
             self.hosts.join(", ")
         };
-        format!("files {files} · hosts {hosts}")
+        if self.excluded_hosts.is_empty() {
+            format!("files {files} · hosts {hosts}")
+        } else {
+            format!(
+                "files {files} · hosts {hosts} · excluded {}",
+                self.excluded_hosts.join(", ")
+            )
+        }
     }
 
     /// May a write land here? `/tmp` is standard scratch space and the
@@ -92,27 +158,93 @@ impl Scope {
     }
 
     /// Is `host` (bare, `host:port`, or from a URL) on the allowlist? An
-    /// entry without a port matches any port on that host.
+    /// entry without a port matches any port on that host. `*.example.com`
+    /// matches subdomains but not the apex; exclusions are checked first.
     pub fn allows_host(&self, host: &str) -> bool {
-        let host = host.trim().trim_end_matches('/').to_ascii_lowercase();
-        if host.is_empty() {
+        let Some((name, port)) = split_host(host) else {
             return true;
-        }
-        let (name, port) = match host.rsplit_once(':') {
-            Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
-                (name.to_string(), Some(port.to_string()))
-            }
-            _ => (host.clone(), None),
         };
-        self.hosts.iter().any(|allowed| {
-            if let Some((_, allowed_port)) = allowed.rsplit_once(':') {
-                if allowed_port.chars().all(|c| c.is_ascii_digit()) {
-                    return allowed == &host;
-                }
-            }
-            allowed == &name || (allowed == &host && port.is_none())
-        })
+        if self
+            .excluded_hosts
+            .iter()
+            .any(|entry| host_entry_matches(entry, &name, port.as_deref()))
+        {
+            return false;
+        }
+        self.hosts
+            .iter()
+            .any(|entry| host_entry_matches(entry, &name, port.as_deref()))
     }
+}
+
+/// Strip a URL down to its authority, or accept a bare host entry. Returns
+/// `None` for paths, descriptions, and empty input.
+pub fn host_entry(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.contains("://") {
+        return url_host(value);
+    }
+    if value.starts_with('/') || value.contains(char::is_whitespace) {
+        return None;
+    }
+    let authority = value
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if authority.is_empty() {
+        return None;
+    }
+    Some(authority)
+}
+
+/// Split `host`, `host:port`, or a URL into a lowercased name and optional
+/// port. IPv6 literals in brackets are kept intact.
+pub fn split_host(value: &str) -> Option<(String, Option<String>)> {
+    let authority = host_entry(value)?;
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (name, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':').filter(|port| !port.is_empty());
+        return Some((name.to_ascii_lowercase(), port.map(str::to_string)));
+    }
+    match authority.rsplit_once(':') {
+        Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => {
+            Some((name.to_string(), Some(port.to_string())))
+        }
+        _ => Some((authority, None)),
+    }
+}
+
+fn host_entry_matches(entry: &str, name: &str, port: Option<&str>) -> bool {
+    let Some((pattern, entry_port)) = split_host(entry) else {
+        return false;
+    };
+    if let (Some(entry_port), port) = (entry_port.as_deref(), port) {
+        if port != Some(entry_port) {
+            return false;
+        }
+    } else if entry_port.is_some() {
+        // A port-qualified entry never authorizes the same host on another
+        // port or an unspecified one.
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return name.len() > suffix.len()
+            && name.ends_with(suffix)
+            && name.as_bytes()[name.len() - suffix.len() - 1] == b'.';
+    }
+    pattern == name
 }
 
 /// The host inside a URL, lowercased, keeping an explicit port.
@@ -134,30 +266,35 @@ pub fn url_host(url: &str) -> Option<String> {
     Some(authority.to_ascii_lowercase())
 }
 
-/// How far the autopilot may push before it must stop and report:
-/// model turns, total tokens, and wall time. `steps=…,tokens=…,seconds=…`
-/// or a bare number for steps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Optional safety ceilings for the autopilot: model turns, total tokens,
+/// and wall time. Zero means unlimited. The interactive `/ctf` mode defaults
+/// to unlimited so it keeps searching until a flag is verified or the user
+/// cancels; explicit `--budget` values still provide bounded runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Budget {
     pub steps: usize,
     pub tokens: u64,
     pub seconds: u64,
 }
 
-impl Default for Budget {
-    fn default() -> Self {
-        Self {
-            steps: 40,
-            tokens: 300_000,
-            seconds: 1_800,
+impl Budget {
+    pub fn describe(&self) -> String {
+        if self.steps == 0 && self.tokens == 0 && self.seconds == 0 {
+            "unlimited".into()
+        } else {
+            format!(
+                "{} steps / {} tokens / {} seconds",
+                self.steps, self.tokens, self.seconds
+            )
         }
     }
-}
 
-impl Budget {
     pub fn parse(text: &str) -> Result<Self> {
         let text = text.trim();
         if text.is_empty() {
+            return Ok(Self::default());
+        }
+        if text.eq_ignore_ascii_case("unlimited") || text.eq_ignore_ascii_case("none") {
             return Ok(Self::default());
         }
         if !text.contains('=') {
@@ -286,7 +423,6 @@ impl ToolInventory {
 /// Every command degrades to a "not installed" note instead of an error.
 pub async fn triage(root: &Path) -> String {
     let inventory = tool_inventory();
-    let mut lines = vec!["TRIAGE (one parallel batch)".to_string()];
     let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
         .map(|entries| {
             entries
@@ -304,18 +440,24 @@ pub async fn triage(root: &Path) -> String {
         .unwrap_or_default();
     entries.sort();
     entries.truncate(8);
-    lines.push(run_triage(root, "ls -la", &inventory).await);
+
+    // Triage is deliberately read-only, so these independent probes can run
+    // concurrently. Keep the concurrency bounded: a challenge directory may
+    // contain expensive binaries, and unbounded process spawning makes the
+    // agent less responsive rather than faster.
+    let mut commands = vec![(0usize, "ls -la".to_string())];
     if entries.is_empty() {
-        lines.push(run_triage(root, "ls -la", &inventory).await);
+        commands.push((1, "ls -la".to_string()));
     }
-    for path in &entries {
+    for (entry_index, path) in entries.iter().enumerate() {
         let name = shell_quote(&path.display().to_string());
-        for command in [
+        let probes = [
             format!("file {name}"),
             format!("xxd {name} | head -n 8"),
             format!("strings -n 8 {name} | head -n 30"),
-        ] {
-            lines.push(run_triage(root, &command, &inventory).await);
+        ];
+        for (probe_index, command) in probes.into_iter().enumerate() {
+            commands.push((1 + entry_index * 10 + probe_index, command));
         }
         let extension = path
             .extension()
@@ -324,24 +466,41 @@ pub async fn triage(root: &Path) -> String {
             .to_ascii_lowercase();
         match extension.as_str() {
             "png" | "jpg" | "jpeg" | "gif" | "wav" | "mp3" => {
-                lines.push(
-                    run_triage(root, &format!("exiftool {name} | head -n 20"), &inventory).await,
-                );
+                commands.push((
+                    1 + entry_index * 10 + 3,
+                    format!("exiftool {name} | head -n 20"),
+                ));
             }
             "zip" | "tar" | "gz" | "tgz" | "7z" | "rar" => {
-                lines.push(
-                    run_triage(root, &format!("unzip -l {name} | head -n 20"), &inventory).await,
-                );
+                commands.push((
+                    1 + entry_index * 10 + 3,
+                    format!("unzip -l {name} | head -n 20"),
+                ));
             }
             _ => {}
         }
         if inventory.present.iter().any(|tool| tool == "binwalk") {
-            lines.push(run_triage(root, &format!("binwalk {name}"), &inventory).await);
+            commands.push((1 + entry_index * 10 + 4, format!("binwalk {name}")));
         }
         if inventory.present.iter().any(|tool| tool == "checksec") {
-            lines.push(run_triage(root, &format!("checksec --file={name}"), &inventory).await);
+            commands.push((1 + entry_index * 10 + 5, format!("checksec --file={name}")));
         }
     }
+
+    let root = root.to_path_buf();
+    let results = stream::iter(commands.into_iter().map(|(order, command)| {
+        let root = root.clone();
+        let inventory = inventory.clone();
+        async move { (order, run_triage(&root, &command, &inventory).await) }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut results = results;
+    results.sort_by_key(|(order, _)| *order);
+    let mut lines = vec!["TRIAGE (4 bounded read-only workers)".to_string()];
+    lines.extend(results.into_iter().map(|(_, output)| output));
     lines.join("\n")
 }
 
@@ -457,9 +616,9 @@ pub struct Verified {
 ///
 /// * `file:` hits are re-derived: the artifact is re-read and the same flag
 ///   must appear again through the recorded transformation.
-/// * `tool:` hits whose transformation is a decode chain (`hex`, `base64`,
-///   `rot13`, …) are accepted — the chain itself is the evidence recorded in
-///   `.ctf/flags.log`.
+/// * `tool:` hits are trusted execution evidence. Plain output (for example a
+///   remote service printing `HTB{...}`) and decoded output both verify; model
+///   text never uses a `tool:` source.
 /// * `model response` claims are candidates until the same flag also shows
 ///   up from a file or a decode chain.
 ///
@@ -470,21 +629,28 @@ pub fn verify(engine: &CtfEngine, hits: &[FlagHit]) -> Option<Verified> {
     let root = engine.root();
     let mut from_artifact: BTreeSet<&str> = BTreeSet::new();
     for hit in hits {
+        // Same lossy view as the project scan: binary artifacts replay
+        // exactly what the scan saw, so forensics evidence verifies.
         let derived = match hit.source.strip_prefix("file:") {
-            Some(relative) => std::fs::read_to_string(root.join(relative)).is_ok_and(|text| {
-                engine
-                    .detect(&hit.source, &text)
-                    .iter()
-                    .any(|found| found.flag == hit.flag)
-            }),
-            None => hit.source.starts_with("tool:") && hit.transformation != "plain",
+            Some(relative) => std::fs::read(root.join(relative))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .is_some_and(|text| {
+                    engine
+                        .detect(&hit.source, &text)
+                        .iter()
+                        .any(|found| found.flag == hit.flag)
+                }),
+            None => hit.source.starts_with("tool:"),
         };
         if derived {
             from_artifact.insert(hit.flag.as_str());
         }
     }
     for hit in hits {
-        if from_artifact.contains(hit.flag.as_str()) {
+        if from_artifact.contains(hit.flag.as_str())
+            && (hit.source.starts_with("file:") || hit.source.starts_with("tool:"))
+        {
             let evidence = if let Some(path) = hit.source.strip_prefix("file:") {
                 format!("re-derived from {path} via {} decode", hit.transformation)
             } else if hit.transformation != "plain" {
@@ -499,6 +665,107 @@ pub fn verify(engine: &CtfEngine, hits: &[FlagHit]) -> Option<Verified> {
         }
     }
     None
+}
+
+/// Fast local-artifact path: scan a bounded, overlapping window rather than
+/// loading a whole PCAP into memory. A candidate is independently re-read
+/// from its original byte range before it can be reported as verified.
+pub(crate) fn preflight_local_flag(
+    engine: &CtfEngine,
+    root: &Path,
+    target: &str,
+) -> Option<Verified> {
+    const WINDOW_BYTES: usize = 128 * 1024;
+    const OVERLAP_BYTES: usize = 4096;
+    const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+    const PREFLIGHT_BUDGET: Duration = Duration::from_secs(15);
+    let candidate = Path::new(target);
+    let path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES {
+        return None;
+    }
+    let relative = path.strip_prefix(root).unwrap_or(path.as_path());
+    let source = format!("file:{}", relative.display());
+    let mut file = std::fs::File::open(&path).ok()?;
+    let mut block = vec![0_u8; WINDOW_BYTES];
+    let mut overlap = Vec::<u8>::new();
+    let mut consumed = 0_u64;
+    let started = Instant::now();
+    let mut unique: Option<(FlagHit, u64, Vec<u8>)> = None;
+    loop {
+        // A deliberately short local preflight must not become a TUI stall on
+        // a gigabyte-long capture; ambiguous/large inputs fall back to triage.
+        if started.elapsed() > PREFLIGHT_BUDGET {
+            return None;
+        }
+        let size = file.read(&mut block).ok()?;
+        if size == 0 {
+            break;
+        }
+        let start = consumed.saturating_sub(overlap.len() as u64);
+        let mut window = Vec::with_capacity(overlap.len() + size);
+        window.extend_from_slice(&overlap);
+        window.extend_from_slice(&block[..size]);
+        let hits = engine.detect(&source, &String::from_utf8_lossy(&window));
+        for hit in hits {
+            if let Some((existing, _, _)) = &unique {
+                // Multiple distinct plausible flags require further evidence.
+                // Never auto-submit an arbitrary first match.
+                if existing.flag != hit.flag {
+                    return None;
+                }
+            } else {
+                unique = Some((hit, start, window.clone()));
+            }
+        }
+        overlap.clear();
+        overlap.extend_from_slice(&window[window.len().saturating_sub(OVERLAP_BYTES)..]);
+        consumed += size as u64;
+    }
+    let (candidate, offset, original) = unique?;
+    let mut replay = vec![0_u8; original.len()];
+    let mut evidence_file = std::fs::File::open(&path).ok()?;
+    evidence_file.seek(SeekFrom::Start(offset)).ok()?;
+    evidence_file.read_exact(&mut replay).ok()?;
+    if replay != original {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&replay);
+    if !engine
+        .detect(&source, &text)
+        .iter()
+        .any(|hit| hit.flag == candidate.flag && hit.transformation == candidate.transformation)
+    {
+        return None;
+    }
+    let _ = engine.scan(&source, &text);
+    Some(Verified {
+        flag: candidate.flag,
+        evidence: format!(
+            "re-derived from {} at byte offset {} via {} decode",
+            relative.display(),
+            offset,
+            candidate.transformation
+        ),
+    })
+}
+
+/// Keep binary/regex work off Tokio's I/O executor so provider streams,
+/// signal handling, and MCP heartbeats are not starved by a large capture.
+pub(crate) async fn preflight_local_flag_async(
+    engine: CtfEngine,
+    root: PathBuf,
+    target: String,
+) -> Option<Verified> {
+    tokio::task::spawn_blocking(move || preflight_local_flag(&engine, &root, &target))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// A candidate the autopilot saw but could not verify, with what is missing.
@@ -538,6 +805,64 @@ impl Default for Options {
             parallel: 3,
         }
     }
+}
+
+/// Parse the interactive `/ctf` arguments. Targets may be paths, URLs, or a
+/// natural-language description containing spaces; option values are kept
+/// separate so a description cannot accidentally become the last word only.
+pub fn parse_command_args(args: &str) -> Result<Options> {
+    let mut options = Options::default();
+    let mut target = Vec::new();
+    let mut words = args.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        match word {
+            "--flag-format" => {
+                options.flag_format = Some(
+                    words
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--flag-format needs a value"))?
+                        .to_string(),
+                );
+            }
+            "--category" => {
+                options.category = Some(
+                    words
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--category needs a value"))?
+                        .to_string(),
+                );
+            }
+            "--remote" => {
+                options.remote = Some(
+                    words
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--remote needs a value"))?
+                        .to_string(),
+                );
+            }
+            "--budget" => {
+                let value = words
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--budget needs a value"))?;
+                options.budget = Budget::parse(value)?;
+            }
+            "--parallel" => {
+                options.parallel = words
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--parallel needs a number"))?
+                    .parse::<usize>()
+                    .map_err(|_| anyhow::anyhow!("--parallel needs a number"))?;
+            }
+            other if other.starts_with("--") => {
+                anyhow::bail!("unknown flag {other}");
+            }
+            other => target.push(other.trim_matches(|ch| ch == '\"' || ch == '\'')),
+        }
+    }
+    if !target.is_empty() {
+        options.target = target.join(" ");
+    }
+    Ok(options)
 }
 
 /// `ctf-notes.md` — the shared scratch pad: challenge, scope, triage,
@@ -626,21 +951,26 @@ pub fn brief(
             .to_string(),
     };
     format!(
-        "CTF AUTOPILOT — keep working until a flag is verified or the budget stops you.\n\
+        "CTF AUTOPILOT — keep working until a flag is verified, or until the user cancels.\n\
          Target: `{}`\n\
          Category hypothesis: {category}\n\
          Flag format: {}\n\
-         Scope (only these files and hosts; anything else must be approved): {}\n\
+         Scope: {}\n\
          Tools: {}\n\
+         Budget: {}\n\
          {playbook_block}\
          Rules:\n\
-         1. No check-ins: work autonomously inside the scope. Ask only for out-of-scope network,\n\
-            destructive host actions, or input only the user can supply.\n\
+         1. No check-ins: work autonomously. YOLO skips ordinary approval prompts; the scope allowlist\n\
+            and the destructive-command gate always apply. Widen scope with --remote instead of guessing.\n\
          2. Record every dead end in ctf-notes.md so nothing is retried; re-read it when stuck.\n\
          3. Any string matching the flag format is a candidate — verify it (re-derive the decode\n\
             chain, re-run the extraction, or test it against the remote service) before claiming success.\n\
-         4. Fork independent hypotheses with `delegate_task` (clean context each) and use the\n\
-            `decode` tool for encoding sweeps.\n\
+         4. Fork independent hypotheses with `delegate_task`; give each child one falsifiable\n\
+            hypothesis and demand commands/evidence, not speculation. Use `decode` for sweeps.\n\
+         5. Prefer deterministic evidence first: metadata/magic/strings/protocol structure, then\n\
+            exploit/decrypt. If an approach fails, record the exact reason and pivot once.\n\
+         6. A plain flag printed by a real tool or remote response is evidence; model-authored\n\
+            flag text is never evidence. Stop immediately after a verified flag.\n\
          TRIAGE:\n```text\n{triage_report}\n```\n",
         options.target,
         options
@@ -649,6 +979,7 @@ pub fn brief(
             .unwrap_or_else(|| "flag{{…}} / CTF{{…}} / HTB{{…}} / picoCTF{{…}}".into()),
         scope.describe(),
         inventory.describe(),
+        options.budget.describe(),
     )
 }
 
@@ -820,7 +1151,25 @@ pub async fn run(agent: &mut Agent, options: &Options) -> Result<Outcome> {
     if let Some(category) = &options.category {
         agent.ctf.category = category.clone();
     }
+    agent.ctf.begin_run();
     agent.ctf.lock_category();
+    if let Some(verified) =
+        preflight_local_flag_async(agent.ctf.clone(), root.clone(), options.target.clone()).await
+    {
+        println!("SCOPE   {}", scope.describe());
+        println!("TOOLS   local artifact verifier (model probes skipped)");
+        let category = options
+            .category
+            .clone()
+            .unwrap_or_else(|| crate::ctf::categorize(&root, &options.target));
+        agent.ctf.category = category.clone();
+        println!("GUESS   {category}");
+        println!("✔ flag verified: {} ({})", verified.flag, verified.evidence);
+        return Ok(Outcome::Verified {
+            flag: verified.flag,
+            evidence: verified.evidence,
+        });
+    }
     let inventory = tool_inventory();
     println!("SCOPE   {}", scope.describe());
     println!("TOOLS   {}", inventory.describe());
@@ -870,7 +1219,7 @@ pub async fn run(agent: &mut Agent, options: &Options) -> Result<Outcome> {
             head.replace('\n', " ")
         );
         let tokens = agent.usage.input + agent.usage.output;
-        let hits = agent.ctf.recorded_hits();
+        let hits = agent.ctf.current_hits();
         if let Some(verified) = verify(&agent.ctf, &hits) {
             println!("✔ flag verified: {} ({})", verified.flag, verified.evidence);
             return Ok(Outcome::Verified {
@@ -934,10 +1283,16 @@ mod tests {
         let budget = Budget::parse("steps=4,tokens=100,seconds=60").unwrap();
         assert_eq!((budget.steps, budget.tokens, budget.seconds), (4, 100, 60));
         let budget = Budget::parse("tokens=50").unwrap();
-        assert_eq!((budget.steps, budget.tokens), (Budget::default().steps, 50));
+        assert_eq!((budget.steps, budget.tokens), (0, 50));
         assert!(Budget::parse("steps=nan").is_err());
         assert!(Budget::parse("watts=1").is_err());
         assert!(Budget::parse("").is_ok());
+        assert_eq!(Budget::parse("unlimited").unwrap(), Budget::default());
+        assert_eq!(Budget::default().describe(), "unlimited");
+        assert_eq!(
+            Budget::default().exhausted(usize::MAX, u64::MAX, Duration::MAX),
+            None
+        );
 
         let budget = Budget {
             steps: 2,
@@ -951,6 +1306,65 @@ mod tests {
             Some("seconds")
         );
         assert_eq!(budget.exhausted(1, 5, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn local_file_preflight_verifies_plain_and_encoded_evidence() {
+        let root = scratch("preflight");
+        let engine = CtfEngine::new(&root);
+
+        std::fs::write(root.join("plain.txt"), "HTB{fast_local_ok}").unwrap();
+        let verified = preflight_local_flag(&engine, &root, "plain.txt").unwrap();
+        assert_eq!(verified.flag, "HTB{fast_local_ok}");
+        assert!(verified.evidence.contains("plain.txt"));
+
+        std::fs::write(root.join("encoded.txt"), "ZmxhZ3tiZW5jaF9iNjRfb2t9").unwrap();
+        let verified = preflight_local_flag(&engine, &root, "encoded.txt").unwrap();
+        assert_eq!(verified.flag, "flag{bench_b64_ok}");
+
+        // Realistic packet captures exceed the old 2 MiB fast-path ceiling.
+        let mut capture = vec![0_u8; 3 * 1024 * 1024];
+        capture.extend_from_slice(b"CTF{large_capture_verified}");
+        std::fs::write(root.join("capture.pcapng"), capture).unwrap();
+        let verified = preflight_local_flag(&engine, &root, "capture.pcapng").unwrap();
+        assert_eq!(verified.flag, "CTF{large_capture_verified}");
+
+        // A flag spanning two read windows is still detected, and the former
+        // 16 MiB ceiling no longer excludes otherwise ordinary captures.
+        let mut long_capture = vec![0_u8; 17 * 1024 * 1024];
+        let offset = 128 * 1024 - 5;
+        long_capture[offset..offset + 23].copy_from_slice(b"CTF{window_boundary_ok}");
+        std::fs::write(root.join("large.pcapng"), &long_capture).unwrap();
+        let verified = preflight_local_flag(&engine, &root, "large.pcapng").unwrap();
+        assert_eq!(verified.flag, "CTF{window_boundary_ok}");
+
+        // Decoy/ambiguous artifacts must be handed to the solver instead of
+        // claiming that whichever flag appeared first is the true answer.
+        std::fs::write(
+            root.join("ambiguous.txt"),
+            "CTF{first_candidate_ok}\nCTF{second_candidate_ok}",
+        )
+        .unwrap();
+        assert!(preflight_local_flag(&engine, &root, "ambiguous.txt").is_none());
+
+        assert!(preflight_local_flag(&engine, &root, "missing.txt").is_none());
+        assert!(preflight_local_flag(&engine, &root, "https://example.org").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn triage_uses_bounded_workers_and_keeps_probe_order() {
+        let root = scratch("triage-batch");
+        std::fs::write(root.join("challenge.txt"), "not a flag\n").unwrap();
+
+        let report = triage(&root).await;
+
+        assert!(report.starts_with("TRIAGE (4 bounded read-only workers)"));
+        let file = report.find("$ file ").expect("file probe");
+        let xxd = report.find("$ xxd ").expect("hex probe");
+        let strings = report.find("$ strings ").expect("strings probe");
+        assert!(file < xxd && xxd < strings, "probe order changed: {report}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1077,6 +1491,21 @@ mod tests {
     }
 
     #[test]
+    fn plain_tool_output_is_verified_but_model_text_is_not() {
+        let root = scratch("toolverify");
+        let hits = vec![FlagHit {
+            flag: "HTB{remote_service_evidence}".into(),
+            source: "tool:shell-42".into(),
+            transformation: "plain".into(),
+            confidence: 1.0,
+        }];
+        let verified = verify(&CtfEngine::new(&root), &hits).expect("real tool output verifies");
+        assert_eq!(verified.flag, "HTB{remote_service_evidence}");
+        assert!(verified.evidence.contains("tool:shell-42"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn decode_chain_hit_verifies_without_the_artifact() {
         let root = scratch("chainverify");
         let hits = vec![FlagHit {
@@ -1110,5 +1539,26 @@ mod tests {
         let guess = guess_category(&root, "challenge.pcap", "tcpdump: HTTP GET /admin");
         assert_eq!(guess, "forensics");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn interactive_ctf_parser_keeps_description_and_options() {
+        let options = parse_command_args(
+            "\"an ELF challenge with a hidden flag\" --category pwn --parallel 4 --budget steps=8,tokens=9000",
+        )
+        .unwrap();
+        assert_eq!(options.target, "an ELF challenge with a hidden flag");
+        assert_eq!(options.category.as_deref(), Some("pwn"));
+        assert_eq!(options.parallel, 4);
+        assert_eq!(options.budget.steps, 8);
+        assert_eq!(options.budget.tokens, 9000);
+    }
+
+    #[test]
+    fn interactive_ctf_parser_rejects_unknown_options() {
+        let error = parse_command_args("challenge --wat")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown flag --wat"), "{error}");
     }
 }

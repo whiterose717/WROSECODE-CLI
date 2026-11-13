@@ -16,25 +16,60 @@ use crossterm::{
 use regex::Regex;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex, OnceLock,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Process-global ownership bit for raw/alternate-screen state.  The guard,
+/// panic hook, explicit editor suspension, and signal path may all race to
+/// restore the same terminal.  Restoration must therefore be idempotent.
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TERMINAL_ALTERNATE: AtomicBool = AtomicBool::new(false);
+static TERMINAL_MOUSE: AtomicBool = AtomicBool::new(false);
+
+/// Mark the terminal as owned after raw mode and all requested terminal modes
+/// have been entered successfully.
+pub fn arm_terminal(alternate: bool, mouse: bool) {
+    // The guard may run without the alternate screen or mouse capture. Never
+    // send an unmatched LeaveAlternateScreen to the user's terminal.
+    TERMINAL_ALTERNATE.store(alternate, Ordering::Relaxed);
+    TERMINAL_MOUSE.store(mouse, Ordering::Relaxed);
+    TERMINAL_ACTIVE.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+pub fn terminal_active() -> bool {
+    TERMINAL_ACTIVE.load(Ordering::Acquire)
+}
 
 /// Put the terminal back into cooked mode on the primary screen.
 ///
-/// Every sequence is emitted unconditionally: disabling a mode that was never
-/// enabled is a no-op in every terminal emulator, while *forgetting* to disable
-/// one that was is a permanent glitch.
+/// This is deliberately idempotent: normal `Drop`, the panic hook, `/editor`,
+/// and a signal may all call it.  Only the caller that flips the ownership bit
+/// emits teardown sequences, preventing duplicate `LeaveAlternateScreen` and
+/// mouse-mode escapes from corrupting the user's shell.
 pub fn restore() {
+    if !TERMINAL_ACTIVE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let alternate = TERMINAL_ALTERNATE.swap(false, Ordering::AcqRel);
+    let mouse = TERMINAL_MOUSE.swap(false, Ordering::AcqRel);
     let _ = terminal::disable_raw_mode();
     let _ = execute!(
         std::io::stdout(),
         SetForegroundColor(crossterm::style::Color::Reset),
         ResetColor,
         cursor::Show,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen
+        DisableBracketedPaste
     );
+    if mouse {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
+    if alternate {
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    }
     let _ = std::io::stdout().flush();
 }
 
@@ -83,7 +118,7 @@ pub fn install_panic_hook(root: Option<PathBuf>) {
     }));
 }
 
-/// Register SIGINT / SIGTERM handlers that restore the terminal before the
+/// Register SIGINT / SIGTERM / SIGHUP handlers that restore the terminal before the
 /// process dies. Returns `false` when the platform has no signal support.
 pub fn install_signal_handlers() -> bool {
     #[cfg(unix)]
@@ -98,6 +133,9 @@ pub fn install_signal_handlers() -> bool {
                     std::process::exit(130);
                 }
             };
+            // Terminal disconnection (SSH hangup / PTY close) needs cleanup,
+            // too. If unsupported, leave this branch permanently pending.
+            let mut hup = signal(SignalKind::hangup()).ok();
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     restore();
@@ -106,6 +144,16 @@ pub fn install_signal_handlers() -> bool {
                 _ = term.recv() => {
                     restore();
                     std::process::exit(143);
+                }
+                _ = async {
+                    if let Some(signal) = &mut hup {
+                        let _ = signal.recv().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    restore();
+                    std::process::exit(129);
                 }
             }
         });
@@ -221,7 +269,7 @@ fn redactor() -> &'static Regex {
     REDACTOR.get_or_init(|| {
         Regex::new(
             r#"(?xi)
-            (?P<prefix>\b(?:api[_-]?key|apikey|token|secret|passwd|password|authorization)\b\s*[=:]\s*)(?P<value>[^\s"',;]+)
+            (?P<prefix>\b(?:api[_-]?key|apikey|token|secret|passwd|password|authorization)\b\s*[=:]\s*)(?P<value>(?:(?:bearer|basic|token)\s+)?[^\s"',;]+)
             | (?P<directive>\b(?:bearer|basic|token)\s+)(?P<bearer>[A-Za-z0-9._~+/=-]{8,})
             | (?P<aws>AKIA[0-9A-Z]{16})
             | (?P<github>(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})
@@ -275,11 +323,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restore_is_safe_to_call_without_a_tui() {
-        // Emitting the teardown sequences on a non-raw terminal is a no-op;
-        // the point is that it never panics or hangs.
+    fn restore_is_idempotent_and_tracks_terminal_ownership() {
         restore();
+        assert!(!terminal_active());
+        arm_terminal(false, false);
+        assert!(terminal_active());
         restore();
+        assert!(!terminal_active());
+        // A second teardown must be a no-op rather than emitting another
+        // LeaveAlternateScreen sequence.
+        restore();
+        assert!(!terminal_active());
     }
 
     #[test]
@@ -288,6 +342,7 @@ mod tests {
             "ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnop",
             "api_key: super-secret-value",
             "Authorization: Bearer eyJhbGciOi.eyJzdWIi.SflKxwRJ",
+            "Authorization: Bearer SECRET-TOKEN-123",
             "aws_key AKIAIOSFODNN7EXAMPLE",
             "token ghp_abcdefghijklmnopqrstuv",
             "slack xoxb-1234567890-abcdef",
@@ -301,10 +356,16 @@ mod tests {
                     && !redacted.contains("sk-ant-abcdefghijklmnop")
                     && !redacted.contains("AKIAIOSFODNN7EXAMPLE")
                     && !redacted.contains("ghp_abcdefghijklmnopqrstuv")
-                    && !redacted.contains("xoxb-1234567890-abcdef"),
+                    && !redacted.contains("xoxb-1234567890-abcdef")
+                    && !redacted.contains("SECRET-TOKEN-123"),
                 "leaked: {redacted}"
             );
         }
+        let header = redact("Authorization: Bearer SECRET-TOKEN-123");
+        assert_eq!(
+            header, "Authorization: ***",
+            "the header name should stay readable but the value must vanish"
+        );
     }
 
     #[test]
