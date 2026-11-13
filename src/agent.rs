@@ -2064,7 +2064,7 @@ fn quick_directory_command(query: &str, project_root: &std::path::Path) -> Optio
     };
     if count {
         Some(format!(
-            "find {root} -mindepth 1 -maxdepth 1 -type d | wc -l"
+            "find {root} -mindepth 1 -maxdepth 1 -type d | awk 'END {{ print NR }}'"
         ))
     } else {
         // 'list dir' is an ordinary listing of files and folders. Explicit
