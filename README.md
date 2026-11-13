@@ -66,7 +66,7 @@ These are previews of the **separate companion Web Console**, not the native CLI
 Requires **Node.js 18+** and network access on the first installation/run to download the native executable.
 
 ```bash
-npm install --global wrosecode@latest
+npm install -g wrosecode
 wrosecode --version
 wrosecode
 ```
@@ -80,8 +80,8 @@ npx wrosecode
 Update or uninstall:
 
 ```bash
-npm install --global wrosecode@latest
-npm uninstall --global wrosecode
+npm install -g wrosecode@latest
+npm uninstall -g wrosecode
 ```
 
 The npm package is a small JavaScript launcher, not a bundled Rust binary. It downloads the **matching native release asset** from [GitHub Releases](https://github.com/whiterose717/WROSECODE-CLI/releases) and verifies its **SHA-256 checksum**. If your npm version disables lifecycle scripts by default, the launcher downloads the verified binary when first run.
