@@ -230,7 +230,7 @@ pub fn signal(pid: u32, kill: bool) -> Result<String> {
 
 /// Average CPU percent since spawn and resident set size, read from procfs.
 /// Non-Linux platforms get `(None, None)` and the panel prints `n/a`.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub fn proc_usage(pid: u32) -> (Option<f64>, Option<u64>) {
     #[cfg(target_os = "linux")]
     {
