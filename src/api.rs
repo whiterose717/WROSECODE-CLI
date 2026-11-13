@@ -14,6 +14,7 @@ type AxumResponse = Response;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
+#[cfg(unix)]
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{

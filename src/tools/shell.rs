@@ -345,6 +345,13 @@ fn proc_usage_tree(root_pid: u32) -> (Option<f64>, Option<u64>) {
     (Some(cpu_ticks as f64 / hz / elapsed * 100.0), Some(rss_kb))
 }
 
+// On platforms without Linux procfs, the dashboard reports unavailable
+// process metrics rather than failing to compile or reporting invented data.
+#[cfg(not(target_os = "linux"))]
+fn proc_usage_tree(_root_pid: u32) -> (Option<f64>, Option<u64>) {
+    (None, None)
+}
+
 #[cfg(target_os = "linux")]
 fn pid_started(pid: u32) -> Option<Instant> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;

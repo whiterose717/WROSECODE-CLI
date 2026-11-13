@@ -583,12 +583,12 @@ mod tests {
             expires_at: now_secs() + 100,
             account_id: None,
         };
-        let path = store_tokens(&dir, "openai", &tokens).unwrap();
+        let _path = store_tokens(&dir, "openai", &tokens).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&_path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
         }

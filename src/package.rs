@@ -621,6 +621,7 @@ mod tests {
         std::fs::write(source.join("SKILL.md"), skill_md("pack")).unwrap();
         std::fs::write(source.join("a/SKILL.md"), skill_md("pack-deep")).unwrap();
         std::fs::write(source.join("a/b/SKILL.md"), skill_md("too-deep")).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/passwd", source.join("link.md")).unwrap();
 
         let names = install(&skills_dir, source.to_str().unwrap())
@@ -633,6 +634,7 @@ mod tests {
             !skills_dir.join("pack/a/b").exists(),
             "files past the depth cap must not be copied"
         );
+        #[cfg(unix)]
         assert!(!skills_dir.join("pack/link.md").exists(), "symlink copied");
 
         // An oversize file rejects the whole package.
