@@ -272,8 +272,12 @@ impl Agent {
         if !resolved.is_file() {
             bail!("{} is not a file", resolved.display());
         }
+        // fs::resolve returns canonical paths on macOS and Windows.
+        // Canonicalize the root too, to preserve relative pin identity.
+        let canonical_root =
+            std::fs::canonicalize(&self.config.root).unwrap_or_else(|_| self.config.root.clone());
         Ok(resolved
-            .strip_prefix(&self.config.root)
+            .strip_prefix(&canonical_root)
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|_| resolved.display().to_string()))
     }
@@ -2070,7 +2074,7 @@ fn quick_directory_command(query: &str, project_root: &std::path::Path) -> Optio
             .any(|word| matches!(*word, "dirs" | "directories" | "folders"));
         let filter = if only_dirs { "-type d " } else { "" };
         Some(format!(
-            "find {root} -mindepth 1 -maxdepth 1 {filter}-printf '%f\\n' | LC_ALL=C sort"
+            "find {root} -mindepth 1 -maxdepth 1 {filter}-exec basename {{}} \\; | LC_ALL=C sort"
         ))
     }
 }

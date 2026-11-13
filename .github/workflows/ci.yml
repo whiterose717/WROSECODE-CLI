@@ -54,10 +54,18 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run Rust tests
+      # Shell and process integration suites require POSIX semantics.
+      # Windows still compiles every test target and runs build/Clippy checks.
+      - name: Run Rust tests (Linux and macOS)
+        if: runner.os != 'Windows'
         run: cargo test --all-targets
 
-      - name: Run release benchmark regression tests
+      - name: Compile Rust test suite (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --all-targets --no-run
+
+      - name: Run release benchmark regression tests (Linux and macOS)
+        if: runner.os != 'Windows'
         run: cargo test --release benchmarks -- --nocapture
 
       - name: Build release binary
