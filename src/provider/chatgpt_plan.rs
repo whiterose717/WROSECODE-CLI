@@ -102,7 +102,6 @@ impl PendingFunctionCall {
 pub struct ChatGptPlan {
     pub client: reqwest::Client,
     pub model: String,
-    pub credentials: Credentials,
     store: Store,
     label: String,
     refresh_lock: Arc<Mutex<()>>,
@@ -112,14 +111,13 @@ impl ChatGptPlan {
     pub fn new(
         client: reqwest::Client,
         model: &str,
-        credentials: Credentials,
+        _credentials: Credentials,
         store: Store,
         label: &str,
     ) -> Self {
         Self {
             client,
             model: model.into(),
-            credentials,
             store,
             label: label.into(),
             refresh_lock: Arc::new(Mutex::new(())),
@@ -129,8 +127,7 @@ impl ChatGptPlan {
     async fn access_token(&self) -> Result<String> {
         // A long-lived CLI process, another terminal, or an OAuth login may
         // have rotated its credentials after this provider was constructed.
-        // Always use the current on-disk token; self.credentials is only the
-        // immutable snapshot from construction time.
+        // Always use the current on-disk token rather than a login snapshot.
         let current = self
             .store
             .account(&self.label)?

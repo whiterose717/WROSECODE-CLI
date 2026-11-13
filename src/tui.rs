@@ -559,15 +559,24 @@ struct Entry {
     text: String,
 }
 
-/// Wrap-cache bookkeeping for one transcript entry: where its rows live in
-/// the flattened transcript, how many rows it owns (including the blank
-/// separator), and the revision that produced them.
+/// Offset of one entry in the flattened transcript cache.
 #[derive(Clone, Copy, Debug)]
 struct EntryRowsMeta {
     start: usize,
-    count: usize,
-    revision: u64,
 }
+
+/// Lightweight idle checkpoint revision key, shared by pending and saved
+/// versions to avoid excessive tuple type complexity.
+type CheckpointVersion = (
+    u64,
+    usize,
+    usize,
+    usize,
+    String,
+    String,
+    Vec<String>,
+    String,
+);
 
 /// Streaming state for the assistant body renderer. The full renderer and
 /// the incremental draft cache both drive this machine, so the live draft is
@@ -1880,7 +1889,6 @@ impl Ui {
         self.line_origin.truncate(start);
         self.entry_rows_meta.truncate(first_stale);
         for (index, entry) in self.entries.iter().enumerate().skip(first_stale) {
-            let revision = self.entry_revisions.get(index).copied().unwrap_or_default();
             let begin = self.transcript_lines.len();
             let wrapped = entry_rows(entry, left_width, verbose, panel);
             let count = wrapped.len();
@@ -1891,11 +1899,7 @@ impl Ui {
             self.transcript_lines.push(String::new());
             self.transcript_bg.push(None);
             self.line_origin.push(index);
-            self.entry_rows_meta.push(EntryRowsMeta {
-                start: begin,
-                count: count + 1,
-                revision,
-            });
+            self.entry_rows_meta.push(EntryRowsMeta { start: begin });
         }
         self.transcript_rebuilds += 1;
         self.entries_rewrapped += self.entries.len().saturating_sub(first_stale) as u64;
@@ -6166,26 +6170,8 @@ pub async fn run(
     let mut checkpoint: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
     // Compare lightweight state versions before cloning a long transcript
     // for an idle checkpoint. Failed saves are never marked persisted.
-    let mut saved_checkpoint_version: Option<(
-        u64,
-        usize,
-        usize,
-        usize,
-        String,
-        String,
-        Vec<String>,
-        String,
-    )> = None;
-    let mut pending_checkpoint_version: Option<(
-        u64,
-        usize,
-        usize,
-        usize,
-        String,
-        String,
-        Vec<String>,
-        String,
-    )> = None;
+    let mut saved_checkpoint_version: Option<CheckpointVersion> = None;
+    let mut pending_checkpoint_version: Option<CheckpointVersion> = None;
     let mut last_spin = std::time::Instant::now();
     let mut last_tip = std::time::Instant::now();
     let mut last_chrome = std::time::Instant::now()

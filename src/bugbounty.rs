@@ -1561,7 +1561,7 @@ fn finding_markdown(finding: &Finding, root: &Path, program: &str) -> Result<Str
             out.push_str(&format!("- {}: {}\n", label, redact(reference)));
         }
     }
-    out.push_str("\n");
+    out.push('\n');
     if !finding.summary.is_empty() {
         out.push_str("## Summary\n\n");
         out.push_str(&redact(&finding.summary));
